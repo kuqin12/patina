@@ -1,0 +1,33 @@
+[package]
+name = "patina_mm_supervisor_core"
+resolver = "2"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+readme = "README.md"
+description = "A pure Rust implementation of the MM Supervisor Core for standalone MM mode environments."
+
+# Metadata to tell docs.rs how to build the documentation when uploading
+[package.metadata.docs.rs]
+features = ["doc"]
+
+# Example binary showing how to build a PE/COFF MM Supervisor
+[[bin]]
+name = "example_mm_supervisor"
+path = "bin/example_mm_supervisor.rs"
+
+[dependencies]
+log = { workspace = true }
+r-efi = { workspace = true }
+spin = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+mockall = { workspace = true }
+serial_test = { workspace = true }
+
+[features]
+default = []
+std = []
+doc = []
