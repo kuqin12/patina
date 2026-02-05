@@ -34,6 +34,9 @@
 
 use core::{ffi::c_void, panic::PanicInfo};
 use patina_mm_supervisor_core::*;
+// use the the uart from patina
+use patina::{log::Format, serial::uart::Uart16550};
+use patina_adv_logger::logger::AdvancedLogger;
 
 // =============================================================================
 // Platform Configuration
@@ -68,6 +71,21 @@ impl PlatformInfo for ExamplePlatform {
 ///
 /// This is instantiated at compile time with no heap allocation.
 static SUPERVISOR: MmSupervisorCore<ExamplePlatform> = MmSupervisorCore::new();
+
+static LOGGER: AdvancedLogger<Uart16550> = AdvancedLogger::new(
+    Format::Standard,
+    &[
+        ("goblin", log::LevelFilter::Off),
+        ("gcd_measure", log::LevelFilter::Off),
+        ("allocations", log::LevelFilter::Off),
+        ("efi_memory_map", log::LevelFilter::Off),
+        ("mm_comm", log::LevelFilter::Off),
+        ("sw_mmi", log::LevelFilter::Off),
+        ("patina_performance", log::LevelFilter::Off),
+    ],
+    log::LevelFilter::Info,
+    Uart16550::Io { base: 0x402 },
+);
 
 // =============================================================================
 // Request Handlers (Examples)
@@ -161,14 +179,22 @@ fn panic(info: &PanicInfo) -> ! {
 /// The export name `MmSupervisorMain` matches the EDK2 convention for
 /// standalone MM supervisor entry points. The MM IPL looks for this symbol
 /// when loading the supervisor.
-#[unsafe(export_name = "efi_main")]
-pub extern "efiapi" fn mm_supervisor_main(hob_list: *const c_void) -> ! {
+#[unsafe(export_name = "rust_main")]
+pub extern "efiapi" fn mm_supervisor_main(cpu_index: usize, hob_list: *const c_void) -> ! {
+    // TODO: should not have it here because we will get back here everytime an MM call is made
+
     // Register platform-specific handlers before entering the main loop
     // Note: Only BSP will actually process these, but it's safe for APs to
     // call register_handler as well (they'll just fail to register duplicates)
+    log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace)).unwrap();
+    // SAFETY: The physical_hob_list pointer is considered valid at this point as it's provided by the core
+    // to the entry point.
+    unsafe {
+        LOGGER.init(hob_list).unwrap();
+    }
 
     // The entry_point handles BSP vs AP routing internally
-    SUPERVISOR.entry_point(hob_list)
+    SUPERVISOR.entry_point(cpu_index, hob_list)
 }
 
 // =============================================================================

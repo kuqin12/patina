@@ -49,13 +49,20 @@
 
 mod cpu;
 mod mailbox;
+pub mod mm_mem;
 mod request_handler;
 
 pub use cpu::{ApState, CpuInfo, CpuManager};
 pub use mailbox::{ApCommand, ApMailbox, ApResponse, MailboxManager};
+pub use mm_mem::{
+    AllocationType, PageAllocator, PoolAllocator, PageAllocError, SmramDescriptor,
+    PAGE_SIZE, PAGE_ALLOCATOR,
+    SMM_SMRAM_MEMORY_GUID, MM_PEI_MMRAM_MEMORY_RESERVE_GUID,
+};
 pub use request_handler::{RequestContext, RequestHandler, RequestResult, RequestDispatcher};
 
 use core::{
+    arch::global_asm,
     ffi::c_void,
     num::NonZeroUsize,
     ptr::NonNull,
@@ -63,6 +70,8 @@ use core::{
 };
 
 use spin::Once;
+
+global_asm!(include_str!("entry_point.asm"));
 
 /// A trait to be implemented by the platform to provide configuration values and types to be used
 /// by the MM Supervisor Core.
@@ -222,7 +231,7 @@ where
     /// Panics if:
     /// - The supervisor instance was already set
     /// - The HOB list pointer is null
-    pub fn entry_point(&'static self, hob_list: *const c_void) -> ! {
+    pub fn entry_point(&'static self, cpu_index: usize, hob_list: *const c_void) -> ! {
         // Get the current CPU's APIC ID to determine if we're BSP or AP
         let cpu_id = cpu::get_current_cpu_id();
 
@@ -278,11 +287,19 @@ where
     /// BSP-specific initialization.
     ///
     /// This is called only on the BSP after basic setup is complete.
-    fn bsp_init(&'static self, _hob_list: *const c_void) {
-        log::trace!("BSP performing one-time initialization...");
+    fn bsp_init(&'static self, hob_list: *const c_void) {
+        log::info!("BSP performing one-time initialization...");
+
+        // Initialize the page allocator from the HOB list
+        // This finds all SMRAM regions and sets up memory tracking
+        // SAFETY: hob_list is provided by the MM IPL and is guaranteed to be valid
+        unsafe {
+            if let Err(e) = mm_mem::PAGE_ALLOCATOR.init_from_hob_list(hob_list) {
+                log::error!("Failed to initialize page allocator: {:?}", e);
+            }
+        }
 
         // TODO: Process HOB list for MM-specific configuration
-        // TODO: Initialize memory services
         // TODO: Set up protocol database
         // TODO: Initialize request handler infrastructure
 

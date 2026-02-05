@@ -1,0 +1,8 @@
+# Local overrides for UEFI builds. Safe to edit; not synced from DevOps.
+[target.x86_64-unknown-uefi]
+# Make the PE/COFF image relocatable by removing the fixed base (default 0x140000000)
+# and keeping dynamic base/relocs so the firmware can place it anywhere in MMRAM.
+rustflags = [
+    "-C", "link-arg=-Wl,--image-base=0x0",
+    "-C", "link-arg=-Wl,--dynamicbase",
+]

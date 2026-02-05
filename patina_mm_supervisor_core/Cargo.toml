@@ -21,9 +21,10 @@ path = "bin/example_mm_supervisor.rs"
 log = { workspace = true }
 r-efi = { workspace = true }
 spin = { workspace = true }
+patina = { workspace = true }
+patina_adv_logger = { workspace = true }
 
 [dev-dependencies]
-env_logger = { workspace = true }
 mockall = { workspace = true }
 serial_test = { workspace = true }
 

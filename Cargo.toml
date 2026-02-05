@@ -48,6 +48,7 @@ patina_paging = { version = "10" }
 patina_performance = { version = "19.0.2", path = "components/patina_performance" }
 patina_smbios = { version = "19.0.2", path = "components/patina_smbios" }
 patina_stacktrace = { version = "19.0.2", path = "core/patina_stacktrace" }
+patina_adv_logger = { version = "19.0.2", path = "components/patina_adv_logger" }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
 r-efi = { version = "5.0.0", default-features = false }
