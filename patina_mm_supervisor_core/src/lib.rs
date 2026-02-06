@@ -50,6 +50,7 @@
 mod cpu;
 mod mailbox;
 pub mod mm_mem;
+pub mod paging_allocator;
 mod request_handler;
 
 pub use cpu::{ApState, CpuInfo, CpuManager};
@@ -59,17 +60,141 @@ pub use mm_mem::{
     PAGE_SIZE, PAGE_ALLOCATOR,
     SMM_SMRAM_MEMORY_GUID, MM_PEI_MMRAM_MEMORY_RESERVE_GUID,
 };
+pub use paging_allocator::{
+    PagingPoolAllocator, PagingAllocError, SharedPagingAllocator,
+    PAGING_ALLOCATOR, DEFAULT_PAGING_POOL_PAGES,
+};
 pub use request_handler::{RequestContext, RequestHandler, RequestResult, RequestDispatcher};
 
 use core::{
-    arch::global_asm,
+    arch::{global_asm, asm},
     ffi::c_void,
     num::NonZeroUsize,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
+use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
+use patina_paging::{PagingType, x64::X64PageTable};
+use r_efi::efi;
+
+// use patina_mm_policy::{walk_page_table, MemDescriptorV1_0};
+
+// GUID for gMmSupervisorHobMemoryAllocModuleGuid
+// { 0x3efafe72, 0x3dbf, 0x4341, { 0xad, 0x04, 0x1c, 0xb6, 0xe8, 0xb6, 0x8e, 0x5e }}
+/// GUID used in MemoryAllocationModule HOBs to identify MM Supervisor module allocations.
+pub const MM_SUPERVISOR_HOB_MEMORY_ALLOC_MODULE_GUID: efi::Guid = efi::Guid::from_fields(
+    0x3efafe72,
+    0x3dbf,
+    0x4341,
+    0xad,
+    0x04,
+    &[0x1c, 0xb6, 0xe8, 0xb6, 0x8e, 0x5e],
+);
+
+// GUID for gMmSupervisorUserGuid
+// { 0x30d1cc3f, 0xc1db, 0x41ed, { 0xb1, 0x13, 0xab, 0xce, 0x21, 0xb0, 0x2b, 0xce }}
+/// GUID identifying the MM Supervisor User module.
+pub const MM_SUPERVISOR_USER_GUID: efi::Guid = efi::Guid::from_fields(
+    0x30d1cc3f,
+    0xc1db,
+    0x41ed,
+    0xb1,
+    0x13,
+    &[0xab, 0xce, 0x21, 0xb0, 0x2b, 0xce],
+);
+
+// GUID for gMmSupervisorPassDownHobGuid
+// { 0x3f2d2d1a, 0x7c6a, 0x4e2e, { 0x91, 0x2e, 0x5c, 0x4f, 0x5b, 0x8c, 0x2a, 0x9d } }
+/// GUID for the MM Supervisor PassDown HOB.
+pub const MM_SUPV_PASS_DOWN_HOB_GUID: efi::Guid = efi::Guid::from_fields(
+    0x3f2d2d1a,
+    0x7c6a,
+    0x4e2e,
+    0x91,
+    0x2e,
+    &[0x5c, 0x4f, 0x5b, 0x8c, 0x2a, 0x9d],
+);
+
+/// MM Supervisor PassDown HOB Revision
+pub const MM_SUPV_PASS_DOWN_HOB_REVISION: u32 = 1;
+
+/// MM Supervisor PassDown HOB Data Structure
+///
+/// This structure contains various buffer pointers and sizes passed from
+/// the PEI phase to the MM Supervisor.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct MmSupvPassDownHobData {
+    /// Revision of this HOB structure
+    pub revision: u32,
+    /// Reserved for future use
+    pub reserved: u32,
+    /// Base address of CPL3 stack for MM Supervisor
+    pub mm_supervisor_cpl3_stack_base: u64,
+    /// Per-CPU stack size for CPL3
+    pub mm_supervisor_cpl3_per_core_stack_size: u64,
+    /// MM Supervisor CPU private data base address
+    pub mm_supv_cpu_private: u64,
+    /// Size of MM Supervisor CPU private data
+    pub mm_supv_cpu_private_size: u64,
+    /// MM Supervisor MP sync data base address
+    pub mm_supv_mp_sync_data: u64,
+    /// Size of MM Supervisor MP sync data
+    pub mm_supv_mp_sync_data_size: u64,
+    /// MM Supervisor communication buffer base address
+    pub mm_supv_comm_buffer: u64,
+    /// MM Supervisor internal communication buffer base address
+    pub mm_supv_comm_buffer_internal: u64,
+    /// Size of MM Supervisor communication buffer
+    pub mm_supv_comm_buffer_size: u64,
+    /// MM User communication buffer base address
+    pub mm_user_comm_buffer: u64,
+    /// MM User internal communication buffer base address
+    pub mm_user_comm_buffer_internal: u64,
+    /// Size of MM User communication buffer
+    pub mm_user_comm_buffer_size: u64,
+    /// MM Supervisor status buffer base address
+    pub mm_supv_status_buffer: u64,
+    /// MM Supervisor to User buffer base address
+    pub mm_supv_to_user_buffer: u64,
+    /// Size of MM Supervisor to User buffer
+    pub mm_supv_to_user_buffer_size: u64,
+    /// MM Supervisor GDT buffer base address
+    pub mm_supv_gdt_buffer: u64,
+    /// Size of MM Supervisor GDT buffer
+    pub mm_supv_gdt_buffer_size: u64,
+    /// Step size of MM Supervisor GDT buffer per CPU
+    pub mm_supv_gdt_step_size: u64,
+    /// MM Initialized buffer base address
+    pub mm_initialized_buffer: u64,
+    /// MM Supervisor firmware policy buffer base address
+    pub mm_supv_firmware_policy_buffer: u64,
+    /// Size of MM Supervisor firmware policy buffer
+    pub mm_supv_firmware_policy_buffer_size: u64,
+    /// MM Supervisor memory policy buffer base address
+    pub mm_supv_memory_policy_buffer: u64,
+    /// Size of MM Supervisor memory policy buffer
+    pub mm_supv_memory_policy_buffer_size: u64,
+}
+
+/// Errors that can occur during policy initialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyInitError {
+    /// The HOB list pointer is null.
+    NullHobList,
+    /// PassDown HOB not found.
+    PassDownHobNotFound,
+    /// Invalid PassDown HOB revision.
+    InvalidRevision { found: u32, expected: u32 },
+    /// Firmware policy buffer is null or empty.
+    NullFirmwarePolicyBuffer,
+    /// Invalid policy data.
+    InvalidPolicyData,
+}
+
 use spin::Once;
+use patina_internal_cpu::interrupts::Interrupts;
 
 global_asm!(include_str!("entry_point.asm"));
 
@@ -116,6 +241,11 @@ static CPU_ARRIVAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Flag indicating that initialization is complete.
 static BSP_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
+
+/// The policy object is initialized once during BSP initialization and provides access to the security policy
+/// for the MM Supervisor. It is stored in a static variable for global access.
+/// The policy gate is initialized from the firmware policy buffer provided in the PassDown HOB.
+static POLICY_GATE: Once<patina_mm_policy::PolicyGate> = Once::new();
 
 /// The MM Supervisor Core responsible for managing the standalone MM environment.
 ///
@@ -175,6 +305,27 @@ where
     [(); P::MAX_CPU_COUNT]:,
     [(); P::MAX_HANDLERS]:,
 {
+}
+
+fn is_buffer_inside_mmram(base: u64, size: u64) -> bool {
+    // we will go over the page allocator to see if this region falls inside any of the MMRAM regions
+    mm_mem::PAGE_ALLOCATOR.is_region_inside_mmram(base, size)
+}
+
+/// Read CR3 register.
+fn read_cr3() -> u64 {
+    let mut _value = 0u64;
+
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    {
+        // SAFETY: inline asm is inherently unsafe because Rust can't reason about it.
+        // In this case we are reading the CR3 register, which is a safe operation.
+        unsafe {
+            asm!("mov {}, cr3", out(reg) _value, options(nostack, preserves_flags));
+        }
+    }
+
+    _value
 }
 
 #[coverage(off)]
@@ -290,6 +441,17 @@ where
     fn bsp_init(&'static self, hob_list: *const c_void) {
         log::info!("BSP performing one-time initialization...");
 
+        let mut interrupt_manager = Interrupts::new();
+        interrupt_manager.initialize().unwrap_or_else(|err| {
+            panic!("Failed to initialize Interrupt Manager: {:?}", err);
+        });
+
+        // // For debugging: Dump the HOB list
+        // // SAFETY: The HOB list pointer is provided by the MM IPL and is guaranteed to be valid at this point.
+        // unsafe {
+        //     mm_mem::dump_hob_list(hob_list);
+        // }
+
         // Initialize the page allocator from the HOB list
         // This finds all SMRAM regions and sets up memory tracking
         // SAFETY: hob_list is provided by the MM IPL and is guaranteed to be valid
@@ -299,11 +461,250 @@ where
             }
         }
 
-        // TODO: Process HOB list for MM-specific configuration
-        // TODO: Set up protocol database
+        // Reserve pages from the page allocator for paging structures.
+        // This is done before paging is initialized to avoid circular dependency.
+        unsafe {
+            match mm_mem::PAGE_ALLOCATOR.allocate_pages(paging_allocator::DEFAULT_PAGING_POOL_PAGES) {
+                Ok(paging_pool_base) => {
+                    log::info!(
+                        "Reserved {} pages at 0x{:016x} for paging structures",
+                        paging_allocator::DEFAULT_PAGING_POOL_PAGES,
+                        paging_pool_base
+                    );
+                    // Initialize the paging allocator with the reserved pool
+                    if let Err(e) = paging_allocator::PAGING_ALLOCATOR.init(
+                        paging_pool_base,
+                        paging_allocator::DEFAULT_PAGING_POOL_PAGES,
+                    ) {
+                        log::error!("Failed to initialize paging allocator: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to reserve pages for paging structures: {:?}", e);
+                }
+            }
+        }
+
+        let mut paging_alloc = paging_allocator::SharedPagingAllocator::new(&paging_allocator::PAGING_ALLOCATOR);
+        let paging = X64PageTable::new(paging_alloc, PagingType::Paging4Level);
+
+        // Discover the MM Supervisor User module entry point from the HOB list.
+        // We look for EFI_HOB_TYPE_MEMORY_ALLOCATION HOBs that have:
+        // - MemoryAllocationHeader.Name == gMmSupervisorHobMemoryAllocModuleGuid
+        // - ModuleName == gMmSupervisorUserGuid
+        // SAFETY: hob_list is provided by the MM IPL and is guaranteed to be valid
+        let user_entry_point = unsafe { self.discover_user_module_entry(hob_list) };
+        if let Some(entry) = user_entry_point {
+            log::info!("Discovered MM User module entry point: 0x{:016x}", entry);
+            // TODO: Store this entry point for later invocation
+        } else {
+            log::warn!("MM User module entry point not found in HOB list");
+        }
+
+        // Initialize the policy gate from the PassDown HOB.
+        // This discovers the firmware policy buffer and initializes the policy gate.
+        // SAFETY: hob_list is provided by the MM IPL and is guaranteed to be valid
+        unsafe {
+            if let Err(e) = self.init_policy_from_hob_list(hob_list) {
+                log::error!("Failed to initialize policy gate: {:?}", e);
+            }
+        }
+
+        // Read CR3 from hardware
+        let cr3: u64 = read_cr3();
+
+        // Allocate buffer for descriptors
+        // let mut buffer = [MemDescriptorV1_0::default(); 1024];
+
+        // // Walk page table and generate memory policy
+        // let count = unsafe {
+        //     walk_page_table(
+        //         cr3,
+        //         buffer.as_mut_ptr(),
+        //         buffer.len(),
+        //         |base, size| is_buffer_inside_mmram(base, size), // Your MMRAM check
+        //     )
+        // };
+
+        // if let Ok(count) = count {
+        //     log::info!("Successfully generated {} memory policy descriptors", count);
+        // } else {
+        //     log::error!("Failed to generate memory policy descriptors: {:?}", count.err());
+        // }
+
+        // log::info!("Generated {} memory policy descriptors", count.unwrap_or(0));
+
         // TODO: Initialize request handler infrastructure
 
         log::trace!("BSP one-time initialization complete.");
+    }
+
+    /// Discovers the MM Supervisor User module entry point from the HOB list.
+    ///
+    /// This function iterates through the HOB list looking for `MemoryAllocationModule` HOBs
+    /// that match the MM Supervisor memory allocation module GUID and have the MM Supervisor
+    /// User GUID as their module name.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `hob_list` points to a valid HOB list.
+    ///
+    /// # Returns
+    ///
+    /// The entry point address of the user module if found, or `None` otherwise.
+    unsafe fn discover_user_module_entry(&self, hob_list: *const c_void) -> Option<u64> {
+        if hob_list.is_null() {
+            return None;
+        }
+
+        // Get the HOB list header
+        let hob_list_info = unsafe {
+            (hob_list as *const PhaseHandoffInformationTable).as_ref()?
+        };
+
+        let hob = Hob::Handoff(hob_list_info);
+
+        // Iterate through the HOB list looking for MemoryAllocationModule HOBs
+        for current_hob in &hob {
+            if let Hob::MemoryAllocationModule(mem_alloc_mod) = current_hob {
+                // Check if this is an MM Supervisor module allocation
+                // (MemoryAllocationHeader.Name == gMmSupervisorHobMemoryAllocModuleGuid)
+                if mem_alloc_mod.alloc_descriptor.name == MM_SUPERVISOR_HOB_MEMORY_ALLOC_MODULE_GUID {
+                    log::debug!(
+                        "Found MM Supervisor module HOB: module_name={:?}, entry_point=0x{:016x}",
+                        mem_alloc_mod.module_name,
+                        mem_alloc_mod.entry_point
+                    );
+
+                    // Check if this is the User module (ModuleName == gMmSupervisorUserGuid)
+                    if mem_alloc_mod.module_name == MM_SUPERVISOR_USER_GUID {
+                        log::info!(
+                            "Found MM User module: entry_point=0x{:016x}, base=0x{:016x}, size=0x{:x}",
+                            mem_alloc_mod.entry_point,
+                            mem_alloc_mod.alloc_descriptor.memory_base_address,
+                            mem_alloc_mod.alloc_descriptor.memory_length
+                        );
+                        return Some(mem_alloc_mod.entry_point);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Initializes the policy gate from the PassDown HOB.
+    ///
+    /// This function iterates through the HOB list looking for the PassDown HOB,
+    /// extracts the firmware policy buffer pointer, and initializes the policy gate.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `hob_list` points to a valid HOB list.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the policy gate was successfully initialized, or an error otherwise.
+    unsafe fn init_policy_from_hob_list(&self, hob_list: *const c_void) -> Result<(), PolicyInitError> {
+        if hob_list.is_null() {
+            return Err(PolicyInitError::NullHobList);
+        }
+
+        // Get the HOB list header
+        let hob_list_info = unsafe {
+            (hob_list as *const PhaseHandoffInformationTable)
+                .as_ref()
+                .ok_or(PolicyInitError::NullHobList)?
+        };
+
+        let hob = Hob::Handoff(hob_list_info);
+
+        // Walk through HOBs to find the PassDown HOB
+        for current_hob in &hob {
+            if let Hob::GuidHob(guid_hob, data) = current_hob {
+                if guid_hob.name == MM_SUPV_PASS_DOWN_HOB_GUID {
+                    log::info!("Found MM Supervisor PassDown HOB");
+
+                    // Verify data size
+                    if data.len() < core::mem::size_of::<MmSupvPassDownHobData>() {
+                        log::error!(
+                            "PassDown HOB data too small: {} < {}",
+                            data.len(),
+                            core::mem::size_of::<MmSupvPassDownHobData>()
+                        );
+                        return Err(PolicyInitError::InvalidPolicyData);
+                    }
+
+                    // Cast to PassDown HOB data structure
+                    let pass_down = unsafe { &*(data.as_ptr() as *const MmSupvPassDownHobData) };
+
+                    // Copy packed struct fields to local variables to avoid unaligned access
+                    // SAFETY: read_unaligned is used because MmSupvPassDownHobData is packed
+                    let revision = unsafe { core::ptr::addr_of!(pass_down.revision).read_unaligned() };
+                    let firmware_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer).read_unaligned() };
+                    let firmware_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer_size).read_unaligned() };
+                    let memory_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer).read_unaligned() };
+                    let memory_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer_size).read_unaligned() };
+
+                    // Validate revision
+                    if revision != MM_SUPV_PASS_DOWN_HOB_REVISION {
+                        log::error!(
+                            "Invalid PassDown HOB revision: {} (expected {})",
+                            revision,
+                            MM_SUPV_PASS_DOWN_HOB_REVISION
+                        );
+                        return Err(PolicyInitError::InvalidRevision {
+                            found: revision,
+                            expected: MM_SUPV_PASS_DOWN_HOB_REVISION,
+                        });
+                    }
+
+                    log::info!(
+                        "PassDown HOB: FirmwarePolicyBuffer=0x{:x}, Size=0x{:x}",
+                        firmware_policy_buffer,
+                        firmware_policy_buffer_size
+                    );
+                    log::info!(
+                        "PassDown HOB: MemoryPolicyBuffer=0x{:x}, Size=0x{:x}",
+                        memory_policy_buffer,
+                        memory_policy_buffer_size
+                    );
+
+                    // Validate firmware policy buffer
+                    if firmware_policy_buffer == 0
+                        || firmware_policy_buffer_size == 0
+                    {
+                        log::error!("Firmware policy buffer is null or empty");
+                        return Err(PolicyInitError::NullFirmwarePolicyBuffer);
+                    }
+
+                    // Initialize the policy gate with the firmware policy buffer
+                    let policy_ptr = firmware_policy_buffer as *const u8;
+                    // SAFETY: We validated that policy_ptr is non-null above and comes from
+                    // the PassDown HOB which is set up by the MM IPL.
+                    match unsafe { patina_mm_policy::PolicyGate::new(policy_ptr) } {
+                        Ok(gate) => {
+                            log::info!("Policy gate initialized successfully");
+                            // TODO: Store the policy gate for later use
+                            // For now, dump the policy for debugging
+                            // SAFETY: policy_ptr points to valid policy data as validated above.
+                            unsafe { patina_mm_policy::dump_policy(policy_ptr) };
+                            // Store the initialized policy gate in the static variable for global access
+                            POLICY_GATE.call_once(|| gate);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to create policy gate: {:?}", e);
+                            return Err(PolicyInitError::InvalidPolicyData);
+                        }
+                    }
+
+                    return Ok(());
+                }
+            }
+        }
+
+        log::error!("PassDown HOB not found in HOB list");
+        Err(PolicyInitError::PassDownHobNotFound)
     }
 
     /// The main request serving loop for the BSP.

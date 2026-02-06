@@ -19,10 +19,13 @@ path = "bin/example_mm_supervisor.rs"
 
 [dependencies]
 log = { workspace = true }
-r-efi = { workspace = true }
-spin = { workspace = true }
 patina = { workspace = true }
 patina_adv_logger = { workspace = true }
+patina_internal_cpu = { workspace = true }
+patina_mm_policy = { workspace = true }
+patina_paging = { workspace = true }
+r-efi = { workspace = true }
+spin = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

@@ -1,0 +1,25 @@
+[package]
+name = "patina_mm_policy"
+resolver = "2"
+version.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+readme = "README.md"
+description = "MM Supervisor secure policy library for Rust UEFI environments."
+
+# Metadata to tell docs.rs how to build the documentation when uploading
+[package.metadata.docs.rs]
+features = ["doc"]
+
+[dependencies]
+log = { workspace = true }
+r-efi = { workspace = true }
+spin = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+default = []
+std = []
+doc = []
