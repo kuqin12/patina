@@ -621,6 +621,447 @@ impl MemoryPolicyBuilder {
     }
 }
 
+// ============================================================================
+// Page Table Walking (x86_64 4-Level Paging)
+// ============================================================================
+
+/// Page table entry for x86_64 4-level paging.
+///
+/// This structure represents entries in PML4, PDPE, PDE, and PTE tables.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PageTableEntry {
+    /// Raw 64-bit value of the page table entry.
+    pub value: u64,
+}
+
+impl PageTableEntry {
+    /// Present bit (bit 0): Entry is valid if set.
+    pub const PRESENT: u64 = 1 << 0;
+    /// Read/Write bit (bit 1): Writable if set.
+    pub const READ_WRITE: u64 = 1 << 1;
+    /// User/Supervisor bit (bit 2): User-mode accessible if set.
+    pub const USER_SUPERVISOR: u64 = 1 << 2;
+    /// Page Size bit (bit 7): Large page (2MB or 1GB) if set.
+    pub const PAGE_SIZE: u64 = 1 << 7;
+    /// No Execute bit (bit 63): Not executable if set.
+    pub const NO_EXECUTE: u64 = 1 << 63;
+
+    /// Address mask for 4KB page table base addresses.
+    pub const ADDR_MASK_4K: u64 = 0x000F_FFFF_FFFF_F000;
+    /// Address mask for 2MB large page addresses.
+    pub const ADDR_MASK_2M: u64 = 0x000F_FFFF_FFE0_0000;
+    /// Address mask for 1GB huge page addresses.
+    pub const ADDR_MASK_1G: u64 = 0x000F_FFFF_C000_0000;
+
+    /// Size of a 4KB page.
+    pub const SIZE_4K: u64 = 0x1000;
+    /// Size of a 2MB large page.
+    pub const SIZE_2M: u64 = 0x20_0000;
+    /// Size of a 1GB huge page.
+    pub const SIZE_1G: u64 = 0x4000_0000;
+
+    /// Creates a new page table entry from a raw value.
+    #[inline]
+    pub const fn new(value: u64) -> Self {
+        Self { value }
+    }
+
+    /// Returns true if the entry is present.
+    #[inline]
+    pub const fn is_present(&self) -> bool {
+        (self.value & Self::PRESENT) != 0
+    }
+
+    /// Returns true if the entry is writable.
+    #[inline]
+    pub const fn is_writable(&self) -> bool {
+        (self.value & Self::READ_WRITE) != 0
+    }
+
+    /// Returns true if the entry is user-mode accessible.
+    #[inline]
+    pub const fn is_user(&self) -> bool {
+        (self.value & Self::USER_SUPERVISOR) != 0
+    }
+
+    /// Returns true if this is a large/huge page (PS bit set).
+    #[inline]
+    pub const fn is_large_page(&self) -> bool {
+        (self.value & Self::PAGE_SIZE) != 0
+    }
+
+    /// Returns true if the page is executable (NX bit NOT set).
+    #[inline]
+    pub const fn is_executable(&self) -> bool {
+        (self.value & Self::NO_EXECUTE) == 0
+    }
+
+    /// Gets the physical address of the next-level page table (4KB aligned).
+    #[inline]
+    pub const fn next_table_addr(&self) -> u64 {
+        self.value & Self::ADDR_MASK_4K
+    }
+
+    /// Gets the physical address of a 2MB large page.
+    #[inline]
+    pub const fn large_page_addr(&self) -> u64 {
+        self.value & Self::ADDR_MASK_2M
+    }
+
+    /// Gets the physical address of a 1GB huge page.
+    #[inline]
+    pub const fn huge_page_addr(&self) -> u64 {
+        self.value & Self::ADDR_MASK_1G
+    }
+
+    /// Gets the physical address of a 4KB page.
+    #[inline]
+    pub const fn page_addr(&self) -> u64 {
+        self.value & Self::ADDR_MASK_4K
+    }
+
+    /// Converts page table entry attributes to policy memory attributes.
+    ///
+    /// Inherits R/W/X permissions from upper-level entries.
+    #[inline]
+    pub fn to_policy_attrs(&self, inherited_attrs: u32) -> u32 {
+        if !self.is_present() {
+            return 0;
+        }
+
+        let mut attrs = RESOURCE_ATTR_READ;
+
+        if self.is_writable() {
+            attrs |= RESOURCE_ATTR_WRITE;
+        }
+
+        if self.is_executable() {
+            attrs |= RESOURCE_ATTR_EXECUTE;
+        }
+
+        // Inherit restrictions from upper-level tables
+        attrs & inherited_attrs
+    }
+}
+
+/// Errors that can occur during page table walking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTableWalkError {
+    /// Buffer is full, cannot add more descriptors.
+    BufferFull,
+    /// The CR3 value is invalid (null).
+    InvalidCr3,
+    /// Paging is not in the expected mode.
+    UnsupportedPagingMode,
+}
+
+/// Callback type for checking if a buffer is inside MMRAM.
+///
+/// Returns `true` if the buffer `[base, base + size)` is fully inside MMRAM.
+pub type IsInsideMmramFn = fn(base: u64, size: u64) -> bool;
+
+/// Walks x86_64 4-level page tables and generates memory policy descriptors.
+///
+/// This function traverses the page table hierarchy starting from the PML4
+/// table (pointed to by CR3), and for each mapped page, generates a memory
+/// policy descriptor with the effective R/W/X attributes.
+///
+/// Adjacent pages with the same attributes are coalesced into single descriptors.
+///
+/// # Arguments
+///
+/// * `cr3` - The CR3 register value (physical address of PML4 table)
+/// * `buffer` - Buffer to store the generated memory descriptors
+/// * `max_count` - Maximum number of descriptors the buffer can hold
+/// * `is_inside_mmram` - Callback to check if a region is inside MMRAM
+///   (regions fully inside MMRAM are skipped)
+///
+/// # Returns
+///
+/// The number of memory descriptors generated, or an error.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - `cr3` points to a valid PML4 table
+/// - `buffer` has space for at least `max_count` descriptors
+/// - The page table memory is accessible and won't change during the walk
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use patina_mm_policy::{walk_page_table, MemDescriptorV1_0, default_mmram_check};
+///
+/// let cr3 = read_cr3(); // Read from hardware
+/// let mut buffer = [MemDescriptorV1_0::default(); 1024];
+///
+/// let count = unsafe {
+///     walk_page_table(cr3, buffer.as_mut_ptr(), buffer.len(), default_mmram_check)?
+/// };
+///
+/// println!("Generated {} memory policy descriptors", count);
+/// ```
+pub unsafe fn walk_page_table(
+    cr3: u64,
+    buffer: *mut MemDescriptorV1_0,
+    max_count: usize,
+    is_inside_mmram: IsInsideMmramFn,
+) -> Result<usize, PageTableWalkError> {
+    if cr3 == 0 || buffer.is_null() {
+        return Err(PageTableWalkError::InvalidCr3);
+    }
+
+    let pml4_base = cr3 & PageTableEntry::ADDR_MASK_4K;
+    let mut builder = unsafe { MemoryPolicyBuilder::new(buffer, max_count) };
+
+    // Walk PML4 (512 entries)
+    let pml4_table = pml4_base as *const PageTableEntry;
+
+    for i in 0..512u64 {
+        let pml4e = unsafe { *pml4_table.add(i as usize) };
+        if !pml4e.is_present() {
+            continue;
+        }
+
+        // Calculate inherited attributes from PML4 entry
+        let pml4_attrs = pml4e.to_policy_attrs(
+            RESOURCE_ATTR_READ | RESOURCE_ATTR_WRITE | RESOURCE_ATTR_EXECUTE,
+        );
+
+        // Walk PDPE (512 entries)
+        let pdpe_table = pml4e.next_table_addr() as *const PageTableEntry;
+
+        for j in 0..512u64 {
+            let pdpe = unsafe { *pdpe_table.add(j as usize) };
+            if !pdpe.is_present() {
+                continue;
+            }
+
+            let pdpe_attrs = pdpe.to_policy_attrs(pml4_attrs);
+
+            // Check for 1GB huge page
+            if pdpe.is_large_page() {
+                let page_addr = pdpe.huge_page_addr();
+                let page_size = PageTableEntry::SIZE_1G;
+
+                // Skip if fully inside MMRAM
+                if is_inside_mmram(page_addr, page_size) {
+                    continue;
+                }
+
+                if builder.add_region(page_addr, page_size, pdpe_attrs).is_err() {
+                    return Err(PageTableWalkError::BufferFull);
+                }
+                continue;
+            }
+
+            // Walk PDE (512 entries)
+            let pde_table = pdpe.next_table_addr() as *const PageTableEntry;
+
+            for k in 0..512u64 {
+                let pde = unsafe { *pde_table.add(k as usize) };
+                if !pde.is_present() {
+                    continue;
+                }
+
+                let pde_attrs = pde.to_policy_attrs(pdpe_attrs);
+
+                // Check for 2MB large page
+                if pde.is_large_page() {
+                    let page_addr = pde.large_page_addr();
+                    let page_size = PageTableEntry::SIZE_2M;
+
+                    // Skip if fully inside MMRAM
+                    if is_inside_mmram(page_addr, page_size) {
+                        continue;
+                    }
+
+                    if builder.add_region(page_addr, page_size, pde_attrs).is_err() {
+                        return Err(PageTableWalkError::BufferFull);
+                    }
+                    continue;
+                }
+
+                // Walk PTE (512 entries)
+                let pte_table = pde.next_table_addr() as *const PageTableEntry;
+
+                for l in 0..512u64 {
+                    let pte = unsafe { *pte_table.add(l as usize) };
+                    if !pte.is_present() {
+                        continue;
+                    }
+
+                    let page_addr = pte.page_addr();
+                    let page_size = PageTableEntry::SIZE_4K;
+
+                    // Skip if fully inside MMRAM
+                    if is_inside_mmram(page_addr, page_size) {
+                        continue;
+                    }
+
+                    let pte_attrs = pte.to_policy_attrs(pde_attrs);
+
+                    if builder.add_region(page_addr, page_size, pte_attrs).is_err() {
+                        return Err(PageTableWalkError::BufferFull);
+                    }
+                }
+            }
+        }
+    }
+
+    builder.finish().map_err(|()| PageTableWalkError::BufferFull)
+}
+
+/// Statistics from page table walking.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageTableWalkStats {
+    /// Number of PML4 entries traversed.
+    pub pml4_entries: usize,
+    /// Number of PDPE entries traversed.
+    pub pdpe_entries: usize,
+    /// Number of PDE entries traversed.
+    pub pde_entries: usize,
+    /// Number of PTE entries traversed.
+    pub pte_entries: usize,
+    /// Number of 1GB huge pages found.
+    pub huge_pages_1g: usize,
+    /// Number of 2MB large pages found.
+    pub large_pages_2m: usize,
+    /// Number of 4KB pages found.
+    pub pages_4k: usize,
+    /// Number of pages skipped (inside MMRAM).
+    pub skipped_mmram: usize,
+}
+
+/// Walks x86_64 4-level page tables with statistics.
+///
+/// This is the same as [`walk_page_table`] but also returns statistics
+/// about the page table structure.
+///
+/// # Safety
+///
+/// Same requirements as [`walk_page_table`].
+pub unsafe fn walk_page_table_with_stats(
+    cr3: u64,
+    buffer: *mut MemDescriptorV1_0,
+    max_count: usize,
+    is_inside_mmram: IsInsideMmramFn,
+) -> Result<(usize, PageTableWalkStats), PageTableWalkError> {
+    if cr3 == 0 || buffer.is_null() {
+        return Err(PageTableWalkError::InvalidCr3);
+    }
+
+    let pml4_base = cr3 & PageTableEntry::ADDR_MASK_4K;
+    let mut builder = unsafe { MemoryPolicyBuilder::new(buffer, max_count) };
+    let mut stats = PageTableWalkStats::default();
+
+    // Walk PML4 (512 entries)
+    let pml4_table = pml4_base as *const PageTableEntry;
+
+    for i in 0..512u64 {
+        let pml4e = unsafe { *pml4_table.add(i as usize) };
+        if !pml4e.is_present() {
+            continue;
+        }
+
+        stats.pml4_entries += 1;
+
+        let pml4_attrs = pml4e.to_policy_attrs(
+            RESOURCE_ATTR_READ | RESOURCE_ATTR_WRITE | RESOURCE_ATTR_EXECUTE,
+        );
+
+        // Walk PDPE
+        let pdpe_table = pml4e.next_table_addr() as *const PageTableEntry;
+
+        for j in 0..512u64 {
+            let pdpe = unsafe { *pdpe_table.add(j as usize) };
+            if !pdpe.is_present() {
+                continue;
+            }
+
+            stats.pdpe_entries += 1;
+            let pdpe_attrs = pdpe.to_policy_attrs(pml4_attrs);
+
+            // 1GB huge page
+            if pdpe.is_large_page() {
+                let page_addr = pdpe.huge_page_addr();
+                let page_size = PageTableEntry::SIZE_1G;
+
+                if is_inside_mmram(page_addr, page_size) {
+                    stats.skipped_mmram += 1;
+                    continue;
+                }
+
+                stats.huge_pages_1g += 1;
+                if builder.add_region(page_addr, page_size, pdpe_attrs).is_err() {
+                    return Err(PageTableWalkError::BufferFull);
+                }
+                continue;
+            }
+
+            // Walk PDE
+            let pde_table = pdpe.next_table_addr() as *const PageTableEntry;
+
+            for k in 0..512u64 {
+                let pde = unsafe { *pde_table.add(k as usize) };
+                if !pde.is_present() {
+                    continue;
+                }
+
+                stats.pde_entries += 1;
+                let pde_attrs = pde.to_policy_attrs(pdpe_attrs);
+
+                // 2MB large page
+                if pde.is_large_page() {
+                    let page_addr = pde.large_page_addr();
+                    let page_size = PageTableEntry::SIZE_2M;
+
+                    if is_inside_mmram(page_addr, page_size) {
+                        stats.skipped_mmram += 1;
+                        continue;
+                    }
+
+                    stats.large_pages_2m += 1;
+                    if builder.add_region(page_addr, page_size, pde_attrs).is_err() {
+                        return Err(PageTableWalkError::BufferFull);
+                    }
+                    continue;
+                }
+
+                // Walk PTE
+                let pte_table = pde.next_table_addr() as *const PageTableEntry;
+
+                for l in 0..512u64 {
+                    let pte = unsafe { *pte_table.add(l as usize) };
+                    if !pte.is_present() {
+                        continue;
+                    }
+
+                    stats.pte_entries += 1;
+                    let page_addr = pte.page_addr();
+                    let page_size = PageTableEntry::SIZE_4K;
+
+                    if is_inside_mmram(page_addr, page_size) {
+                        stats.skipped_mmram += 1;
+                        continue;
+                    }
+
+                    stats.pages_4k += 1;
+                    let pte_attrs = pte.to_policy_attrs(pde_attrs);
+
+                    if builder.add_region(page_addr, page_size, pte_attrs).is_err() {
+                        return Err(PageTableWalkError::BufferFull);
+                    }
+                }
+            }
+        }
+    }
+
+    let count = builder.finish().map_err(|()| PageTableWalkError::BufferFull)?;
+    Ok((count, stats))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

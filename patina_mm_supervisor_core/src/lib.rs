@@ -52,6 +52,7 @@ mod mailbox;
 pub mod mm_mem;
 pub mod paging_allocator;
 mod request_handler;
+pub mod unblock_memory;
 
 pub use cpu::{ApState, CpuInfo, CpuManager};
 pub use mailbox::{ApCommand, ApMailbox, ApResponse, MailboxManager};
@@ -65,6 +66,10 @@ pub use paging_allocator::{
     PAGING_ALLOCATOR, DEFAULT_PAGING_POOL_PAGES,
 };
 pub use request_handler::{RequestContext, RequestHandler, RequestResult, RequestDispatcher};
+pub use unblock_memory::{
+    UnblockedMemoryTracker, UnblockedMemoryEntry, UnblockError,
+    UNBLOCKED_MEMORY_TRACKER,
+};
 
 use core::{
     arch::{global_asm, asm},
@@ -78,7 +83,7 @@ use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
 use patina_paging::{PagingType, x64::X64PageTable};
 use r_efi::efi;
 
-// use patina_mm_policy::{walk_page_table, MemDescriptorV1_0};
+use patina_mm_policy::{walk_page_table, MemDescriptorV1_0};
 
 // GUID for gMmSupervisorHobMemoryAllocModuleGuid
 // { 0x3efafe72, 0x3dbf, 0x4341, { 0xad, 0x04, 0x1c, 0xb6, 0xe8, 0xb6, 0x8e, 0x5e }}
@@ -510,29 +515,9 @@ where
             }
         }
 
-        // Read CR3 from hardware
-        let cr3: u64 = read_cr3();
-
         // Allocate buffer for descriptors
         // let mut buffer = [MemDescriptorV1_0::default(); 1024];
 
-        // // Walk page table and generate memory policy
-        // let count = unsafe {
-        //     walk_page_table(
-        //         cr3,
-        //         buffer.as_mut_ptr(),
-        //         buffer.len(),
-        //         |base, size| is_buffer_inside_mmram(base, size), // Your MMRAM check
-        //     )
-        // };
-
-        // if let Ok(count) = count {
-        //     log::info!("Successfully generated {} memory policy descriptors", count);
-        // } else {
-        //     log::error!("Failed to generate memory policy descriptors: {:?}", count.err());
-        // }
-
-        // log::info!("Generated {} memory policy descriptors", count.unwrap_or(0));
 
         // TODO: Initialize request handler infrastructure
 
@@ -605,6 +590,7 @@ where
     /// # Returns
     ///
     /// `Ok(())` if the policy gate was successfully initialized, or an error otherwise.
+    /// TODO: Remove the passdown hob eventually!!!!!
     unsafe fn init_policy_from_hob_list(&self, hob_list: *const c_void) -> Result<(), PolicyInitError> {
         if hob_list.is_null() {
             return Err(PolicyInitError::NullHobList);
@@ -697,6 +683,43 @@ where
                             return Err(PolicyInitError::InvalidPolicyData);
                         }
                     }
+
+                    // Read CR3 from hardware
+                    let cr3: u64 = read_cr3();
+
+                    // Walk page table and generate memory policy
+                    let count = unsafe {
+                        walk_page_table(
+                            cr3,
+                            memory_policy_buffer as *mut MemDescriptorV1_0,
+                            memory_policy_buffer_size as usize,
+                            |base, size| is_buffer_inside_mmram(base, size), // Your MMRAM check
+                        )
+                    };
+
+                    if let Ok(descriptor_count) = count {
+                        log::info!("Successfully generated {} memory policy descriptors", descriptor_count);
+
+                        // Initialize the unblocked memory tracker from the generated descriptors
+                        // SAFETY: memory_policy_buffer points to valid MemDescriptorV1_0 array
+                        // with descriptor_count entries, as we just filled it via walk_page_table
+                        if let Err(e) = unsafe {
+                            unblock_memory::UNBLOCKED_MEMORY_TRACKER.init_from_buffer(
+                                memory_policy_buffer as *const MemDescriptorV1_0,
+                                descriptor_count,
+                            )
+                        } {
+                            log::error!("Failed to initialize unblocked memory tracker: {:?}", e);
+                        } else {
+                            log::info!("Unblocked memory tracker initialized");
+                            // Dump regions for debugging
+                            unblock_memory::UNBLOCKED_MEMORY_TRACKER.dump_regions();
+                        }
+                    } else {
+                        log::error!("Failed to generate memory policy descriptors: {:?}", count.err());
+                    }
+
+                    log::info!("Generated {} memory policy descriptors", count.unwrap_or(0));
 
                     return Ok(());
                 }
