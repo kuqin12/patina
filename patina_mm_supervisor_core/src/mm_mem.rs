@@ -882,6 +882,25 @@ impl PageAllocator {
             }
         }
     }
+
+    pub fn is_region_inside_mmram(&self, addr: u64, size: u64) -> bool {
+        if !self.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let _guard = self.lock.lock();
+
+        unsafe {
+            let regions = self.get_regions();
+            for region in regions.iter() {
+                let region_end = region.base + (region.total_pages as u64 * PAGE_SIZE as u64);
+                if addr >= region.base && (addr + size) <= region_end {
+                    return true;
+                }
+            }
+            false
+        }
+    }
 }
 
 // ============================================================================
