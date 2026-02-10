@@ -51,10 +51,11 @@ mod cpu;
 mod mailbox;
 pub mod mm_mem;
 pub mod paging_allocator;
+pub mod privilege_mgmt;
 mod request_handler;
 pub mod unblock_memory;
 
-pub use cpu::{ApState, CpuInfo, CpuManager};
+pub use cpu::{ApState, CpuInfo, CpuManager, get_current_cpu_id, is_bsp};
 pub use mailbox::{ApCommand, ApMailbox, ApResponse, MailboxManager};
 pub use mm_mem::{
     AllocationType, PageAllocator, PoolAllocator, PageAllocError, SmramDescriptor,
@@ -69,6 +70,18 @@ pub use request_handler::{RequestContext, RequestHandler, RequestResult, Request
 pub use unblock_memory::{
     UnblockedMemoryTracker, UnblockedMemoryEntry, UnblockError,
     UNBLOCKED_MEMORY_TRACKER,
+};
+pub use privilege_mgmt::{
+    SyscallInterface, SyscallCache, SyscallSetupError,
+    SyscallDispatcher, SyscallIndex, SyscallResult,
+    CallGateManager, SegmentSelectors,
+    PrivilegeLevel, PrivilegeError,
+    // MSR constants
+    MSR_IA32_STAR, MSR_IA32_LSTAR, MSR_IA32_EFER,
+    MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
+    // Segment selectors
+    LONG_CS_R0, LONG_DS_R0, LONG_CS_R3, LONG_DS_R3,
+    CALL_GATE_OFFSET, TSS_SEL_OFFSET,
 };
 
 use core::{
@@ -241,11 +254,16 @@ pub trait PlatformInfo: 'static {
 /// This is set during the `entry_point` call and provides global access to the supervisor.
 static __SUPERVISOR: Once<NonZeroUsize> = Once::new();
 
-/// Counter for tracking CPU arrivals at the entry point.
-static CPU_ARRIVAL_COUNT: AtomicU32 = AtomicU32::new(0);
-
-/// Flag indicating that initialization is complete.
+/// Flag indicating that BSP one-time initialization is complete.
 static BSP_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
+
+/// Pointer to the per-core initialized buffer from the PassDown HOB.
+/// Each core has a 64-bit slot at `buffer_base + (cpu_index * 8)`.
+/// A non-zero value indicates the core has completed initialization.
+static MM_INITIALIZED_BUFFER: Once<u64> = Once::new();
+
+/// Counter for tracking how many cores have completed their per-core init.
+static PER_CORE_INIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// The policy object is initialized once during BSP initialization and provides access to the security policy
 /// for the MM Supervisor. It is stored in a static variable for global access.
@@ -292,6 +310,8 @@ where
     mailbox_manager: MailboxManager<{ P::MAX_CPU_COUNT }>,
     /// Request dispatcher for handling incoming requests.
     request_dispatcher: RequestDispatcher<{ P::MAX_HANDLERS }>,
+    /// Syscall interface for privilege transitions.
+    syscall_interface: SyscallInterface<{ P::MAX_CPU_COUNT }>,
     /// Flag indicating if the core has been initialized.
     initialized: AtomicBool,
     /// Phantom data for the platform type.
@@ -333,6 +353,48 @@ fn read_cr3() -> u64 {
     _value
 }
 
+// ============================================================================
+// Per-Core Initialization Status Helpers
+// ============================================================================
+
+/// Checks if a specific core has completed initialization.
+///
+/// Reads the 64-bit slot at `mm_initialized_buffer + (cpu_index * 8)`.
+/// A non-zero value indicates the core has completed initialization.
+fn is_core_initialized(cpu_index: usize) -> bool {
+    if let Some(&buffer_base) = MM_INITIALIZED_BUFFER.get() {
+        if buffer_base == 0 {
+            return false;
+        }
+        let slot_ptr = (buffer_base as usize + cpu_index) as *const u8;
+        // SAFETY: The buffer is provided by the MM IPL and is guaranteed to be valid.
+        // Each core only reads its own slot or slots of other cores.
+        let value = unsafe { core::ptr::read_volatile(slot_ptr) };
+        value != 0
+    } else {
+        false
+    }
+}
+
+/// Marks a specific core as initialized.
+///
+/// Writes a non-zero value to the 64-bit slot at `mm_initialized_buffer + (cpu_index * 8)`.
+fn mark_core_initialized(cpu_index: usize) {
+    if let Some(&buffer_base) = MM_INITIALIZED_BUFFER.get() {
+        if buffer_base == 0 {
+            log::error!("MM initialized buffer is null, cannot mark core {} as initialized", cpu_index);
+            return;
+        }
+        let slot_ptr = (buffer_base as usize + cpu_index) as *mut u8;
+        // SAFETY: The buffer is provided by the MM IPL and is guaranteed to be valid.
+        // Each core writes only to its own slot.
+        unsafe { core::ptr::write_volatile(slot_ptr, 1) };
+        log::trace!("Core {} marked as initialized at 0x{:016x}", cpu_index, slot_ptr as u64);
+    } else {
+        log::error!("MM initialized buffer not set, cannot mark core {} as initialized", cpu_index);
+    }
+}
+
 #[coverage(off)]
 impl<P: PlatformInfo> MmSupervisorCore<P>
 where
@@ -347,6 +409,7 @@ where
             cpu_manager: CpuManager::new(),
             mailbox_manager: MailboxManager::new(),
             request_dispatcher: RequestDispatcher::new(),
+            syscall_interface: SyscallInterface::new(),
             initialized: AtomicBool::new(false),
             _phantom: core::marker::PhantomData,
         }
@@ -387,43 +450,47 @@ where
     /// Panics if:
     /// - The supervisor instance was already set
     /// - The HOB list pointer is null
-    pub fn entry_point(&'static self, cpu_index: usize, hob_list: *const c_void) -> ! {
-        // Get the current CPU's APIC ID to determine if we're BSP or AP
+    /// 
+    /// # Returns
+    /// 
+    /// On the first call (initialization phase), this function returns after init is complete.
+    /// On subsequent calls, BSP enters the request loop and APs enter the holding pen (neither returns).
+    pub fn entry_point(&'static self, cpu_index: usize, hob_list: *const c_void) {
+        // Get the current CPU's APIC ID
         let cpu_id = cpu::get_current_cpu_id();
 
-        // Track CPU arrival
-        let arrival_order = CPU_ARRIVAL_COUNT.fetch_add(1, Ordering::SeqCst);
+        // Determine if we're BSP by checking IA32_APIC_BASE MSR
+        let is_bsp = cpu::is_bsp();
 
-        // The first CPU to arrive is considered the BSP
-        let is_bsp = arrival_order == 0;
+        // Check if this core has already completed initialization (per-core check)
+        if is_core_initialized(cpu_index) {
+            // Subsequent entry: go directly to request loop or holding pen (does not return)
+            self.enter_runtime(cpu_id);
+        }
 
+        // First entry: initialization phase
         if is_bsp {
             // BSP path: Initialize the supervisor
             assert!(self.set_instance(), "MM Supervisor Core instance was already set!");
             assert!(!hob_list.is_null(), "MM Supervisor Core requires a non-null HOB list pointer.");
 
             log::info!("MM Supervisor Core v{}", env!("CARGO_PKG_VERSION"));
-            log::info!("BSP (CPU {}) starting initialization...", cpu_id);
+            log::info!("BSP (CPU {}, index {}) starting one-time initialization...", cpu_id, cpu_index);
 
             // Register BSP with CPU manager
             self.cpu_manager.register_cpu(cpu_id, true);
 
-            // Perform platform-specific initialization
+            // Perform BSP-only one-time initialization (this sets up MM_INITIALIZED_BUFFER)
             self.bsp_init(hob_list);
 
-            // Mark as initialized
+            // Mark BSP init as complete so APs can proceed
             self.initialized.store(true, Ordering::Release);
-
-            // Signal that initialization is complete
             BSP_INIT_COMPLETE.store(true, Ordering::Release);
 
-            log::info!("BSP initialization complete, entering request serving loop...");
-
-            // Enter the main request serving loop
-            self.bsp_request_loop()
+            log::info!("BSP one-time initialization complete.");
         } else {
-            // AP path: Wait for BSP to complete initialization, then enter holding pen
-            log::trace!("AP (CPU {}) waiting for BSP initialization...", cpu_id);
+            // AP path: Wait for BSP to complete one-time initialization
+            log::trace!("AP (CPU {}, index {}) waiting for BSP initialization...", cpu_id, cpu_index);
 
             // Spin until BSP completes initialization
             while !BSP_INIT_COMPLETE.load(Ordering::Acquire) {
@@ -432,12 +499,30 @@ where
 
             // Register this AP with the CPU manager
             self.cpu_manager.register_cpu(cpu_id, false);
-
-            log::trace!("AP (CPU {}) entering holding pen...", cpu_id);
-
-            // Enter the holding pen
-            self.ap_holding_pen(cpu_id)
         }
+
+        // All cores perform per-core initialization
+        self.per_core_init(cpu_id, is_bsp);
+
+        // Mark this core as initialized in the per-core buffer
+        mark_core_initialized(cpu_index);
+
+        // Track that this core has completed per-core init
+        let init_count = PER_CORE_INIT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        log::trace!("CPU {} (index {}) completed per-core init ({} cores initialized)", cpu_id, cpu_index, init_count);
+
+        // BSP waits for all registered CPUs to complete per-core init before returning
+        if is_bsp {
+            let expected_cpus = self.cpu_manager.registered_count();
+            while PER_CORE_INIT_COUNT.load(Ordering::Acquire) < expected_cpus as u32 {
+                core::hint::spin_loop();
+            }
+
+            log::info!("All {} cores completed initialization, returning to caller.", expected_cpus);
+        }
+
+        // First entry returns to caller after init is complete
+        // (Each core has already marked itself as initialized via mark_core_initialized)
     }
 
     /// BSP-specific initialization.
@@ -522,6 +607,44 @@ where
         // TODO: Initialize request handler infrastructure
 
         log::trace!("BSP one-time initialization complete.");
+    }
+
+    /// Per-core initialization.
+    ///
+    /// This is called on every core (BSP and APs) during the first entry.
+    /// Use this for setting up per-CPU state like syscall MSRs, GS base, etc.
+    fn per_core_init(&'static self, cpu_id: u32, is_bsp: bool) {
+        let core_type = if is_bsp { "BSP" } else { "AP" };
+        log::trace!("{} (CPU {}) performing per-core initialization...", core_type, cpu_id);
+
+        // // Initialize syscall MSRs for this core
+        // if let Err(e) = self.syscall_interface.init_for_cpu(cpu_id as usize) {
+        //     log::error!("CPU {}: Failed to initialize syscall interface: {:?}", cpu_id, e);
+        // }
+
+        // TODO: Set up per-CPU GDT/TSS if needed
+        // TODO: Set up per-CPU interrupt stacks
+        // TODO: Initialize per-CPU data structures
+
+        log::trace!("{} (CPU {}) per-core initialization complete.", core_type, cpu_id);
+    }
+
+    /// Enter runtime mode (called on subsequent entries after init is complete).
+    ///
+    /// BSP enters the request serving loop, APs enter the holding pen.
+    /// This function does not return.
+    fn enter_runtime(&'static self, cpu_id: u32) -> ! {
+        let is_bsp = self.cpu_manager.is_bsp(cpu_id);
+
+        if is_bsp {
+            log::trace!("BSP (CPU {}) entering request serving loop...", cpu_id);
+            // Enter the main request serving loop
+            self.bsp_request_loop()
+        } else {
+            log::trace!("AP (CPU {}) entering holding pen...", cpu_id);
+            // Enter the holding pen
+            self.ap_holding_pen(cpu_id)
+        }
     }
 
     /// Discovers the MM Supervisor User module entry point from the HOB list.
@@ -627,6 +750,7 @@ where
                     // Copy packed struct fields to local variables to avoid unaligned access
                     // SAFETY: read_unaligned is used because MmSupvPassDownHobData is packed
                     let revision = unsafe { core::ptr::addr_of!(pass_down.revision).read_unaligned() };
+                    let mm_initialized_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_initialized_buffer).read_unaligned() };
                     let firmware_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer).read_unaligned() };
                     let firmware_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer_size).read_unaligned() };
                     let memory_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer).read_unaligned() };
@@ -643,6 +767,14 @@ where
                             found: revision,
                             expected: MM_SUPV_PASS_DOWN_HOB_REVISION,
                         });
+                    }
+
+                    // Store the per-core initialized buffer address for use by all cores
+                    if mm_initialized_buffer != 0 {
+                        MM_INITIALIZED_BUFFER.call_once(|| mm_initialized_buffer);
+                        log::info!("MM Initialized buffer set to 0x{:016x}", mm_initialized_buffer);
+                    } else {
+                        log::warn!("MM Initialized buffer is null in PassDown HOB");
                     }
 
                     log::info!(
@@ -755,6 +887,7 @@ where
         // TODO: Check communication buffer for incoming requests
         // TODO: Dispatch to registered handlers via self.request_dispatcher
         // TODO: Optionally distribute work to APs via mailbox
+        
     }
 
     /// The holding pen for APs.

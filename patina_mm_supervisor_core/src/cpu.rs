@@ -304,6 +304,49 @@ pub fn get_current_cpu_id() -> u32 {
     0
 }
 
+// ============================================================================
+// BSP Detection via IA32_APIC_BASE MSR
+// ============================================================================
+
+/// MSR index for IA32_APIC_BASE.
+const IA32_APIC_BASE_MSR_INDEX: u32 = 0x1B;
+
+/// BSP flag bit in IA32_APIC_BASE MSR (bit 8).
+const IA32_APIC_BSP: u64 = 1 << 8;
+
+/// Checks if the current processor is the Bootstrap Processor (BSP).
+///
+/// This reads the IA32_APIC_BASE MSR and checks the BSP flag (bit 8).
+/// The BSP flag is set by hardware during reset and indicates which
+/// processor is the bootstrap processor.
+///
+/// # Returns
+///
+/// `true` if this is the BSP, `false` if this is an AP.
+#[cfg(target_arch = "x86_64")]
+pub fn is_bsp() -> bool {
+    // SAFETY: Reading the IA32_APIC_BASE MSR is safe on x86_64.
+    let apic_base_lo: u32;
+    let apic_base_hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_APIC_BASE_MSR_INDEX,
+            out("eax") apic_base_lo,
+            out("edx") apic_base_hi,
+        );
+    }
+
+    let apic_base = ((apic_base_hi as u64) << 32) | (apic_base_lo as u64);
+    (apic_base & IA32_APIC_BSP) != 0
+}
+
+/// Checks if the current processor is the BSP (stub for non-x86_64).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn is_bsp() -> bool {
+    true // Assume BSP on non-x86_64 platforms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -33,10 +33,12 @@
 #![no_main]
 
 use core::{ffi::c_void, panic::PanicInfo};
+use core::sync::atomic::AtomicBool;
 use patina_mm_supervisor_core::*;
 // use the the uart from patina
 use patina::{log::Format, serial::uart::Uart16550};
 use patina_adv_logger::logger::AdvancedLogger;
+use patina_stacktrace::StackTrace;
 
 // =============================================================================
 // Platform Configuration
@@ -62,6 +64,9 @@ impl PlatformInfo for ExamplePlatform {
     /// Maximum number of request handlers that can be registered.
     const MAX_HANDLERS: usize = 32;
 }
+
+/// Flag indicating that advanced logger initialization is complete.
+static ADV_LOGGER_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 // =============================================================================
 // Static Supervisor Instance
@@ -133,21 +138,13 @@ static VERSION_INFO_HANDLER: VersionInfoHandler = VersionInfoHandler;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // In a real implementation, you might:
-    // 1. Log to a serial port
-    // 2. Trigger a debug breakpoint
-    // 3. Record telemetry
-    let _ = info;
+    log::error!("{}", info);
 
-    // Halt the processor
-    loop {
-        // On x86, you might use HLT instruction
-        // SAFETY: HLT is safe to call, just halts the CPU until next interrupt
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
+    if let Err(err) = unsafe { StackTrace::dump() } {
+        log::error!("StackTrace: {}", err);
     }
+
+    loop {}
 }
 
 // =============================================================================
@@ -180,17 +177,19 @@ fn panic(info: &PanicInfo) -> ! {
 /// standalone MM supervisor entry points. The MM IPL looks for this symbol
 /// when loading the supervisor.
 #[unsafe(export_name = "rust_main")]
-pub extern "efiapi" fn mm_supervisor_main(cpu_index: usize, hob_list: *const c_void) -> ! {
+pub extern "efiapi" fn mm_supervisor_main(cpu_index: usize, hob_list: *const c_void) {
     // TODO: should not have it here because we will get back here everytime an MM call is made
 
     // Register platform-specific handlers before entering the main loop
     // Note: Only BSP will actually process these, but it's safe for APs to
     // call register_handler as well (they'll just fail to register duplicates)
-    log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace)).unwrap();
-    // SAFETY: The physical_hob_list pointer is considered valid at this point as it's provided by the core
-    // to the entry point.
-    unsafe {
-        LOGGER.init(hob_list).unwrap();
+    if !ADV_LOGGER_INIT_COMPLETE.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace)).unwrap();
+        // SAFETY: The physical_hob_list pointer is considered valid at this point as it's provided by the core
+        // to the entry point.
+        unsafe {
+            LOGGER.init(hob_list).unwrap();
+        }
     }
 
     // The entry_point handles BSP vs AP routing internally
