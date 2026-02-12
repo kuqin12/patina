@@ -156,14 +156,14 @@ fn test_real_component_mm_supervisor_version_request() {
 
     // Create MM Supervisor version request using the actual structures
     let version_request = MmSupervisorRequestHeader {
-        signature: u32::from_le_bytes(mm_supv::SIGNATURE),
+        signature: mm_supv::SIGNATURE,
         revision: mm_supv::REVISION,
         request: mm_supv::requests::VERSION_INFO,
         reserved: 0,
         result: 0,
     };
 
-    let request_bytes = version_request.to_bytes();
+    let request_bytes = version_request.as_bytes().to_vec();
 
     // Send the request using the real component framework
     let result = framework.communicate(&Guid::from_ref(&test_guids::MM_SUPERVISOR), &request_bytes);
@@ -275,7 +275,7 @@ fn test_real_component_multiple_handlers() {
 
     // Test MM supervisor handler
     let supervisor_request = MmSupervisorRequestHeader {
-        signature: u32::from_le_bytes(mm_supv::SIGNATURE),
+        signature: mm_supv::SIGNATURE,
         revision: mm_supv::REVISION,
         request: mm_supv::requests::FETCH_POLICY,
         reserved: 0,
@@ -283,7 +283,7 @@ fn test_real_component_multiple_handlers() {
     };
 
     let supervisor_result =
-        framework.communicate(&Guid::from_ref(&test_guids::MM_SUPERVISOR), &supervisor_request.to_bytes());
+        framework.communicate(&Guid::from_ref(&test_guids::MM_SUPERVISOR), &supervisor_request.as_bytes().to_vec());
     assert!(supervisor_result.is_ok(), "Supervisor communication should succeed");
 
     // Both handlers should work independently through the real component infrastructure
