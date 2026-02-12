@@ -18,11 +18,13 @@ name = "example_mm_supervisor"
 path = "bin/example_mm_supervisor.rs"
 
 [dependencies]
+linkme = { workspace = true }
 log = { workspace = true }
 patina = { workspace = true }
 patina_adv_logger = { workspace = true }
 patina_internal_cpu = { workspace = true }
 patina_mm_policy = { workspace = true }
+patina_mm = { workspace = true }
 patina_paging = { workspace = true }
 patina_stacktrace = { workspace = true }
 r-efi = { workspace = true }

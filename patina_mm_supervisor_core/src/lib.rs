@@ -53,6 +53,7 @@ pub mod mm_mem;
 pub mod paging_allocator;
 pub mod privilege_mgmt;
 mod request_handler;
+pub mod supervisor_handlers;
 pub mod unblock_memory;
 
 pub use cpu::{ApState, CpuInfo, CpuManager, get_current_cpu_id, is_bsp};
@@ -66,7 +67,11 @@ pub use paging_allocator::{
     PagingPoolAllocator, PagingAllocError, SharedPagingAllocator,
     PAGING_ALLOCATOR, DEFAULT_PAGING_POOL_PAGES,
 };
-pub use request_handler::{RequestContext, RequestHandler, RequestResult, RequestDispatcher};
+pub use request_handler::{
+    RequestContext, RequestHandler, RequestResult, RequestDispatcher,
+    MmSupervisorRequestHeader, MmSupervisorVersionInfo,
+    mm_supv_protocol, requests, responses, SIGNATURE, REVISION,
+};
 pub use unblock_memory::{
     UnblockedMemoryTracker, UnblockedMemoryEntry, UnblockError,
     UNBLOCKED_MEMORY_TRACKER,
@@ -74,6 +79,9 @@ pub use unblock_memory::{
 pub use privilege_mgmt::{
     SyscallInterface,
     invoke_demoted_routine,
+};
+pub use supervisor_handlers::{
+    SupervisorMmiHandler, SUPERVISOR_MMI_HANDLERS,
 };
 
 use core::{
@@ -304,7 +312,7 @@ static SMM_CPU_PRIVATE: Once<u64> = Once::new();
 
 /// MM Communication Buffer Status Structure.
 /// Matches the C structure MM_COMM_BUFFER_STATUS from MmCommBuffer.h
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MmCommBufferStatus {
     /// Whether the data in the fixed MM communication buffer is valid when entering from non-MM to MM.
@@ -407,6 +415,32 @@ pub struct SmmCpuPrivateData {
     pub first_free_token: u64,
 }
 
+/// EFI_MM_COMMUNICATE_HEADER structure.
+///
+/// Communication buffer header used by the MM Communicate protocol.
+/// The data payload immediately follows this header.
+///
+/// Layout:
+/// - `header_guid`: 16 bytes - GUID identifying the handler
+/// - `message_length`: 8 bytes - size of `Data` in bytes (does not include header size)
+///
+/// Note: Although the C definition uses `#pragma pack(1)`, the fields are naturally aligned
+/// (16-byte GUID + 8-byte u64), so `#[repr(C)]` produces an identical layout of 24 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EfiMmCommunicateHeader {
+    /// GUID identifying the target handler for this communication.
+    pub header_guid: efi::Guid,
+    /// Size of the data payload in bytes (does not include this header).
+    pub message_length: u64,
+    // Variable-length data follows at offset 24 (0x18)
+}
+
+impl EfiMmCommunicateHeader {
+    /// Size of the header (offset to the start of the data payload).
+    pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
+}
+
 /// Request target derived from MM_COMM_BUFFER_STATUS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestTarget {
@@ -421,7 +455,7 @@ pub enum RequestTarget {
 impl From<&MmCommBufferStatus> for RequestTarget {
     fn from(status: &MmCommBufferStatus) -> Self {
         if status.is_comm_buffer_valid == 0 {
-            RequestTarget::None
+            RequestTarget::User
         } else if status.talk_to_supervisor != 0 {
             RequestTarget::Supervisor
         } else {
@@ -841,7 +875,7 @@ where
         let is_bsp = self.cpu_manager.is_bsp(cpu_id);
 
         if is_bsp {
-            log::trace!("BSP (CPU {}) entering request serving loop...", cpu_id);
+            log::info!("BSP (CPU {}) entering request serving routine...", cpu_id);
             // Enter the main request serving loop
             self.bsp_request_loop(cpu_id as usize)
         } else {
@@ -1121,33 +1155,14 @@ where
     }
 
     /// The main request serving loop for the BSP.
-    ///
-    /// The BSP sits in this loop, processing incoming requests and dispatching
-    /// work to APs as needed.
-    fn bsp_request_loop(&'static self, cpu_index: usize) -> ! {
-        log::trace!("BSP entering request serving loop...");
-
-        loop {
-            // Check for incoming requests
-            // In a real implementation, this would check the communication buffer
-            // and dispatch handlers for incoming MM requests.
-
-            // Process any pending work
-            self.process_pending_requests(cpu_index);
-
-            // Brief pause to avoid spinning too aggressively
-            core::hint::spin_loop();
-        }
-    }
-
-    /// Process pending requests from the communication buffer.
+    /// It manages other CPUs and processes pending requests from the communication buffer.
     ///
     /// This function reads the MM_COMM_BUFFER_STATUS structure to determine if there's a pending request
     /// and whether it targets the Supervisor or User module.
     ///
     /// - If targeting User: copies user comm buffer to internal, then demotes to user entry point
     /// - If targeting Supervisor: dispatches to the request dispatcher
-    fn process_pending_requests(&self, cpu_index: usize) {
+    fn bsp_request_loop(&self, cpu_index: usize) {
         // Get communication buffer configuration
         let config = match COMM_BUFFER_CONFIG.get() {
             Some(c) => c,
@@ -1169,7 +1184,7 @@ where
         };
         let target = RequestTarget::from(&status);
 
-        log::trace!(
+        log::info!(
             "Processing request: valid={}, talk_to_supervisor={}, target={:?}",
             status.is_comm_buffer_valid,
             status.talk_to_supervisor,
@@ -1187,14 +1202,6 @@ where
             RequestTarget::Supervisor => {
                 // Request targets the Supervisor
                 self.process_supervisor_request(config, &status, cpu_index);
-                // Clear the talk to supervisor flag after processing
-                // SAFETY: status_buffer is valid
-                unsafe {
-                    let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
-                    let mut cleared_status = core::ptr::read_volatile(status_ptr);
-                    cleared_status.talk_to_supervisor = 0;
-                    core::ptr::write_volatile(status_ptr, cleared_status);
-                }
             }
         }
     }
@@ -1209,7 +1216,7 @@ where
     /// 5. Demotes to the user entry point via `invoke_demoted_routine`
     /// 6. On return, copies back the user comm buffer and reads the updated status
     fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
-        log::trace!("Processing User request...");
+        log::info!("Processing User request...");
 
         // Validate buffers
         if config.user_comm_buffer == 0 || config.user_comm_buffer_internal == 0 {
@@ -1324,7 +1331,7 @@ where
                 context_size as u64,
             )
         };
-        log::info!("Returned from user request with value: 0x{:016x}", ret);
+        log::info!("Returned from user request with value: 0x{}", ret);
 
         // Copy the response from the internal buffer back to the user buffer
         // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
@@ -1360,9 +1367,22 @@ where
 
     /// Process a request targeting the Supervisor.
     ///
-    /// Dispatches to the registered request handlers.
+    /// Parses the [`EfiMmCommunicateHeader`] from the supervisor communication buffer,
+    /// matches the header GUID against the [`SUPERVISOR_MMI_HANDLERS`] distributed slice,
+    /// and invokes the first matching handler. Handlers are registered at build time,
+    /// allowing platforms to link in additional handlers without modifying the core.
+    ///
+    /// ## Dispatch Flow
+    ///
+    /// 1. Zero the internal buffer and copy the external supervisor buffer into it
+    /// 2. Parse the `EfiMmCommunicateHeader` (GUID + message length) from the internal buffer
+    /// 3. Validate message length does not exceed the buffer size
+    /// 4. Iterate [`SUPERVISOR_MMI_HANDLERS`] to find a handler matching the header GUID
+    /// 5. Call the handler with a pointer to the data payload and mutable size
+    /// 6. Update the status buffer with return status and total response size
+    /// 7. Copy the internal buffer back to the external buffer
     fn process_supervisor_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
-        log::trace!("Processing Supervisor request...");
+        log::info!("Processing Supervisor request on CPU {}...", cpu_index);
 
         // Validate buffers
         if config.supv_comm_buffer == 0 || config.supv_comm_buffer_internal == 0 {
@@ -1370,37 +1390,143 @@ where
             return;
         }
 
-        // Copy supervisor buffer to internal buffer for processing
-        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        let buffer_size = config.supv_comm_buffer_size as usize;
+
+        // Zero the internal buffer then copy the external supervisor buffer into it
+        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid and non-overlapping
         unsafe {
+            core::ptr::write_bytes(config.supv_comm_buffer_internal as *mut u8, 0, buffer_size);
             core::ptr::copy_nonoverlapping(
                 config.supv_comm_buffer as *const u8,
                 config.supv_comm_buffer_internal as *mut u8,
-                config.supv_comm_buffer_size as usize,
+                buffer_size,
             );
         }
 
-        // TODO: Dispatch to request handlers via self.request_dispatcher
-        // The request_dispatcher will parse the communication buffer and
-        // invoke the appropriate registered handler.
-        log::trace!("Supervisor request dispatch (not yet implemented)");
-
-        // Clear the status buffer after processing by marking buffer as invalid
-        // SAFETY: status_buffer is valid
-        unsafe {
-            let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
-            let mut cleared_status = *status;
-            cleared_status.is_comm_buffer_valid = 0;
-            core::ptr::write_volatile(status_ptr, cleared_status);
+        // Parse the EfiMmCommunicateHeader from the internal buffer
+        if buffer_size < EfiMmCommunicateHeader::HEADER_SIZE {
+            log::error!(
+                "Supervisor buffer too small for communicate header: {} < {}",
+                buffer_size,
+                EfiMmCommunicateHeader::HEADER_SIZE
+            );
+            self.write_supv_status(config, status, efi::Status::BAD_BUFFER_SIZE, 0);
+            return;
         }
 
-        // Copy any response from the internal buffer back to the supervisor buffer for the caller to consume after processing
-        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        // SAFETY: We verified the buffer is large enough for the header.
+        // The header is packed so we use read_unaligned.
+        let header = unsafe {
+            core::ptr::read_unaligned(config.supv_comm_buffer_internal as *const EfiMmCommunicateHeader)
+        };
+
+        let message_length = header.message_length as usize;
+
+        // Validate message length doesn't exceed the buffer
+        if message_length > buffer_size.saturating_sub(EfiMmCommunicateHeader::HEADER_SIZE) {
+            log::error!(
+                "Message length 0x{:x} exceeds available buffer space 0x{:x}",
+                message_length,
+                buffer_size - EfiMmCommunicateHeader::HEADER_SIZE
+            );
+            self.write_supv_status(config, status, efi::Status::BAD_BUFFER_SIZE, 0);
+            return;
+        }
+
+        // Compute pointer to the data payload (after the header)
+        let data_ptr = unsafe {
+            (config.supv_comm_buffer_internal as *mut u8).add(EfiMmCommunicateHeader::HEADER_SIZE)
+        };
+        let mut data_size = message_length;
+
+        // Dispatch: iterate the SUPERVISOR_MMI_HANDLERS distributed slice to find a match
+        let handler_guid = header.header_guid;
+        let mut dispatch_status = efi::Status::NOT_FOUND;
+
+        for handler in SUPERVISOR_MMI_HANDLERS.iter() {
+            if handler.handler_guid == handler_guid {
+                log::trace!(
+                    "Dispatching supervisor request to handler '{}' (GUID: {:?})",
+                    handler.name,
+                    handler.handler_guid
+                );
+                dispatch_status = (handler.handle)(data_ptr, &mut data_size);
+                break;
+            }
+        }
+
+        if dispatch_status == efi::Status::NOT_FOUND {
+            log::warn!(
+                "No handler found for supervisor request GUID: {:?}",
+                handler_guid
+            );
+        }
+
+        // Compute the total response size (header + data) for the copy-back
+        let total_response_size = data_size + EfiMmCommunicateHeader::HEADER_SIZE;
+
+        // Copy the (possibly modified) internal buffer back to the external buffer
+        if total_response_size <= buffer_size {
+            // SAFETY: Both buffers are valid and total_response_size is within bounds
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    config.supv_comm_buffer_internal as *const u8,
+                    config.supv_comm_buffer as *mut u8,
+                    total_response_size,
+                );
+            }
+        } else {
+            log::error!(
+                "Response size 0x{:x} exceeds buffer capacity 0x{:x}",
+                total_response_size,
+                buffer_size
+            );
+        }
+        log::info!(
+            "Copied {} bytes from internal buffer 0x{:x} back to external 0x{:x}",
+            total_response_size,
+            config.supv_comm_buffer_internal,
+            config.supv_comm_buffer
+        );
+
+        // Update the status buffer with return status and response size
+        let return_status = if dispatch_status == efi::Status::SUCCESS {
+            efi::Status::SUCCESS
+        } else {
+            efi::Status::NOT_FOUND
+        };
+        self.write_supv_status(config, status, return_status, total_response_size as u64);
+    }
+
+    /// Write the supervisor status buffer after processing a supervisor request.
+    ///
+    /// Clears `is_comm_buffer_valid` and `talk_to_supervisor`, sets return status and size.
+    fn write_supv_status(
+        &self,
+        config: &CommBufferConfig,
+        _status: &MmCommBufferStatus,
+        return_status: efi::Status,
+        return_buffer_size: u64,
+    ) {
+        // SAFETY: status_buffer is valid and writable, set up by MM IPL
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                config.supv_comm_buffer_internal as *const u8,
-                config.supv_comm_buffer as *mut u8,
-                config.supv_comm_buffer_size as usize,
+            let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
+            let updated = MmCommBufferStatus {
+                is_comm_buffer_valid: 0,
+                talk_to_supervisor: 0,
+                return_status: return_status.as_usize() as u64,
+                return_buffer_size,
+            };
+            core::ptr::write_volatile(status_ptr, updated);
+            // Dump the content from the status_ptr
+            let dumped_status = core::ptr::read_volatile(status_ptr);
+            log::info!("written to supervisor status buffer at 0x{:x}", status_ptr as usize);
+            log::info!(
+                "Updated supervisor status buffer: is_comm_buffer_valid={}, talk_to_supervisor={}, return_status=0x{:x}, return_buffer_size=0x{:x}",
+                dumped_status.is_comm_buffer_valid,
+                dumped_status.talk_to_supervisor,
+                dumped_status.return_status,
+                dumped_status.return_buffer_size
             );
         }
     }

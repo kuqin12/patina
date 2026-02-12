@@ -19,6 +19,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 use r_efi::efi;
 
+// Re-export shared protocol types from patina_mm so consumers of this crate get them too.
+pub use patina_mm::protocol::mm_supervisor_request::{
+    self as mm_supv_protocol,
+    MmSupervisorRequestHeader,
+    MmSupervisorVersionInfo,
+    requests,
+    responses,
+    SIGNATURE,
+    REVISION,
+};
+
 /// The result of a request handler invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestResult {
@@ -355,57 +366,6 @@ impl<const MAX_HANDLERS: usize> Default for RequestDispatcher<MAX_HANDLERS> {
     }
 }
 
-/// Standard MM Supervisor request types.
-pub mod requests {
-    /// Request to unblock memory regions.
-    pub const UNBLOCK_MEM: u32 = 0x0001;
-    /// Request to fetch security policy.
-    pub const FETCH_POLICY: u32 = 0x0002;
-    /// Request for version information.
-    pub const VERSION_INFO: u32 = 0x0003;
-    /// Request to update communication buffer.
-    pub const COMM_UPDATE: u32 = 0x0004;
-}
-
-/// Header for MM Supervisor requests.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct MmSupervisorRequestHeader {
-    /// Signature to identify the request ('MSUP').
-    pub signature: u32,
-    /// Revision of the request protocol.
-    pub revision: u32,
-    /// The specific request type.
-    pub request: u32,
-    /// Reserved for alignment.
-    pub reserved: u32,
-}
-
-impl MmSupervisorRequestHeader {
-    /// The expected signature value ('MSUP' as little-endian).
-    pub const SIGNATURE: u32 = 0x5055534D;
-
-    /// Current revision of the request protocol.
-    pub const REVISION: u32 = 1;
-
-    /// Validates the header.
-    pub fn is_valid(&self) -> bool {
-        self.signature == Self::SIGNATURE && self.revision <= Self::REVISION
-    }
-}
-
-/// Response from MM Supervisor version info request.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct MmSupervisorVersionInfo {
-    /// Version of the MM Supervisor.
-    pub version: u32,
-    /// Patch level.
-    pub patch_level: u32,
-    /// Maximum supported request level.
-    pub max_supervisor_request_level: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,18 +459,20 @@ mod tests {
     #[test]
     fn test_request_header_validation() {
         let valid_header = MmSupervisorRequestHeader {
-            signature: MmSupervisorRequestHeader::SIGNATURE,
-            revision: MmSupervisorRequestHeader::REVISION,
+            signature: SIGNATURE,
+            revision: REVISION,
             request: requests::VERSION_INFO,
             reserved: 0,
+            result: 0,
         };
         assert!(valid_header.is_valid());
 
         let invalid_header = MmSupervisorRequestHeader {
             signature: 0x12345678,
-            revision: MmSupervisorRequestHeader::REVISION,
+            revision: REVISION,
             request: requests::VERSION_INFO,
             reserved: 0,
+            result: 0,
         };
         assert!(!invalid_header.is_valid());
     }
