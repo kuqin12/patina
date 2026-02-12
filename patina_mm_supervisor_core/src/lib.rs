@@ -298,6 +298,10 @@ static COMM_BUFFER_CONFIG: Once<CommBufferConfig> = Once::new();
 /// User module entry point discovered from HOB list.
 static USER_ENTRY_POINT: Once<u64> = Once::new();
 
+/// Pointer to the SMM_CPU_PRIVATE_DATA structure from the PassDown HOB.
+/// This is used to access the SmmCoreEntryContext for user request dispatch.
+static SMM_CPU_PRIVATE: Once<u64> = Once::new();
+
 /// MM Communication Buffer Status Structure.
 /// Matches the C structure MM_COMM_BUFFER_STATUS from MmCommBuffer.h
 #[repr(C, packed)]
@@ -311,6 +315,96 @@ pub struct MmCommBufferStatus {
     pub return_status: u64,
     /// The size in bytes of the output buffer when returning from MM to non-MM.
     pub return_buffer_size: u64,
+}
+
+/// EFI_SMM_RESERVED_SMRAM_REGION structure.
+///
+/// Describes a reserved SMRAM region that cannot be used for the SMRAM heap.
+/// Matches the C structure from PI specification.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EfiSmmReservedSmramRegion {
+    /// Starting address of the reserved SMRAM area.
+    pub smram_reserved_start: u64,
+    /// Number of bytes occupied by the reserved SMRAM area.
+    pub smram_reserved_size: u64,
+}
+
+/// EFI_MM_ENTRY_CONTEXT structure.
+///
+/// Processor information and functionality needed by MM Foundation.
+/// Matches the C `EFI_MM_ENTRY_CONTEXT` / `EFI_SMM_ENTRY_CONTEXT` from PI specification.
+///
+/// Layout (x86_64, all fields 8 bytes):
+/// - `mm_startup_this_ap`: Function pointer for `EFI_MM_STARTUP_THIS_AP`
+/// - `currently_executing_cpu`: Index of the processor executing the MM Foundation
+/// - `number_of_cpus`: Total number of possible processors in the platform (1-based)
+/// - `cpu_save_state_size`: Pointer to array of save state sizes per CPU
+/// - `cpu_save_state`: Pointer to array of CPU save state pointers
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EfiMmEntryContext {
+    /// Function pointer for EFI_MM_STARTUP_THIS_AP.
+    pub mm_startup_this_ap: u64,
+    /// Index of the currently executing CPU.
+    pub currently_executing_cpu: u64,
+    /// Total number of CPUs (1-based).
+    pub number_of_cpus: u64,
+    /// Pointer to array of per-CPU save state sizes.
+    pub cpu_save_state_size: u64,
+    /// Pointer to array of per-CPU save state pointers.
+    pub cpu_save_state: u64,
+}
+
+/// SMM_CPU_PRIVATE_DATA structure.
+///
+/// Private structure for the SMM CPU module, passed from PEI via the PassDown HOB.
+/// Matches the C `SMM_CPU_PRIVATE_DATA` layout from MpService.h.
+///
+/// Layout (x86_64):
+/// ```text
+/// Offset  Field
+/// 0x00    signature (UINTN)
+/// 0x08    smm_cpu_handle (EFI_HANDLE)
+/// 0x10    processor_info (ptr)
+/// 0x18    cpu_save_state_size (ptr)
+/// 0x20    cpu_save_state (ptr)
+/// 0x28    smm_reserved_smram_region[1] (16 bytes)
+/// 0x38    smm_core_entry_context (40 bytes, inline)
+/// 0x60    smm_core_entry (fn ptr)
+/// 0x68    smm_user_entry (fn ptr)
+/// 0x70    ap_wrapper_func (ptr)
+/// 0x78    token_list (ptr)
+/// 0x80    first_free_token (ptr)
+/// Total:  0x88 bytes
+/// ```
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SmmCpuPrivateData {
+    /// Signature ('scpu').
+    pub signature: u64,
+    /// SMM CPU handle.
+    pub smm_cpu_handle: u64,
+    /// Pointer to processor information array.
+    pub processor_info: u64,
+    /// Pointer to per-CPU save state size array.
+    pub cpu_save_state_size: u64,
+    /// Pointer to per-CPU save state pointer array.
+    pub cpu_save_state: u64,
+    /// Reserved SMRAM region descriptor (single element array).
+    pub smm_reserved_smram_region: EfiSmmReservedSmramRegion,
+    /// Inline entry context structure (40 bytes).
+    pub smm_core_entry_context: EfiMmEntryContext,
+    /// Supervisor core entry point function pointer.
+    pub smm_core_entry: u64,
+    /// User core entry point function pointer.
+    pub smm_user_entry: u64,
+    /// AP wrapper function pointer.
+    pub ap_wrapper_func: u64,
+    /// Token list pointer.
+    pub token_list: u64,
+    /// First free token pointer.
+    pub first_free_token: u64,
 }
 
 /// Request target derived from MM_COMM_BUFFER_STATUS.
@@ -335,6 +429,15 @@ impl From<&MmCommBufferStatus> for RequestTarget {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserCommandType {
+    /// Command to initiate the user level core
+    StartUserCore,
+    /// Command to execute a user level request from the supervisor
+    UserRequest,
+}
+
 
 /// The MM Supervisor Core responsible for managing the standalone MM environment.
 ///
@@ -568,9 +671,15 @@ where
                 }
             };
             let ret = unsafe {
-                invoke_demoted_routine (cpu_index, user_entry, cpl3_stack, 3, 0, hob_list, 0)
+                invoke_demoted_routine (
+                    cpu_index,
+                    user_entry,
+                    cpl3_stack,
+                    3,
+                    UserCommandType::StartUserCore as u64,
+                    hob_list,
+                    0)
             };
-            log::error!("here 6");
             log::info!("Returned from user entry point with value: 0x{:016x}", ret);
 
             // Mark BSP init as complete so APs can proceed
@@ -734,7 +843,7 @@ where
         if is_bsp {
             log::trace!("BSP (CPU {}) entering request serving loop...", cpu_id);
             // Enter the main request serving loop
-            self.bsp_request_loop()
+            self.bsp_request_loop(cpu_id as usize)
         } else {
             log::trace!("AP (CPU {}) entering holding pen...", cpu_id);
             // Enter the holding pen
@@ -864,6 +973,9 @@ where
                     let cpl3_stack_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_stack_base).read() };
                     let cpl3_stack_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_per_core_stack_size).read() };
 
+                    // Extract CPU private data pointer
+                    let cpu_private = unsafe { core::ptr::addr_of!(pass_down.mm_supv_cpu_private).read() };
+
                     // Validate revision
                     if revision != MM_SUPV_PASS_DOWN_HOB_REVISION {
                         log::error!(
@@ -883,6 +995,14 @@ where
                         log::info!("MM Initialized buffer set to 0x{:016x}", mm_initialized_buffer);
                     } else {
                         log::warn!("MM Initialized buffer is null in PassDown HOB");
+                    }
+
+                    // Store CPU private data pointer for SmmCoreEntryContext access
+                    if cpu_private != 0 {
+                        SMM_CPU_PRIVATE.call_once(|| cpu_private);
+                        log::info!("SMM CPU Private data at 0x{:016x}", cpu_private);
+                    } else {
+                        log::warn!("SMM CPU Private data pointer is null in PassDown HOB");
                     }
 
                     // Store communication buffer configuration
@@ -1004,7 +1124,7 @@ where
     ///
     /// The BSP sits in this loop, processing incoming requests and dispatching
     /// work to APs as needed.
-    fn bsp_request_loop(&'static self) -> ! {
+    fn bsp_request_loop(&'static self, cpu_index: usize) -> ! {
         log::trace!("BSP entering request serving loop...");
 
         loop {
@@ -1013,7 +1133,7 @@ where
             // and dispatch handlers for incoming MM requests.
 
             // Process any pending work
-            self.process_pending_requests();
+            self.process_pending_requests(cpu_index);
 
             // Brief pause to avoid spinning too aggressively
             core::hint::spin_loop();
@@ -1027,7 +1147,7 @@ where
     ///
     /// - If targeting User: copies user comm buffer to internal, then demotes to user entry point
     /// - If targeting Supervisor: dispatches to the request dispatcher
-    fn process_pending_requests(&self) {
+    fn process_pending_requests(&self, cpu_index: usize) {
         // Get communication buffer configuration
         let config = match COMM_BUFFER_CONFIG.get() {
             Some(c) => c,
@@ -1062,20 +1182,33 @@ where
             }
             RequestTarget::User => {
                 // Request targets the User module
-                self.process_user_request(config, &status);
+                self.process_user_request(config, &status, cpu_index);
             }
             RequestTarget::Supervisor => {
                 // Request targets the Supervisor
-                self.process_supervisor_request(config, &status);
+                self.process_supervisor_request(config, &status, cpu_index);
+                // Clear the talk to supervisor flag after processing
+                // SAFETY: status_buffer is valid
+                unsafe {
+                    let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
+                    let mut cleared_status = core::ptr::read_volatile(status_ptr);
+                    cleared_status.talk_to_supervisor = 0;
+                    core::ptr::write_volatile(status_ptr, cleared_status);
+                }
             }
         }
     }
 
     /// Process a request targeting the User module.
     ///
-    /// Copies the user communication buffer to the internal buffer,
-    /// then demotes control to the user entry point.
-    fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus) {
+    /// This function implements the user-mode MMI dispatch pathway:
+    /// 1. Updates `SmmCoreEntryContext.CurrentlyExecutingCpu` in the CPU private data
+    /// 2. Copies the `EfiMmEntryContext` into the supervisor-to-user data buffer
+    /// 3. Appends the `MmCommBufferStatus` immediately after the context
+    /// 4. For synchronous MMIs, copies the user comm buffer to the internal copy
+    /// 5. Demotes to the user entry point via `invoke_demoted_routine`
+    /// 6. On return, copies back the user comm buffer and reads the updated status
+    fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
         log::trace!("Processing User request...");
 
         // Validate buffers
@@ -1084,21 +1217,10 @@ where
             return;
         }
 
-        // Copy user buffer to user internal buffer
-        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                config.user_comm_buffer as *const u8,
-                config.user_comm_buffer_internal as *mut u8,
-                config.user_comm_buffer_size as usize,
-            );
+        if config.supv_to_user_buffer == 0 {
+            log::error!("Supervisor-to-user data buffer not configured");
+            return;
         }
-        log::trace!(
-            "Copied {} bytes from user buffer 0x{:x} to internal 0x{:x}",
-            config.user_comm_buffer_size,
-            config.user_comm_buffer,
-            config.user_comm_buffer_internal
-        );
 
         // Get user entry point
         let user_entry = match USER_ENTRY_POINT.get() {
@@ -1109,28 +1231,137 @@ where
             }
         };
 
-        // TODO: Demote to user entry point (ring transition)
-        // This will involve:
-        // 1. Setting up the user stack
-        // 2. Transitioning to Ring 3 via sysret or iret
-        // 3. Jumping to user_entry
-        log::info!("Demoting to User module at 0x{:016x} (not yet implemented)", user_entry);
-        // invoke_demoted_routine (user_entry, , );
+        // Get SMM CPU private data pointer
+        let cpu_private_addr = match SMM_CPU_PRIVATE.get() {
+            Some(&addr) if addr != 0 => addr,
+            _ => {
+                log::error!("SMM CPU Private data not configured, cannot dispatch to user");
+                return;
+            }
+        };
 
-        // Clear the status buffer after processing by marking buffer as invalid
-        // SAFETY: status_buffer is valid
+        // Demote to user entry point to process the request
+        let cpl3_stack = match self.syscall_interface.get_cpl3_stack(cpu_index) {
+            Ok(stack) => stack,
+            Err(e) => {
+                log::error!("Failed to get CPL3 stack for CPU {}: {:?}", cpu_index, e);
+                return;
+            }
+        };
+
+        // Update the currently executing CPU index in the SmmCoreEntryContext
+        // SAFETY: cpu_private_addr was provided by MM IPL via the PassDown HOB and points
+        // to a valid SMM_CPU_PRIVATE_DATA structure in SMRAM.
+        let cpu_private = unsafe { &mut *(cpu_private_addr as *mut SmmCpuPrivateData) };
+        cpu_private.smm_core_entry_context.currently_executing_cpu = cpu_index as u64;
+
+        // Copy the EfiMmEntryContext into the supervisor-to-user data buffer so the user
+        // can read processor information after demotion
+        let context_size = core::mem::size_of::<EfiMmEntryContext>();
+        let status_size = core::mem::size_of::<MmCommBufferStatus>();
+
+        // Validate the supervisor-to-user buffer is large enough for context + status
+        if (config.supv_to_user_buffer_size as usize) < context_size + status_size {
+            log::error!(
+                "Supervisor-to-user buffer too small: {} < {} (context) + {} (status)",
+                config.supv_to_user_buffer_size,
+                context_size,
+                status_size
+            );
+            return;
+        }
+
+        // SAFETY: supv_to_user_buffer is valid and large enough, verified above.
+        unsafe {
+            // Copy the EfiMmEntryContext to the start of the supervisor-to-user buffer
+            core::ptr::copy_nonoverlapping(
+                &cpu_private.smm_core_entry_context as *const EfiMmEntryContext as *const u8,
+                config.supv_to_user_buffer as *mut u8,
+                context_size,
+            );
+
+            // Copy the MmCommBufferStatus right after the context
+            core::ptr::copy_nonoverlapping(
+                status as *const MmCommBufferStatus as *const u8,
+                (config.supv_to_user_buffer as *mut u8).add(context_size),
+                status_size,
+            );
+        }
+
+        // Determine whether this is synchronous or asynchronous request
+        let sync_mmi = status.is_comm_buffer_valid;
+
+        if sync_mmi != 0 {
+            // Copy user buffer to user internal buffer for processing in Ring 3
+            // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    config.user_comm_buffer as *const u8,
+                    config.user_comm_buffer_internal as *mut u8,
+                    config.user_comm_buffer_size as usize,
+                );
+            }
+            log::trace!(
+                "Copied {} bytes from user buffer 0x{:x} to internal 0x{:x}",
+                config.user_comm_buffer_size,
+                config.user_comm_buffer,
+                config.user_comm_buffer_internal
+            );
+        }
+
+        // Invoke the demoted user entry point with:
+        //   arg1: UserCommandType::UserRequest (command type)
+        //   arg2: supv_to_user_buffer (pointer to EfiMmEntryContext + MmCommBufferStatus)
+        //   arg3: sizeof(EfiMmEntryContext) (size of the context portion)
+        let ret = unsafe {
+            invoke_demoted_routine(
+                cpu_index,
+                user_entry,
+                cpl3_stack,
+                3,
+                UserCommandType::UserRequest as u64,
+                config.supv_to_user_buffer,
+                context_size as u64,
+            )
+        };
+        log::info!("Returned from user request with value: 0x{:016x}", ret);
+
+        // Copy the response from the internal buffer back to the user buffer
+        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        if sync_mmi != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    config.user_comm_buffer_internal as *const u8,
+                    config.user_comm_buffer as *mut u8,
+                    config.user_comm_buffer_size as usize,
+                );
+            }
+        }
+
+        // Read the updated MmCommBufferStatus back from the supervisor-to-user buffer
+        // (the user may have modified return_status and return_buffer_size)
+        // SAFETY: supv_to_user_buffer is valid and the status is at offset context_size
+        let returned_status = unsafe {
+            core::ptr::read(
+                (config.supv_to_user_buffer as *const u8).add(context_size) as *const MmCommBufferStatus,
+            )
+        };
+
+        // Write the returned status back to the supervisor's status buffer, clearing
+        // is_comm_buffer_valid to indicate processing is complete
+        // SAFETY: status_buffer is valid and writable
         unsafe {
             let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
-            let mut cleared_status = *status;
-            cleared_status.is_comm_buffer_valid = 0;
-            core::ptr::write_volatile(status_ptr, cleared_status);
+            let mut final_status = returned_status;
+            final_status.is_comm_buffer_valid = 0;
+            core::ptr::write_volatile(status_ptr, final_status);
         }
     }
 
     /// Process a request targeting the Supervisor.
     ///
     /// Dispatches to the registered request handlers.
-    fn process_supervisor_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus) {
+    fn process_supervisor_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
         log::trace!("Processing Supervisor request...");
 
         // Validate buffers
@@ -1161,6 +1392,16 @@ where
             let mut cleared_status = *status;
             cleared_status.is_comm_buffer_valid = 0;
             core::ptr::write_volatile(status_ptr, cleared_status);
+        }
+
+        // Copy any response from the internal buffer back to the supervisor buffer for the caller to consume after processing
+        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                config.supv_comm_buffer_internal as *const u8,
+                config.supv_comm_buffer as *mut u8,
+                config.supv_comm_buffer_size as usize,
+            );
         }
     }
 
