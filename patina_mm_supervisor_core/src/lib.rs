@@ -199,7 +199,7 @@ pub enum PolicyInitError {
     InvalidPolicyData,
 }
 
-use spin::Once;
+use spin::{Mutex, Once};
 use patina_internal_cpu::interrupts::Interrupts;
 
 global_asm!(include_str!("entry_point.asm"));
@@ -257,6 +257,13 @@ static PER_CORE_INIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// for the MM Supervisor. It is stored in a static variable for global access.
 /// The policy gate is initialized from the firmware policy buffer provided in the PassDown HOB.
 pub(crate) static POLICY_GATE: Once<patina_mm_policy::PolicyGate> = Once::new();
+
+/// Global page table instance for managing page attributes.
+///
+/// Initialized during BSP init from the active CR3 register. This allows the supervisor
+/// to modify page table attributes (e.g., marking supervisor pages as R/W + NX) when
+/// allocating memory.
+pub(crate) static PAGE_TABLE: Mutex<Option<X64PageTable<SharedPagingAllocator>>> = Mutex::new(None);
 
 // ============================================================================
 // Communication Buffer Pointers (from PassDown HOB)
@@ -658,8 +665,15 @@ where
             }
         }
 
-        let mut paging_alloc = paging_allocator::SharedPagingAllocator::new(&paging_allocator::PAGING_ALLOCATOR);
-        let paging = X64PageTable::new(paging_alloc, PagingType::Paging4Level);
+        // Initialize the global page table from the active CR3.
+        // This allows the supervisor to modify page attributes on newly allocated pages.
+        let cr3 = read_cr3();
+        let paging_alloc = paging_allocator::SharedPagingAllocator::new(&paging_allocator::PAGING_ALLOCATOR);
+        let page_table = unsafe {
+            X64PageTable::from_existing(cr3, paging_alloc, PagingType::Paging4Level)
+        }.expect("Failed to create page table from active CR3");
+        *PAGE_TABLE.lock() = Some(page_table);
+        log::info!("Page table initialized from CR3=0x{:016x}", cr3);
 
         // Discover the MM Supervisor User module entry point from the HOB list.
         // We look for EFI_HOB_TYPE_MEMORY_ALLOCATION HOBs that have:

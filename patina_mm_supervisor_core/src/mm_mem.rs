@@ -46,6 +46,7 @@ use core::{
 use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
 use r_efi::efi;
 use spin::Mutex;
+use patina_paging::{MemoryAttributes, PageTable};
 
 // ============================================================================
 // Constants
@@ -634,6 +635,9 @@ impl PageAllocator {
     }
 
     /// Allocates contiguous pages from SMRAM with the specified allocation type.
+    ///
+    /// For `Supervisor` allocations, the allocated region is marked as supervisor-owned
+    /// data pages (R/W, non-executable) in the page table.
     pub fn allocate_pages_with_type(
         &self,
         num_pages: usize,
@@ -647,49 +651,144 @@ impl PageAllocator {
             return Err(PageAllocError::OutOfMemory);
         }
 
-        let _guard = self.lock.lock();
+        let allocated_addr = {
+            let _guard = self.lock.lock();
 
-        // SAFETY: We have exclusive access via the lock
-        unsafe {
-            let regions = self.get_regions();
+            // SAFETY: We have exclusive access via the lock
+            unsafe {
+                let regions = self.get_regions();
 
-            // Try each region
-            for region in regions.iter() {
-                // First-fit search for contiguous pages
-                let mut run_start = 0usize;
-                let mut run_length = 0usize;
+                let mut found: Option<u64> = None;
+                // Try each region
+                'outer: for region in regions.iter() {
+                    // First-fit search for contiguous pages
+                    let mut run_start = 0usize;
+                    let mut run_length = 0usize;
 
-                for page_in_region in 0..region.total_pages {
-                    let bit_index = region.bitmap_start_bit + page_in_region;
-                    if self.is_bit_allocated(bit_index) {
-                        run_start = page_in_region + 1;
-                        run_length = 0;
-                    } else {
-                        run_length += 1;
-                        if run_length == num_pages {
-                            // Found a suitable run, allocate it
-                            for p in run_start..run_start + num_pages {
-                                let bit = region.bitmap_start_bit + p;
-                                self.set_bit_allocated(bit, alloc_type);
+                    for page_in_region in 0..region.total_pages {
+                        let bit_index = region.bitmap_start_bit + page_in_region;
+                        if self.is_bit_allocated(bit_index) {
+                            run_start = page_in_region + 1;
+                            run_length = 0;
+                        } else {
+                            run_length += 1;
+                            if run_length == num_pages {
+                                // Found a suitable run, allocate it
+                                for p in run_start..run_start + num_pages {
+                                    let bit = region.bitmap_start_bit + p;
+                                    self.set_bit_allocated(bit, alloc_type);
+                                }
+                                let addr = region.base + (run_start as u64 * PAGE_SIZE as u64);
+                                log::trace!(
+                                    "Allocated {} {:?} page(s) at 0x{:016x}",
+                                    num_pages,
+                                    alloc_type,
+                                    addr
+                                );
+                                found = Some(addr);
+                                break 'outer;
                             }
-                            let addr = region.base + (run_start as u64 * PAGE_SIZE as u64);
-                            log::trace!(
-                                "Allocated {} {:?} page(s) at 0x{:016x}",
-                                num_pages,
-                                alloc_type,
-                                addr
-                            );
-                            return Ok(addr);
                         }
                     }
                 }
-            }
-        }
 
-        Err(PageAllocError::OutOfMemory)
+                found
+            }
+        }; // lock is dropped here
+
+        let addr = allocated_addr.ok_or(PageAllocError::OutOfMemory)?;
+
+        // For supervisor allocations, update page table attributes to mark as
+        // supervisor-owned data pages (R/W/NX/S), otherwise they would
+        // default to user data (R/W/NX/U).
+        self.apply_data_page_attributes(addr, num_pages, alloc_type);
+
+        Ok(addr)
+    }
+
+    /// Applies supervisor page table attributes to a newly allocated region.
+    ///
+    /// Marks pages as supervisor-owned data pages: Read/Write + Non-Executable (NX).
+    /// This ensures supervisor data cannot be executed, providing W^X enforcement.
+    ///
+    /// If the global page table is not yet initialized (e.g., during early boot),
+    /// this is a no-op with a warning.
+    fn apply_data_page_attributes(&self, addr: u64, num_pages: usize, _alloc_type: AllocationType) {
+
+        let size = (num_pages * PAGE_SIZE) as u64;
+        let mut pt_guard = crate::PAGE_TABLE.lock();
+        if let Some(ref mut pt) = *pt_guard {
+            // Data pages: R/W (no ReadOnly) + NX (ExecuteProtect)
+            let mut attributes = MemoryAttributes::ExecuteProtect;
+            
+            if _alloc_type == AllocationType::Supervisor {
+                // For Supervisor allocations, we additionally want the U/S bit cleared (Supervisor-only).
+                attributes = attributes | MemoryAttributes::Special; // Ensure not writable by user code
+            }
+
+            if let Err(e) = pt.map_memory_region(addr, size, attributes) {
+                log::error!(
+                    "Failed to set supervisor page attributes for 0x{:016x} ({} pages): {:?}",
+                    addr,
+                    num_pages,
+                    e
+                );
+            } else {
+                log::trace!(
+                    "Marked 0x{:016x} ({} pages) as supervisor R/W+NX",
+                    addr,
+                    num_pages,
+                );
+            }
+        } else {
+            log::warn!(
+                "Page table not initialized, skipping attribute update for 0x{:016x}",
+                addr
+            );
+        }
+    }
+
+    /// Applies restrictive page table attributes to freed pages.
+    ///
+    /// Marks pages as completely inaccessible: Supervisor + ReadProtect + ExecuteProtect (NX).
+    /// This prevents any read, write, or execute access to freed memory, mitigating
+    /// use-after-free vulnerabilities.
+    ///
+    /// If the global page table is not yet initialized (e.g., during early boot),
+    /// this is a no-op with a warning.
+    fn apply_freed_page_attributes(&self, addr: u64, num_pages: usize) {
+
+        let size = (num_pages * PAGE_SIZE) as u64;
+        let mut pt_guard = crate::PAGE_TABLE.lock();
+        if let Some(ref mut pt) = *pt_guard {
+            // Freed pages: ReadProtect (not present) + NX (no execute) + ReadOnly (no write)
+            // This makes the pages completely inaccessible.
+            if let Err(e) = pt.unmap_memory_region(addr, size) {
+                log::error!(
+                    "Failed to set freed page attributes for 0x{:016x} ({} pages): {:?}",
+                    addr,
+                    num_pages,
+                    e
+                );
+            } else {
+                log::trace!(
+                    "Marked 0x{:016x} ({} pages) as inaccessible (RP+NX+RO+S)",
+                    addr,
+                    num_pages,
+                );
+            }
+        } else {
+            log::warn!(
+                "Page table not initialized, skipping freed page attribute update for 0x{:016x}",
+                addr
+            );
+        }
     }
 
     /// Frees previously allocated pages.
+    ///
+    /// After freeing, the pages are marked as inaccessible in the page table
+    /// (Supervisor + ReadProtect + ExecuteProtect) to prevent use-after-free.
     pub fn free_pages(&self, addr: u64, num_pages: usize) -> Result<(), PageAllocError> {
         if !self.initialized.load(Ordering::Acquire) {
             return Err(PageAllocError::NotInitialized);
@@ -699,37 +798,45 @@ impl PageAllocator {
             return Err(PageAllocError::NotAligned);
         }
 
-        let _guard = self.lock.lock();
+        {
+            let _guard = self.lock.lock();
 
-        unsafe {
-            let (region_index, page_in_region) = self
-                .find_region_for_address(addr)
-                .ok_or(PageAllocError::InvalidAddress)?;
+            unsafe {
+                let (region_index, page_in_region) = self
+                    .find_region_for_address(addr)
+                    .ok_or(PageAllocError::InvalidAddress)?;
 
-            let regions = self.get_regions();
-            let region = &regions[region_index];
+                let regions = self.get_regions();
+                let region = &regions[region_index];
 
-            // Verify all pages are allocated
-            for p in 0..num_pages {
-                let bit = region.bitmap_start_bit + page_in_region + p;
-                if !self.is_bit_allocated(bit) {
-                    return Err(PageAllocError::NotAllocated);
+                // Verify all pages are allocated
+                for p in 0..num_pages {
+                    let bit = region.bitmap_start_bit + page_in_region + p;
+                    if !self.is_bit_allocated(bit) {
+                        return Err(PageAllocError::NotAllocated);
+                    }
                 }
-            }
 
-            // Free the pages
-            for p in 0..num_pages {
-                let bit = region.bitmap_start_bit + page_in_region + p;
-                self.set_bit_free(bit);
-            }
+                // Free the pages
+                for p in 0..num_pages {
+                    let bit = region.bitmap_start_bit + page_in_region + p;
+                    self.set_bit_free(bit);
+                }
 
-            log::trace!("Freed {} page(s) at 0x{:016x}", num_pages, addr);
-        }
+                log::trace!("Freed {} page(s) at 0x{:016x}", num_pages, addr);
+            }
+        } // lock is dropped here
+
+        // Mark freed pages as inaccessible in the page table.
+        self.apply_freed_page_attributes(addr, num_pages);
 
         Ok(())
     }
 
     /// Frees previously allocated pages, verifying the allocation type matches.
+    ///
+    /// After freeing, the pages are marked as inaccessible in the page table
+    /// (Supervisor + ReadProtect + ExecuteProtect) to prevent use-after-free.
     pub fn free_pages_checked(
         &self,
         addr: u64,
@@ -744,41 +851,46 @@ impl PageAllocator {
             return Err(PageAllocError::NotAligned);
         }
 
-        let _guard = self.lock.lock();
+        {
+            let _guard = self.lock.lock();
 
-        unsafe {
-            let (region_index, page_in_region) = self
-                .find_region_for_address(addr)
-                .ok_or(PageAllocError::InvalidAddress)?;
+            unsafe {
+                let (region_index, page_in_region) = self
+                    .find_region_for_address(addr)
+                    .ok_or(PageAllocError::InvalidAddress)?;
 
-            let regions = self.get_regions();
-            let region = &regions[region_index];
+                let regions = self.get_regions();
+                let region = &regions[region_index];
 
-            // Verify all pages are allocated with expected type
-            for p in 0..num_pages {
-                let bit = region.bitmap_start_bit + page_in_region + p;
-                if !self.is_bit_allocated(bit) {
-                    return Err(PageAllocError::NotAllocated);
+                // Verify all pages are allocated with expected type
+                for p in 0..num_pages {
+                    let bit = region.bitmap_start_bit + page_in_region + p;
+                    if !self.is_bit_allocated(bit) {
+                        return Err(PageAllocError::NotAllocated);
+                    }
+                    if self.get_bit_type(bit) != expected_type {
+                        log::warn!(
+                            "Type mismatch at 0x{:016x}: expected {:?}, got {:?}",
+                            addr + (p as u64 * PAGE_SIZE as u64),
+                            expected_type,
+                            self.get_bit_type(bit)
+                        );
+                        return Err(PageAllocError::InvalidAddress);
+                    }
                 }
-                if self.get_bit_type(bit) != expected_type {
-                    log::warn!(
-                        "Type mismatch at 0x{:016x}: expected {:?}, got {:?}",
-                        addr + (p as u64 * PAGE_SIZE as u64),
-                        expected_type,
-                        self.get_bit_type(bit)
-                    );
-                    return Err(PageAllocError::InvalidAddress);
+
+                // Free the pages
+                for p in 0..num_pages {
+                    let bit = region.bitmap_start_bit + page_in_region + p;
+                    self.set_bit_free(bit);
                 }
-            }
 
-            // Free the pages
-            for p in 0..num_pages {
-                let bit = region.bitmap_start_bit + page_in_region + p;
-                self.set_bit_free(bit);
+                log::trace!("Freed {} {:?} page(s) at 0x{:016x}", num_pages, expected_type, addr);
             }
+        } // lock is dropped here
 
-            log::trace!("Freed {} {:?} page(s) at 0x{:016x}", num_pages, expected_type, addr);
-        }
+        // Mark freed pages as inaccessible in the page table.
+        self.apply_freed_page_attributes(addr, num_pages);
 
         Ok(())
     }

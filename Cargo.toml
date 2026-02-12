@@ -93,3 +93,6 @@ codegen-units = 1
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+
+[patch.crates-io]
+patina_paging = { path = 'D:\Repos\patina-paging' }
