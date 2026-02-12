@@ -24,48 +24,14 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
-
+use core::arch::{global_asm, asm};
+use x86_64::{VirtAddr, structures::tss::TaskStateSegment};
 use super::{
     CALL_GATE_OFFSET, TSS_SEL_OFFSET, TSS_DESC_OFFSET,
-    LONG_CS_R0, LONG_CS_R3, LONG_DS_R0, LONG_DS_R3,
-    PrivilegeError, PrivilegeResult,
+    LONG_CS_R0,
 };
 
-// ============================================================================
-// Segment Selectors
-// ============================================================================
-
-/// Collection of segment selectors used for privilege transitions.
-#[derive(Debug, Clone, Copy)]
-pub struct SegmentSelectors {
-    /// Ring 0 code segment selector.
-    pub cs_r0: u16,
-    /// Ring 0 data segment selector.
-    pub ds_r0: u16,
-    /// Ring 3 code segment selector.
-    pub cs_r3: u16,
-    /// Ring 3 data segment selector.
-    pub ds_r3: u16,
-    /// Call gate selector.
-    pub call_gate: u16,
-    /// TSS selector.
-    pub tss: u16,
-}
-
-impl Default for SegmentSelectors {
-    fn default() -> Self {
-        Self {
-            cs_r0: LONG_CS_R0,
-            ds_r0: LONG_DS_R0,
-            cs_r3: LONG_CS_R3,
-            ds_r3: LONG_DS_R3,
-            call_gate: CALL_GATE_OFFSET,
-            tss: TSS_SEL_OFFSET,
-        }
-    }
-}
+global_asm!(include_str!("call_gate_transfer.asm"));
 
 // ============================================================================
 // GDT Descriptor Structures
@@ -189,41 +155,6 @@ impl TssDescriptor {
     }
 }
 
-/// 64-bit Task State Segment.
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TaskStateSegment {
-    /// Reserved
-    pub reserved0: u32,
-    /// RSP for privilege level 0
-    pub rsp0: u64,
-    /// RSP for privilege level 1
-    pub rsp1: u64,
-    /// RSP for privilege level 2
-    pub rsp2: u64,
-    /// Reserved
-    pub reserved1: u64,
-    /// Interrupt Stack Table pointers (IST1-IST7)
-    pub ist: [u64; 7],
-    /// Reserved
-    pub reserved2: u64,
-    /// Reserved
-    pub reserved3: u16,
-    /// I/O Map Base Address
-    pub iomap_base: u16,
-}
-
-impl TaskStateSegment {
-    /// Creates a new TSS with the specified RSP0.
-    pub fn new(rsp0: u64) -> Self {
-        Self {
-            rsp0,
-            iomap_base: core::mem::size_of::<Self>() as u16,
-            ..Default::default()
-        }
-    }
-}
-
 // ============================================================================
 // GDT Register
 // ============================================================================
@@ -239,200 +170,93 @@ pub struct GdtRegister {
 }
 
 // ============================================================================
-// Call Gate Manager
+// Standalone Functions
 // ============================================================================
 
-/// State for the call gate manager.
-struct CallGateState {
-    /// GDT base address per CPU.
-    gdt_bases: [u64; 256],
-    /// GDT step size (distance between per-CPU GDTs).
-    gdt_step_size: usize,
-    /// Number of CPUs.
-    num_cpus: usize,
+/// Gets the current GDT base address by reading the GDTR register.
+/// # Safety
+/// This function is safe to call as it only reads the GDTR register and does not modify
+/// any state. However, it is marked unsafe because it uses inline assembly.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn get_current_gdt_base() -> u64 {
+    // Get current GDT base
+    let mut gdtr = GdtRegister::default();
+    core::arch::asm!(
+        "sgdt [{}]",
+        in(reg) &mut gdtr,
+        options(nostack, preserves_flags)
+    );
+    let gdt_base = gdtr.base;
+    gdt_base
 }
 
-impl CallGateState {
-    const fn new() -> Self {
-        Self {
-            gdt_bases: [0; 256],
-            gdt_step_size: 0,
-            num_cpus: 0,
-        }
+/// Sets up the call gate for returning from a demoted routine.
+/// This function is called from assembly code (InvokeDemotedRoutine).
+///
+/// # Arguments
+///
+/// * `return_pointer` - Address to jump to when the call gate is invoked
+///
+/// # Safety
+///
+/// This modifies the GDT.
+#[unsafe(no_mangle)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe extern "efiapi" fn setup_call_gate(
+    return_pointer: u64,
+    cpl0_stack_ptr: u64,
+) {
+    // Get current GDT base
+    let gdt_base = get_current_gdt_base();
+
+    let call_gate_addr = gdt_base + CALL_GATE_OFFSET as u64;
+
+    let tss_desc_addr = gdt_base + TSS_SEL_OFFSET as u64;
+    let tss_addr = gdt_base + TSS_DESC_OFFSET as u64;
+
+    // Mask page protection on GDT to allow writing to the call gate descriptor
+    let mut cr4: u64;
+    // SAFETY: This is safe because we are temporarily disabling page protection
+    // on the GDT to update the call gate descriptor, which is necessary for the
+    // call gate setup. We will restore protections after updating.
+    unsafe {
+        asm!("mov {}, cr4", out(reg) cr4);
+        asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7)); // Clear PGE to disable page protection on GDT
+    };
+
+    // Now program the call gate descriptor for the return address
+    let call_gate = call_gate_addr as *mut CallGateDescriptor;
+
+    // Update the call gate offset
+    let mut desc = core::ptr::read_volatile(call_gate);
+    desc.set_offset(return_pointer);
+    desc.selector = LONG_CS_R0;
+    // Type = 0xC (64-bit call gate), P = 1, DPL = 3 (Ring 3 can call)
+    desc.type_attr = 0xEC;
+    core::ptr::write_volatile(call_gate, desc);
+
+
+    // Then program the TSS descriptor to point to the TSS (which contains the stack pointer for Ring 0)
+    let tss_desc = tss_desc_addr as *mut TssDescriptor;
+    let tss = tss_addr as *mut TaskStateSegment;
+
+    // Update TSS descriptor to point to the TSS
+    let mut desc = core::ptr::read_volatile(tss_desc);
+    desc.set_base(tss_addr);
+    core::ptr::write_volatile(tss_desc, desc);
+
+    // Update RSP0 in the TSS
+    let mut tss_data = core::ptr::read_volatile(tss);
+    tss_data.privilege_stack_table[0] = VirtAddr::new(cpl0_stack_ptr);
+    core::ptr::write_volatile(tss, tss_data);
+
+    // Restore GDT read-only protection
+    unsafe {
+        asm!("mov cr4, {}", in(reg) cr4);
     }
+
+    log::trace!("Call gate set to 0x{:016x}, CPL0 stack pointer set to 0x{:016x}", return_pointer, cpl0_stack_ptr);
 }
-
-/// Manages call gates and TSS descriptors for privilege transitions.
-pub struct CallGateManager {
-    /// Whether the manager has been initialized.
-    initialized: AtomicBool,
-    /// Internal state.
-    state: Mutex<CallGateState>,
-}
-
-impl CallGateManager {
-    /// Creates a new call gate manager.
-    pub const fn new() -> Self {
-        Self {
-            initialized: AtomicBool::new(false),
-            state: Mutex::new(CallGateState::new()),
-        }
-    }
-
-    /// Initializes the call gate manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `gdt_buffer` - Base address of the GDT buffer
-    /// * `gdt_step_size` - Step size between per-CPU GDTs
-    /// * `num_cpus` - Number of CPUs
-    pub fn init(
-        &self,
-        gdt_buffer: u64,
-        gdt_step_size: usize,
-        num_cpus: usize,
-    ) -> PrivilegeResult<()> {
-        if self.initialized.swap(true, Ordering::SeqCst) {
-            return Err(PrivilegeError::AlreadyInitialized);
-        }
-
-        let mut state = self.state.lock();
-        state.gdt_step_size = gdt_step_size;
-        state.num_cpus = num_cpus;
-
-        // Calculate GDT base for each CPU
-        for i in 0..num_cpus {
-            state.gdt_bases[i] = gdt_buffer + (gdt_step_size as u64) * (i as u64);
-        }
-
-        log::info!(
-            "CallGateManager initialized: {} CPUs, gdt_buffer=0x{:016x}, step=0x{:x}",
-            num_cpus,
-            gdt_buffer,
-            gdt_step_size
-        );
-
-        Ok(())
-    }
-
-    /// Gets the GDT base for the current CPU.
-    ///
-    /// # Safety
-    ///
-    /// This reads the GDTR register.
-    #[cfg(target_arch = "x86_64")]
-    pub unsafe fn get_current_gdt_base(&self) -> u64 {
-        let mut gdtr = GdtRegister::default();
-        core::arch::asm!(
-            "sgdt [{}]",
-            in(reg) &mut gdtr,
-            options(nostack, preserves_flags)
-        );
-        gdtr.base
-    }
-
-    /// Sets up the call gate for returning from a demoted routine.
-    ///
-    /// # Arguments
-    ///
-    /// * `return_pointer` - Address to jump to when the call gate is invoked
-    ///
-    /// # Safety
-    ///
-    /// This modifies the GDT.
-    #[cfg(target_arch = "x86_64")]
-    pub unsafe fn setup_call_gate(
-        &self,
-        return_pointer: u64
-    ) -> PrivilegeResult<()> {
-        let state = self.state.lock();
-
-        let gdt_base = self.get_current_gdt_base();
-        let call_gate_addr = gdt_base + CALL_GATE_OFFSET as u64;
-
-        // TODO: Clear GDT read-only protection before writing
-        // SmmClearGdtReadOnlyForThisProcessor()
-
-        let call_gate = call_gate_addr as *mut CallGateDescriptor;
-
-        // Update the call gate offset
-        let mut desc = core::ptr::read_volatile(call_gate);
-        desc.set_offset(return_pointer);
-        desc.selector = LONG_CS_R0;
-        // Type = 0xC (64-bit call gate), P = 1, DPL = 3 (Ring 3 can call)
-        desc.type_attr = 0xEC;
-        core::ptr::write_volatile(call_gate, desc);
-
-        // TODO: Restore GDT read-only protection
-        // SmmSetGdtReadOnlyForThisProcessor()
-
-        log::trace!("Call gate set to 0x{:016x}", return_pointer);
-
-        Ok(())
-    }
-
-    /// Sets up the TSS descriptor with the Ring 0 stack pointer.
-    ///
-    /// # Arguments
-    ///
-    /// * `cpl0_stack_ptr` - Ring 0 stack pointer to use on privilege transitions
-    ///
-    /// # Safety
-    ///
-    /// This modifies the GDT and TSS.
-    #[cfg(target_arch = "x86_64")]
-    pub unsafe fn setup_tss_descriptor(
-        &self,
-        cpl0_stack_ptr: u64,
-    ) -> PrivilegeResult<()> {
-        let gdt_base = self.get_current_gdt_base();
-        let tss_desc_addr = gdt_base + TSS_SEL_OFFSET as u64;
-        let tss_addr = gdt_base + TSS_DESC_OFFSET as u64;
-
-        // TODO: Clear GDT read-only protection before writing
-
-        let tss_desc = tss_desc_addr as *mut TssDescriptor;
-        let tss = tss_addr as *mut TaskStateSegment;
-
-        // Update TSS descriptor to point to the TSS
-        let mut desc = core::ptr::read_volatile(tss_desc);
-        desc.set_base(tss_addr);
-        core::ptr::write_volatile(tss_desc, desc);
-
-        // Update RSP0 in the TSS
-        let mut tss_data = core::ptr::read_volatile(tss);
-        tss_data.rsp0 = cpl0_stack_ptr;
-        core::ptr::write_volatile(tss, tss_data);
-
-        // TODO: Restore GDT read-only protection
-
-        log::trace!("TSS RSP0 set to 0x{:016x}", cpl0_stack_ptr);
-
-        Ok(())
-    }
-
-    /// Loads the TSS into TR register.
-    ///
-    /// # Safety
-    ///
-    /// This modifies the TR register.
-    #[cfg(target_arch = "x86_64")]
-    pub unsafe fn load_tss(&self) -> PrivilegeResult<()> {
-        core::arch::asm!(
-            "ltr {:x}",
-            in(reg) TSS_SEL_OFFSET,
-            options(nostack, preserves_flags)
-        );
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Global Instance
-// ============================================================================
-
-/// Global call gate manager instance.
-pub static CALL_GATE_MANAGER: CallGateManager = CallGateManager::new();
 
 // ============================================================================
 // Tests
@@ -460,12 +284,4 @@ mod tests {
         assert_eq!(desc.get_base(), 0xFEDCBA98_76543210);
     }
 
-    #[test]
-    fn test_segment_selectors_default() {
-        let selectors = SegmentSelectors::default();
-        assert_eq!(selectors.cs_r0, LONG_CS_R0);
-        assert_eq!(selectors.ds_r0, LONG_DS_R0);
-        assert_eq!(selectors.cs_r3, LONG_CS_R3);
-        assert_eq!(selectors.ds_r3, LONG_DS_R3);
-    }
 }

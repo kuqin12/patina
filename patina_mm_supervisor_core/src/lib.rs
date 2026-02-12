@@ -72,24 +72,12 @@ pub use unblock_memory::{
     UNBLOCKED_MEMORY_TRACKER,
 };
 pub use privilege_mgmt::{
-    SyscallInterface, SyscallCache, SyscallSetupError,
-    SyscallDispatcher, SyscallIndex, SyscallResult,
-    CallGateManager, SegmentSelectors,
-    PrivilegeLevel, PrivilegeError,
-    // MSR constants
-    MSR_IA32_STAR, MSR_IA32_LSTAR, MSR_IA32_EFER,
-    MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
-    // Segment selectors
-    LONG_CS_R0, LONG_DS_R0, LONG_CS_R3, LONG_DS_R3,
-    CALL_GATE_OFFSET, TSS_SEL_OFFSET,
+    SyscallInterface,
+    invoke_demoted_routine,
 };
 
 use core::{
-    arch::{global_asm, asm},
-    ffi::c_void,
-    num::NonZeroUsize,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    arch::{asm, global_asm}, ffi::c_void, num::NonZeroUsize, panic, ptr::NonNull, sync::atomic::{AtomicBool, AtomicU32, Ordering}
 };
 
 use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
@@ -268,7 +256,78 @@ static PER_CORE_INIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// The policy object is initialized once during BSP initialization and provides access to the security policy
 /// for the MM Supervisor. It is stored in a static variable for global access.
 /// The policy gate is initialized from the firmware policy buffer provided in the PassDown HOB.
-static POLICY_GATE: Once<patina_mm_policy::PolicyGate> = Once::new();
+pub(crate) static POLICY_GATE: Once<patina_mm_policy::PolicyGate> = Once::new();
+
+// ============================================================================
+// Communication Buffer Pointers (from PassDown HOB)
+// ============================================================================
+
+/// Communication buffer configuration extracted from PassDown HOB.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommBufferConfig {
+    /// MM Supervisor communication buffer (external interface).
+    pub supv_comm_buffer: u64,
+    /// MM Supervisor internal communication buffer.
+    pub supv_comm_buffer_internal: u64,
+    /// Size of supervisor communication buffer.
+    pub supv_comm_buffer_size: u64,
+    /// MM User communication buffer (external interface).
+    pub user_comm_buffer: u64,
+    /// MM User internal communication buffer.
+    pub user_comm_buffer_internal: u64,
+    /// Size of user communication buffer.
+    pub user_comm_buffer_size: u64,
+    /// MM Supervisor status buffer (indicates target: supervisor or user).
+    pub status_buffer: u64,
+    /// MM Supervisor to User buffer.
+    pub supv_to_user_buffer: u64,
+    /// Size of Supervisor to User buffer.
+    pub supv_to_user_buffer_size: u64,
+}
+
+/// Communication buffer configuration initialized from PassDown HOB.
+static COMM_BUFFER_CONFIG: Once<CommBufferConfig> = Once::new();
+
+/// User module entry point discovered from HOB list.
+static USER_ENTRY_POINT: Once<u64> = Once::new();
+
+/// MM Communication Buffer Status Structure.
+/// Matches the C structure MM_COMM_BUFFER_STATUS from MmCommBuffer.h
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct MmCommBufferStatus {
+    /// Whether the data in the fixed MM communication buffer is valid when entering from non-MM to MM.
+    pub is_comm_buffer_valid: u8, // BOOLEAN in C is u8 in Rust
+    /// The channel used to communicate with MM (true = Supervisor, false = User).
+    pub talk_to_supervisor: u8, // BOOLEAN in C is u8 in Rust
+    /// The return status when returning from MM to non-MM.
+    pub return_status: u64,
+    /// The size in bytes of the output buffer when returning from MM to non-MM.
+    pub return_buffer_size: u64,
+}
+
+/// Request target derived from MM_COMM_BUFFER_STATUS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestTarget {
+    /// No pending request (buffer not valid).
+    None,
+    /// Request targets the Supervisor.
+    Supervisor,
+    /// Request targets the User module.
+    User,
+}
+
+impl From<&MmCommBufferStatus> for RequestTarget {
+    fn from(status: &MmCommBufferStatus) -> Self {
+        if status.is_comm_buffer_valid == 0 {
+            RequestTarget::None
+        } else if status.talk_to_supervisor != 0 {
+            RequestTarget::Supervisor
+        } else {
+            RequestTarget::User
+        }
+    }
+}
 
 /// The MM Supervisor Core responsible for managing the standalone MM environment.
 ///
@@ -466,6 +525,8 @@ where
         if is_core_initialized(cpu_index) {
             // Subsequent entry: go directly to request loop or holding pen (does not return)
             self.enter_runtime(cpu_id);
+
+            return;
         }
 
         // First entry: initialization phase
@@ -482,6 +543,28 @@ where
 
             // Perform BSP-only one-time initialization (this sets up MM_INITIALIZED_BUFFER)
             self.bsp_init(hob_list);
+
+            // Dispatch to the user level entry point discovered from the HOB list (if found)
+            let user_entry = match USER_ENTRY_POINT.get() {
+                Some(&entry) if entry != 0 => entry,
+                _ => {
+                    log::error!("User entry point not configured, cannot demote");
+                    return;
+                }
+            };
+
+            let cpl3_stack = match self.syscall_interface.get_cpl3_stack(cpu_index) {
+                Ok(stack) => stack,
+                Err(e) => {
+                    log::error!("Failed to get CPL3 stack for CPU {}: {:?}", cpu_index, e);
+                    return;
+                }
+            };
+            let ret = unsafe {
+                invoke_demoted_routine (cpu_index, user_entry, cpl3_stack, 3, 0, hob_list, 0)
+            };
+            log::error!("here 6");
+            log::info!("Returned from user entry point with value: 0x{:016x}", ret);
 
             // Mark BSP init as complete so APs can proceed
             self.initialized.store(true, Ordering::Release);
@@ -587,6 +670,8 @@ where
         if let Some(entry) = user_entry_point {
             log::info!("Discovered MM User module entry point: 0x{:016x}", entry);
             // TODO: Store this entry point for later invocation
+        // Store entry point in static for use during request processing
+            USER_ENTRY_POINT.call_once(|| entry);
         } else {
             log::warn!("MM User module entry point not found in HOB list");
         }
@@ -599,10 +684,6 @@ where
                 log::error!("Failed to initialize policy gate: {:?}", e);
             }
         }
-
-        // Allocate buffer for descriptors
-        // let mut buffer = [MemDescriptorV1_0::default(); 1024];
-
 
         // TODO: Initialize request handler infrastructure
 
@@ -633,7 +714,7 @@ where
     ///
     /// BSP enters the request serving loop, APs enter the holding pen.
     /// This function does not return.
-    fn enter_runtime(&'static self, cpu_id: u32) -> ! {
+    fn enter_runtime(&'static self, cpu_id: u32) {
         let is_bsp = self.cpu_manager.is_bsp(cpu_id);
 
         if is_bsp {
@@ -748,13 +829,26 @@ where
                     let pass_down = unsafe { &*(data.as_ptr() as *const MmSupvPassDownHobData) };
 
                     // Copy packed struct fields to local variables to avoid unaligned access
-                    // SAFETY: read_unaligned is used because MmSupvPassDownHobData is packed
-                    let revision = unsafe { core::ptr::addr_of!(pass_down.revision).read_unaligned() };
-                    let mm_initialized_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_initialized_buffer).read_unaligned() };
-                    let firmware_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer).read_unaligned() };
-                    let firmware_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer_size).read_unaligned() };
-                    let memory_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer).read_unaligned() };
-                    let memory_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer_size).read_unaligned() };
+                    // SAFETY: Direct access to read the addresses from the hob data.
+                    let revision = unsafe { core::ptr::addr_of!(pass_down.revision).read() };
+                    let mm_initialized_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_initialized_buffer).read() };
+                    let firmware_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer).read() };
+                    let firmware_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer_size).read() };
+                    let memory_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer).read() };
+                    let memory_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer_size).read() };
+
+                    // Extract communication buffer pointers
+                    let supv_comm_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer).read() };
+                    let supv_comm_buffer_internal = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer_internal).read() };
+                    let supv_comm_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer_size).read() };
+                    let user_comm_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer).read() };
+                    let user_comm_buffer_internal = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer_internal).read() };
+                    let user_comm_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer_size).read() };
+                    let status_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_status_buffer).read() };
+                    let supv_to_user_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_to_user_buffer).read() };
+                    let supv_to_user_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_to_user_buffer_size).read() };
+                    let cpl3_stack_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_stack_base).read() };
+                    let cpl3_stack_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_per_core_stack_size).read() };
 
                     // Validate revision
                     if revision != MM_SUPV_PASS_DOWN_HOB_REVISION {
@@ -776,6 +870,25 @@ where
                     } else {
                         log::warn!("MM Initialized buffer is null in PassDown HOB");
                     }
+
+                    // Store communication buffer configuration
+                    COMM_BUFFER_CONFIG.call_once(|| CommBufferConfig {
+                        supv_comm_buffer,
+                        supv_comm_buffer_internal,
+                        supv_comm_buffer_size,
+                        user_comm_buffer,
+                        user_comm_buffer_internal,
+                        user_comm_buffer_size,
+                        status_buffer,
+                        supv_to_user_buffer,
+                        supv_to_user_buffer_size,
+                    });
+                    log::info!(
+                        "Comm buffers: supv=0x{:x}/0x{:x} size=0x{:x}, user=0x{:x}/0x{:x} size=0x{:x}, status=0x{:x}",
+                        supv_comm_buffer, supv_comm_buffer_internal, supv_comm_buffer_size,
+                        user_comm_buffer, user_comm_buffer_internal, user_comm_buffer_size,
+                        status_buffer
+                    );
 
                     log::info!(
                         "PassDown HOB: FirmwarePolicyBuffer=0x{:x}, Size=0x{:x}",
@@ -815,6 +928,17 @@ where
                             return Err(PolicyInitError::InvalidPolicyData);
                         }
                     }
+
+                    // Init syscall interface
+                    self.syscall_interface.init(
+                        self.cpu_manager.max_cpus(),
+                        cpl3_stack_buffer,
+                        cpl3_stack_buffer_size.try_into().unwrap_or_else(
+                            |err| panic!("Invalid CPL3 stack buffer size: {:?}", err)
+                        ),
+                    ).unwrap_or_else(|err| {
+                        panic!("Failed to initialize syscall interface: {:?}", err);
+                    });
 
                     // Read CR3 from hardware
                     let cr3: u64 = read_cr3();
@@ -883,11 +1007,147 @@ where
     }
 
     /// Process pending requests from the communication buffer.
+    ///
+    /// This function reads the MM_COMM_BUFFER_STATUS structure to determine if there's a pending request
+    /// and whether it targets the Supervisor or User module.
+    ///
+    /// - If targeting User: copies user comm buffer to internal, then demotes to user entry point
+    /// - If targeting Supervisor: dispatches to the request dispatcher
     fn process_pending_requests(&self) {
-        // TODO: Check communication buffer for incoming requests
-        // TODO: Dispatch to registered handlers via self.request_dispatcher
-        // TODO: Optionally distribute work to APs via mailbox
-        
+        // Get communication buffer configuration
+        let config = match COMM_BUFFER_CONFIG.get() {
+            Some(c) => c,
+            None => {
+                // Not yet initialized, nothing to process
+                return;
+            }
+        };
+
+        // Check status buffer for pending request
+        if config.status_buffer == 0 {
+            return;
+        }
+
+        // Read the MM_COMM_BUFFER_STATUS structure
+        // SAFETY: status_buffer is provided by MM IPL and is guaranteed valid
+        let status = unsafe {
+            core::ptr::read_volatile(config.status_buffer as *const MmCommBufferStatus)
+        };
+        let target = RequestTarget::from(&status);
+
+        log::trace!(
+            "Processing request: valid={}, talk_to_supervisor={}, target={:?}",
+            status.is_comm_buffer_valid,
+            status.talk_to_supervisor,
+            target
+        );
+
+        match target {
+            RequestTarget::None => {
+                // No pending request
+            }
+            RequestTarget::User => {
+                // Request targets the User module
+                self.process_user_request(config, &status);
+            }
+            RequestTarget::Supervisor => {
+                // Request targets the Supervisor
+                self.process_supervisor_request(config, &status);
+            }
+        }
+    }
+
+    /// Process a request targeting the User module.
+    ///
+    /// Copies the user communication buffer to the internal buffer,
+    /// then demotes control to the user entry point.
+    fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus) {
+        log::trace!("Processing User request...");
+
+        // Validate buffers
+        if config.user_comm_buffer == 0 || config.user_comm_buffer_internal == 0 {
+            log::error!("User communication buffer not configured");
+            return;
+        }
+
+        // Copy user buffer to user internal buffer
+        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                config.user_comm_buffer as *const u8,
+                config.user_comm_buffer_internal as *mut u8,
+                config.user_comm_buffer_size as usize,
+            );
+        }
+        log::trace!(
+            "Copied {} bytes from user buffer 0x{:x} to internal 0x{:x}",
+            config.user_comm_buffer_size,
+            config.user_comm_buffer,
+            config.user_comm_buffer_internal
+        );
+
+        // Get user entry point
+        let user_entry = match USER_ENTRY_POINT.get() {
+            Some(&entry) if entry != 0 => entry,
+            _ => {
+                log::error!("User entry point not configured, cannot demote");
+                return;
+            }
+        };
+
+        // TODO: Demote to user entry point (ring transition)
+        // This will involve:
+        // 1. Setting up the user stack
+        // 2. Transitioning to Ring 3 via sysret or iret
+        // 3. Jumping to user_entry
+        log::info!("Demoting to User module at 0x{:016x} (not yet implemented)", user_entry);
+        // invoke_demoted_routine (user_entry, , );
+
+        // Clear the status buffer after processing by marking buffer as invalid
+        // SAFETY: status_buffer is valid
+        unsafe {
+            let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
+            let mut cleared_status = *status;
+            cleared_status.is_comm_buffer_valid = 0;
+            core::ptr::write_volatile(status_ptr, cleared_status);
+        }
+    }
+
+    /// Process a request targeting the Supervisor.
+    ///
+    /// Dispatches to the registered request handlers.
+    fn process_supervisor_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus) {
+        log::trace!("Processing Supervisor request...");
+
+        // Validate buffers
+        if config.supv_comm_buffer == 0 || config.supv_comm_buffer_internal == 0 {
+            log::error!("Supervisor communication buffer not configured");
+            return;
+        }
+
+        // Copy supervisor buffer to internal buffer for processing
+        // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                config.supv_comm_buffer as *const u8,
+                config.supv_comm_buffer_internal as *mut u8,
+                config.supv_comm_buffer_size as usize,
+            );
+        }
+
+        // TODO: Dispatch to request handlers via self.request_dispatcher
+        // The request_dispatcher will parse the communication buffer and
+        // invoke the appropriate registered handler.
+        log::trace!("Supervisor request dispatch (not yet implemented)");
+
+        // Clear the status buffer after processing by marking buffer as invalid
+        // SAFETY: status_buffer is valid
+        unsafe {
+            let status_ptr = config.status_buffer as *mut MmCommBufferStatus;
+            let mut cleared_status = *status;
+            cleared_status.is_comm_buffer_valid = 0;
+            core::ptr::write_volatile(status_ptr, cleared_status);
+        }
     }
 
     /// The holding pen for APs.

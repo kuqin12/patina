@@ -51,14 +51,50 @@ mod syscall_dispatcher;
 mod call_gate;
 
 pub use syscall_setup::{
-    SyscallInterface, SyscallCache, SyscallSetupError,
+    SyscallInterface, SyscallSetupError,
 };
 pub use syscall_dispatcher::{
     SyscallDispatcher, SyscallIndex, SyscallResult,
 };
-pub use call_gate::{
-    CallGateManager, SegmentSelectors,
-};
+
+// ============================================================================
+// External Assembly Routine
+// ============================================================================
+
+unsafe extern "efiapi" {
+    /// Invokes a specified routine in CPL 3 (Ring 3).
+    ///
+    /// This function transitions from Ring 0 to Ring 3, executes the demoted routine,
+    /// and returns back to Ring 0 through a call gate.
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu_index` - CPU index value of the intended core
+    /// * `cpl3_routine` - Function pointer to the demoted routine
+    /// * `cpl3_stack` - Stack pointer for Ring 3 execution
+    /// * `arg_count` - Number of arguments needed by the demoted routine
+    /// * `...` - Variable argument list (count defined by `arg_count`), populated
+    ///           to registers and/or CPL3 stack areas per EFIAPI calling convention
+    ///
+    /// # Returns
+    ///
+    /// * `EFI_SUCCESS` - The demoted routine returned successfully
+    /// * Other values - Errors from ring transitioning or the demoted routine
+    ///
+    /// # Safety
+    ///
+    /// This function modifies privilege levels and stack pointers. Callers must ensure:
+    /// - Valid function pointer for `cpl3_routine`
+    /// - Valid stack pointer for `cpl3_stack`
+    /// - Correct `arg_count` matching the actual arguments
+    pub fn invoke_demoted_routine(
+        cpu_index: usize,
+        cpl3_routine: u64,
+        cpl3_stack: u64,
+        arg_count: usize,
+        ...
+    ) -> usize;
+}
 
 // ============================================================================
 // Segment Selector Constants

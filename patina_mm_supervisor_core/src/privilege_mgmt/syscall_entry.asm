@@ -150,19 +150,9 @@ syscall_center:
     pop     r8
     pop     rdx
     pop     rbp
-    cmp     [rsp], rcx
-    je      NormalReturn  # if syscall dispatcher changed return address, need to go through error report
-    push    rcx           # Make caller ID on the top of stack
-    mov     rcx, [rsp+8]  # Put real jump point in rcx
-    mov     [rsp+8], rax  # Make jump buffer second from the top of stack
-    # The next will be call index pushed from rax
-    # Note that in this path, the stack is 3 segments taller than input
-    jmp     Sysret
-
-NormalReturn:
     pop     rcx           # return rcx from stack
+
     add     rsp, 8        # return rsp to original position
-Sysret:
     mov     rsp, gs:[SAVED_USER_RSP]  # restore user RSP
     swapgs  # restore user GS, save kernel pointer
     .byte   0x48          # return to the long mode

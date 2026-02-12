@@ -25,10 +25,160 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::arch::{global_asm, asm};
+use r_efi::efi::{AllocateType, ALLOCATE_ANY_PAGES, MemoryType, RUNTIME_SERVICES_DATA};
+
+use patina_mm_policy::{AccessType, IoWidth, Instruction};
 
 use super::{PrivilegeError, PrivilegeResult};
+use crate::{POLICY_GATE, UNBLOCKED_MEMORY_TRACKER};
 
 global_asm!(include_str!("syscall_entry.asm"));
+
+// ============================================================================
+// EFI_MM_IO_WIDTH values (from EFI spec)
+// ============================================================================
+
+/// MM_IO_UINT8 - 8-bit I/O access width.
+const MM_IO_UINT8: u64 = 0;
+/// MM_IO_UINT16 - 16-bit I/O access width.
+const MM_IO_UINT16: u64 = 1;
+/// MM_IO_UINT32 - 32-bit I/O access width.
+const MM_IO_UINT32: u64 = 2;
+
+/// Converts an EFI_MM_IO_WIDTH enum value to our [`IoWidth`] type.
+///
+/// The EFI spec defines: MM_IO_UINT8=0, MM_IO_UINT16=1, MM_IO_UINT32=2.
+fn efi_io_width_to_io_width(width: u64) -> Option<IoWidth> {
+    match width {
+        MM_IO_UINT8 => Some(IoWidth::Byte),
+        MM_IO_UINT16 => Some(IoWidth::Word),
+        MM_IO_UINT32 => Some(IoWidth::Dword),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Hardware Operation Helpers
+// ============================================================================
+
+/// Reads a 64-bit MSR value.
+///
+/// # Safety
+///
+/// The caller must ensure the MSR index is valid and access is allowed by policy.
+#[inline]
+unsafe fn read_msr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack),
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Writes a 64-bit value to an MSR.
+///
+/// # Safety
+///
+/// The caller must ensure the MSR index is valid and access is allowed by policy.
+#[inline]
+unsafe fn write_msr(msr: u32, value: u64) {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Reads an 8-bit value from an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_read_u8(port: u16) -> u8 {
+    let value: u8;
+    unsafe {
+        asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack));
+    }
+    value
+}
+
+/// Reads a 16-bit value from an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_read_u16(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack));
+    }
+    value
+}
+
+/// Reads a 32-bit value from an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_read_u32(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack));
+    }
+    value
+}
+
+/// Writes an 8-bit value to an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_write_u8(port: u16, value: u8) {
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
+    }
+}
+
+/// Writes a 16-bit value to an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_write_u16(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack));
+    }
+}
+
+/// Writes a 32-bit value to an I/O port.
+///
+/// # Safety
+///
+/// The caller must ensure the port address is valid and access is allowed by policy.
+#[inline]
+unsafe fn io_write_u32(port: u16, value: u32) {
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack));
+    }
+}
 
 // ============================================================================
 // Syscall Indices
@@ -41,56 +191,84 @@ global_asm!(include_str!("syscall_entry.asm"));
 #[repr(u64)]
 pub enum SyscallIndex {
     /// Read MSR - Arg1: MSR index, Returns: MSR value
-    RdMsr = 0x0001,
+    RdMsr = 0x0000,
     /// Write MSR - Arg1: MSR index, Arg2: value
-    WrMsr = 0x0002,
+    WrMsr = 0x0001,
     /// CLI - Clear interrupts
-    Cli = 0x0003,
+    Cli = 0x0002,
     /// IO Read - Arg1: port, Arg2: width
-    IoRead = 0x0004,
+    IoRead = 0x0003,
     /// IO Write - Arg1: port, Arg2: width, Arg3: value
-    IoWrite = 0x0005,
+    IoWrite = 0x0004,
     /// WBINVD - Write back and invalidate cache
-    Wbinvd = 0x0006,
+    Wbinvd = 0x0005,
     /// HLT - Halt processor
-    Hlt = 0x0007,
+    Hlt = 0x0006,
     /// Save State Read - Arg1: register, Arg2: CPU index
-    SaveStateRead = 0x0008,
-    /// Save State Read 2 - Extended save state read
-    SaveStateRead2 = 0x0009,
-    /// Register Handler Jump Pointer
-    RegHandlerJump = 0x000A,
+    SaveStateRead = 0x0007,
+    /// Maximum value for legacy syscall indices
+    LegacyMax = 0xFFFF,
+    /// Register Handler Jump Pointer - Unsupported
+    // RegHandlerJump = 0x10000,
+    /// Install configuration table - Unsupported
+    // InstallConfigTable = 0x10001,
+    /// Allocate pool: unsupported
+    // AllocPool = 0x10002,
+    /// Free pool: unsupported
+    // FreePool = 0x10003,
     /// Allocate Pages - Arg1: memory type, Arg2: page count, Arg3: address ptr
-    AllocPage = 0x0010,
+    AllocPage = 0x10004,
     /// Free Pages - Arg1: address, Arg2: page count
-    FreePage = 0x0011,
+    FreePage = 0x10005,
     /// Start AP Procedure - Arg1: procedure, Arg2: CPU index, Arg3: argument
-    StartApProc = 0x0012,
-    /// Set CPL3 Table - Register user MMST
-    SetCpl3Table = 0x0020,
-    /// Error Report Jump - Register error reporting function
-    ErrReportJump = 0x0030,
+    StartApProc = 0x10006,
+    /// Register MMI handler jump pointer - Unsupported
+    // RegMmiHandlerJump = 0x10007,
+    /// Unregister MMI handler - Unsupported
+    // UnregMmiHandlerJump = 0x10018,
+    /// Set CPL3 Page Table - Unsupported
+    // SetCpl3Table = 0x10019,
+    /// Install protocol - Unsupported
+    // InstallProtocol = 0x1001A,
+    /// Query hobs - Unsupported
+    // QueryHobs = 0x1001B,
+    /// Error Report Jump - Unsupported, this is moved to be handled by the user core
+    // ErrReportJump = 0x1001C,
+    /// MMI handler profile register - Unsupported
+    // RegMmiProfile1 = 0x1001D,
+    /// MMI handler profile register - Unsupported
+    // RegMmiProfile2 = 0x1001E,
+    /// MMI handler profile unregister - Unsupported
+    // UnregMmiProfile1 = 0x1001F,
+    /// MMI handler profile unregister - Unsupported
+    // UnregMmiProfile2 = 0x10020,
+    /// Save state read with extended support - Arg1: width, Arg2: buffer pointer
+    SaveStateRead2 = 0x10021,
+    /// MM memory unblocked - Arg1: address, Arg2: size
+    MmMemoryUnblocked = 0x10022,
+    /// MM memory is communication buffer - Arg1: address, Arg2: size
+    MmIsCommBuffer = 0x10023,
 }
 
 impl SyscallIndex {
     /// Creates a SyscallIndex from a raw u64 value.
     pub fn from_u64(value: u64) -> Option<Self> {
         match value {
-            0x0001 => Some(Self::RdMsr),
-            0x0002 => Some(Self::WrMsr),
-            0x0003 => Some(Self::Cli),
-            0x0004 => Some(Self::IoRead),
-            0x0005 => Some(Self::IoWrite),
-            0x0006 => Some(Self::Wbinvd),
-            0x0007 => Some(Self::Hlt),
-            0x0008 => Some(Self::SaveStateRead),
-            0x0009 => Some(Self::SaveStateRead2),
-            0x000A => Some(Self::RegHandlerJump),
-            0x0010 => Some(Self::AllocPage),
-            0x0011 => Some(Self::FreePage),
-            0x0012 => Some(Self::StartApProc),
-            0x0020 => Some(Self::SetCpl3Table),
-            0x0030 => Some(Self::ErrReportJump),
+            0x0000 => Some(Self::RdMsr),
+            0x0001 => Some(Self::WrMsr),
+            0x0002 => Some(Self::Cli),
+            0x0003 => Some(Self::IoRead),
+            0x0004 => Some(Self::IoWrite),
+            0x0005 => Some(Self::Wbinvd),
+            0x0006 => Some(Self::Hlt),
+            0x0007 => Some(Self::SaveStateRead),
+            0xFFFF => Some(Self::LegacyMax),
+            0x10004 => Some(Self::AllocPage),
+            0x10005 => Some(Self::FreePage),
+            0x10006 => Some(Self::StartApProc),
+            0x10021 => Some(Self::SaveStateRead2),
+            0x10022 => Some(Self::MmMemoryUnblocked),
+            0x10023 => Some(Self::MmIsCommBuffer),
             _ => None,
         }
     }
@@ -133,6 +311,10 @@ impl SyscallResult {
     pub const EFI_UNSUPPORTED: u64 = 0x8000_0000_0000_0003;
     /// EFI_ACCESS_DENIED
     pub const EFI_ACCESS_DENIED: u64 = 0x8000_0000_0000_000F;
+    /// EFI_NOT_READY
+    pub const EFI_NOT_READY: u64 = 0x8000_0000_0000_0006;
+    /// EFI_OUT_OF_RESOURCES
+    pub const EFI_OUT_OF_RESOURCES: u64 = 0x8000_0000_0000_0009;
     /// EFI_SECURITY_VIOLATION
     pub const EFI_SECURITY_VIOLATION: u64 = 0x8000_0000_0000_001A;
 }
@@ -244,142 +426,457 @@ impl SyscallDispatcher {
             SyscallIndex::Wbinvd => self.handle_wbinvd(ctx),
             SyscallIndex::Hlt => self.handle_hlt(ctx),
             SyscallIndex::SaveStateRead => self.handle_save_state_read(ctx),
-            SyscallIndex::SaveStateRead2 => self.handle_save_state_read2(ctx),
-            SyscallIndex::RegHandlerJump => self.handle_reg_handler_jump(ctx),
             SyscallIndex::AllocPage => self.handle_alloc_page(ctx),
             SyscallIndex::FreePage => self.handle_free_page(ctx),
             SyscallIndex::StartApProc => self.handle_start_ap_proc(ctx),
-            SyscallIndex::SetCpl3Table => self.handle_set_cpl3_table(ctx),
-            SyscallIndex::ErrReportJump => self.handle_err_report_jump(ctx),
+            SyscallIndex::LegacyMax => panic!("Invalid syscall index: LegacyMax is not a real syscall"),
+            SyscallIndex::SaveStateRead2 => self.handle_save_state_read2(ctx),
+            SyscallIndex::MmMemoryUnblocked => self.handle_mm_memory_unblocked(ctx),
+            SyscallIndex::MmIsCommBuffer => self.handle_mm_is_comm_buffer(ctx),
         }
     }
 
     // ========================================================================
-    // Syscall Handlers (stubs for now)
+    // Syscall Handlers
     // ========================================================================
 
+    /// Handles MSR read syscall.
+    ///
+    /// Validates the MSR read against firmware policy, then executes `rdmsr`.
+    /// - Arg1: MSR index
+    /// - Returns: MSR value in result.value
     fn handle_rdmsr(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate MSR access against policy
-        // TODO: Read MSR and return value
-        log::trace!("RDMSR: msr=0x{:x}", ctx.arg1);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let msr_index = ctx.arg1 as u32;
+        log::trace!("RDMSR: msr=0x{:x}", msr_index);
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("RDMSR: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_msr_allowed(msr_index, AccessType::Read) {
+            log::error!("RDMSR: MSR 0x{:x} blocked by policy: {:?}", msr_index, e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - execute the MSR read
+        let value = unsafe { read_msr(msr_index) };
+        log::debug!("RDMSR: MSR 0x{:x} = 0x{:x}", msr_index, value);
+        SyscallResult::success(value)
     }
 
+    /// Handles MSR write syscall.
+    ///
+    /// Validates the MSR write against firmware policy, then executes `wrmsr`.
+    /// - Arg1: MSR index
+    /// - Arg2: Value to write
     fn handle_wrmsr(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate MSR access against policy
-        // TODO: Write MSR
-        log::trace!("WRMSR: msr=0x{:x}, value=0x{:x}", ctx.arg1, ctx.arg2);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let msr_index = ctx.arg1 as u32;
+        let value = ctx.arg2;
+        log::trace!("WRMSR: msr=0x{:x}, value=0x{:x}", msr_index, value);
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("WRMSR: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_msr_allowed(msr_index, AccessType::Write) {
+            log::error!("WRMSR: MSR 0x{:x} blocked by policy: {:?}", msr_index, e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - execute the MSR write
+        unsafe { write_msr(msr_index, value) };
+        log::debug!("WRMSR: MSR 0x{:x} written with 0x{:x}", msr_index, value);
+        SyscallResult::success(0)
     }
 
+    /// Handles CLI (clear interrupt flag) syscall.
+    ///
+    /// Validates the CLI instruction against firmware policy, then executes `cli`.
     fn handle_cli(&self, _ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate CLI is allowed by policy
         log::trace!("CLI");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("CLI: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_instruction_allowed(Instruction::Cli) {
+            log::error!("CLI: Instruction blocked by policy: {:?}", e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - disable interrupts
+        unsafe { asm!("cli", options(nomem, nostack)) };
+        log::debug!("CLI: Interrupts disabled");
+        SyscallResult::success(0)
     }
 
+    /// Handles I/O port read syscall.
+    ///
+    /// Validates the I/O read against firmware policy, then executes the `in` instruction.
+    /// - Arg1: I/O port address
+    /// - Arg2: EFI_MM_IO_WIDTH (0=UINT8, 1=UINT16, 2=UINT32)
+    /// - Returns: Value read from the port in result.value
     fn handle_io_read(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate IO port access against policy
-        // TODO: Read IO port
-        log::trace!("IO_READ: port=0x{:x}, width={}", ctx.arg1, ctx.arg2);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let port = ctx.arg1;
+        let efi_width = ctx.arg2;
+        log::trace!("IO_READ: port=0x{:x}, width={}", port, efi_width);
+
+        // Convert EFI_MM_IO_WIDTH to IoWidth
+        let io_width = match efi_io_width_to_io_width(efi_width) {
+            Some(w) => w,
+            None => {
+                log::error!("IO_READ: Invalid IO width: {}", efi_width);
+                return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+            }
+        };
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("IO_READ: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_io_allowed(port as u32, io_width, AccessType::Read) {
+            log::error!("IO_READ: Port 0x{:x} width {:?} blocked by policy: {:?}", port, io_width, e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - execute the I/O read
+        let port_addr = port as u16;
+        let value: u64 = unsafe {
+            match efi_width {
+                MM_IO_UINT8 => io_read_u8(port_addr) as u64,
+                MM_IO_UINT16 => io_read_u16(port_addr) as u64,
+                MM_IO_UINT32 => io_read_u32(port_addr) as u64,
+                _ => unreachable!(), // Already validated above
+            }
+        };
+
+        log::debug!("IO_READ: port=0x{:x} => 0x{:x}", port, value);
+        SyscallResult::success(value)
     }
 
+    /// Handles I/O port write syscall.
+    ///
+    /// Validates the I/O write against firmware policy, then executes the `out` instruction.
+    /// - Arg1: I/O port address
+    /// - Arg2: EFI_MM_IO_WIDTH (0=UINT8, 1=UINT16, 2=UINT32)
+    /// - Arg3: Value to write
     fn handle_io_write(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate IO port access against policy
-        // TODO: Write IO port
-        log::trace!("IO_WRITE: port=0x{:x}, width={}, value=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let port = ctx.arg1;
+        let efi_width = ctx.arg2;
+        let value = ctx.arg3;
+        log::trace!("IO_WRITE: port=0x{:x}, width={}, value=0x{:x}", port, efi_width, value);
+
+        // Convert EFI_MM_IO_WIDTH to IoWidth
+        let io_width = match efi_io_width_to_io_width(efi_width) {
+            Some(w) => w,
+            None => {
+                log::error!("IO_WRITE: Invalid IO width: {}", efi_width);
+                return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+            }
+        };
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("IO_WRITE: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_io_allowed(port as u32, io_width, AccessType::Write) {
+            log::error!("IO_WRITE: Port 0x{:x} width {:?} blocked by policy: {:?}", port, io_width, e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - execute the I/O write
+        let port_addr = port as u16;
+        unsafe {
+            match efi_width {
+                MM_IO_UINT8 => io_write_u8(port_addr, value as u8),
+                MM_IO_UINT16 => io_write_u16(port_addr, value as u16),
+                MM_IO_UINT32 => io_write_u32(port_addr, value as u32),
+                _ => unreachable!(), // Already validated above
+            }
+        }
+
+        log::debug!("IO_WRITE: port=0x{:x} <= 0x{:x}", port, value);
+        SyscallResult::success(0)
     }
 
+    /// Handles WBINVD (write-back and invalidate cache) syscall.
+    ///
+    /// Validates the WBINVD instruction against firmware policy, then executes `wbinvd`.
     fn handle_wbinvd(&self, _ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate WBINVD is allowed by policy
         log::trace!("WBINVD");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("WBINVD: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_instruction_allowed(Instruction::Wbinvd) {
+            log::error!("WBINVD: Instruction blocked by policy: {:?}", e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - write back and invalidate cache
+        unsafe { asm!("wbinvd", options(nomem, nostack)) };
+        log::debug!("WBINVD: Cache written back and invalidated");
+        SyscallResult::success(0)
     }
 
+    /// Handles HLT (halt processor) syscall.
+    ///
+    /// Validates the HLT instruction against firmware policy, then executes `hlt`.
     fn handle_hlt(&self, _ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate HLT is allowed by policy
         log::trace!("HLT");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+
+        // Validate against policy
+        let gate = match POLICY_GATE.get() {
+            Some(g) => g,
+            None => {
+                log::error!("HLT: Policy gate not initialized");
+                return SyscallResult::error(SyscallResult::EFI_NOT_READY);
+            }
+        };
+
+        if let Err(e) = gate.is_instruction_allowed(Instruction::Hlt) {
+            log::error!("HLT: Instruction blocked by policy: {:?}", e);
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        // Policy allows - halt processor (sleep until next interrupt)
+        unsafe { asm!("hlt", options(nomem, nostack)) };
+        log::debug!("HLT: Processor halted and resumed");
+        SyscallResult::success(0)
     }
 
+    /// Handles save state read syscall (legacy).
+    ///
+    /// - Arg1: User MM CPU protocol pointer
+    /// - Arg2: Register to be read
+    /// - Arg3: CPU index to read from
     fn handle_save_state_read(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Validate save state access against policy
-        log::trace!("SAVE_STATE_READ: register={}, cpu={}", ctx.arg1, ctx.arg2);
+        log::trace!("SAVE_STATE_READ: protocol=0x{:x}, register={}, cpu={}", ctx.arg1, ctx.arg2, ctx.arg3);
+
+        // Validate parameters
+        if ctx.arg1 == 0 {
+            log::error!("SAVE_STATE_READ: Null protocol pointer");
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // TODO: Validate Arg2 against EFI_MM_SAVE_STATE_REGISTER_PROCESSOR_ID range
+        // TODO: Validate Arg3 against NumberOfCpus
+        // TODO: Delegate to ProcessUserSaveStateAccess equivalent
+        log::warn!("SAVE_STATE_READ: Not yet implemented");
         SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
     }
 
-    fn handle_save_state_read2(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Extended save state read
-        log::trace!("SAVE_STATE_READ2: width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
-    }
-
-    fn handle_reg_handler_jump(&self, ctx: &SyscallContext) -> SyscallResult {
-        // Register the Ring 3 handler jump pointer
-        // TODO: Validate the pointer is in user-accessible memory
-        self.registered_ring3_jump_pointer.store(ctx.arg1, Ordering::Release);
-        log::info!("Registered Ring 3 handler jump pointer: 0x{:x}", ctx.arg1);
-        SyscallResult::success(0)
-    }
-
+    /// Handles page allocation syscall.
+    ///
+    /// - Arg1: Allocate type (EFI_ALLOCATE_TYPE)
+    /// - Arg2: Memory type (must be EfiRuntimeServicesData)
+    /// - Arg3: Page count
+    /// - Returns: Allocated physical address in result.value
     fn handle_alloc_page(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Allocate pages for user
-        log::trace!("ALLOC_PAGE: type={}, count={}", ctx.arg1, ctx.arg2);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let alloc_type = ctx.arg1 as AllocateType;
+        let mem_type = ctx.arg2 as MemoryType;
+        let page_count = ctx.arg3;
+        log::trace!("ALLOC_PAGE: alloc_type={}, mem_type={}, count={}", alloc_type, mem_type, page_count);
+
+        // Only BSP can allocate pages (AP allocating involves page table updates)
+        if !crate::is_bsp() {
+            log::error!("ALLOC_PAGE: AP cannot allocate pages");
+            return SyscallResult::error(SyscallResult::EFI_ACCESS_DENIED);
+        }
+
+        if mem_type != RUNTIME_SERVICES_DATA {
+            log::error!("ALLOC_PAGE: Invalid memory type: {}", mem_type);
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // Currently only AllocateAnyPages is supported by our page allocator
+        if alloc_type != ALLOCATE_ANY_PAGES {
+            log::error!("ALLOC_PAGE: Only AllocateAnyPages (0) is supported, got {}", alloc_type);
+            return SyscallResult::error(SyscallResult::EFI_UNSUPPORTED);
+        }
+
+        if page_count == 0 {
+            log::error!("ALLOC_PAGE: Zero page count");
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // Allocate pages as User type (Ring 3 driver request)
+        match crate::PAGE_ALLOCATOR.allocate_pages_with_type(
+            page_count as usize,
+            crate::mm_mem::AllocationType::User,
+        ) {
+            Ok(addr) => {
+                log::debug!("ALLOC_PAGE: Allocated {} page(s) at 0x{:x}", page_count, addr);
+                SyscallResult::success(addr)
+            }
+            Err(e) => {
+                log::error!("ALLOC_PAGE: Allocation failed: {:?}", e);
+                SyscallResult::error(SyscallResult::EFI_OUT_OF_RESOURCES)
+            }
+        }
     }
 
+    /// Handles page free syscall.
+    ///
+    /// Mirrors the C implementation's `SMM_FREE_PAGE` case.
+    /// - Arg1: Physical address to free
+    /// - Arg2: Number of pages
     fn handle_free_page(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Free user pages
-        log::trace!("FREE_PAGE: addr=0x{:x}, count={}", ctx.arg1, ctx.arg2);
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        let addr = ctx.arg1;
+        let page_count = ctx.arg2;
+        log::trace!("FREE_PAGE: addr=0x{:x}, count={}", addr, page_count);
+
+        if page_count == 0 {
+            log::error!("FREE_PAGE: Zero page count");
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // Validate the address is page-aligned
+        if addr % crate::PAGE_SIZE as u64 != 0 {
+            log::error!("FREE_PAGE: Address 0x{:x} is not page-aligned", addr);
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // Verify the range was allocated as User type (Ring 3 code should only free its own memory)
+        // This prevents user code from freeing supervisor-internal allocations.
+        match crate::PAGE_ALLOCATOR.get_allocation_type(addr) {
+            Some(crate::mm_mem::AllocationType::User) => {
+                // Good - this is user-owned memory
+            }
+            Some(crate::mm_mem::AllocationType::Supervisor) => {
+                log::error!("FREE_PAGE: Address 0x{:x} is a supervisor allocation - access denied", addr);
+                return SyscallResult::error(SyscallResult::EFI_SECURITY_VIOLATION);
+            }
+            None => {
+                log::error!("FREE_PAGE: Address 0x{:x} is not allocated", addr);
+                return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+            }
+        }
+
+        // Free the pages, verifying they are all User allocations
+        match crate::PAGE_ALLOCATOR.free_pages_checked(
+            addr,
+            page_count as usize,
+            crate::mm_mem::AllocationType::User,
+        ) {
+            Ok(()) => {
+                log::debug!("FREE_PAGE: Freed {} page(s) at 0x{:x}", page_count, addr);
+                SyscallResult::success(0)
+            }
+            Err(e) => {
+                log::error!("FREE_PAGE: Free failed: {:?}", e);
+                SyscallResult::error(SyscallResult::EFI_SECURITY_VIOLATION)
+            }
+        }
     }
 
+    /// Handles start AP procedure syscall.
+    ///
+    /// - Arg1: Procedure function pointer
+    /// - Arg2: CPU index
+    /// - Arg3: Argument pointer
     fn handle_start_ap_proc(&self, ctx: &SyscallContext) -> SyscallResult {
-        // TODO: Start AP procedure
         log::trace!("START_AP_PROC: proc=0x{:x}, cpu={}, arg=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+
+        // TODO: Validate procedure pointer is in user-owned range
+        // TODO: Validate CPU index is within NumberOfCpus
+        // TODO: Validate argument pointer (if non-null) is in user-owned range
+        // TODO: Delegate to MmStartupThisAp equivalent (must ensure procedure runs demoted)
+        log::warn!("START_AP_PROC: Not yet implemented");
         SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
     }
 
-    fn handle_set_cpl3_table(&self, ctx: &SyscallContext) -> SyscallResult {
-        // Set the user MM System Table pointer
-        // TODO: Validate the pointer is in user-accessible memory
-        self.user_mmst.store(ctx.arg1, Ordering::Release);
-        log::info!("Registered User MMST: 0x{:x}", ctx.arg1);
-        SyscallResult::success(0)
+    /// Handles extended save state read syscall.
+    ///
+    /// - Arg1: User MM CPU protocol pointer
+    /// - Arg2: Width of buffer to read in bytes
+    /// - Arg3: User buffer to hold return data
+    fn handle_save_state_read2(&self, ctx: &SyscallContext) -> SyscallResult {
+        log::trace!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+
+        // Validate parameters
+        if ctx.arg1 == 0 {
+            log::error!("SAVE_STATE_READ2: Null protocol pointer");
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // TODO: Validate buffer (Arg3) is in user-owned range with size Arg2
+        // TODO: Delegate to ProcessUserSaveStateAccess equivalent
+        log::warn!("SAVE_STATE_READ2: Not yet implemented");
+        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
     }
 
-    fn handle_err_report_jump(&self, ctx: &SyscallContext) -> SyscallResult {
-        // Register the error report jump pointer
-        // TODO: Validate the pointer is in user-accessible memory
-        self.reg_error_report_jump_pointer.store(ctx.arg1, Ordering::Release);
-        log::info!("Registered error report jump pointer: 0x{:x}", ctx.arg1);
-        SyscallResult::success(0)
+    /// Handles MM memory unblocked check syscall.
+    ///
+    /// Checks if a memory range is outside MMRAM and valid (unblocked), AND
+    /// is within user-owned space.
+    /// - Arg1: Physical address
+    /// - Arg2: Size in bytes
+    /// - Returns: 1 (TRUE) if valid, 0 (FALSE) otherwise
+    fn handle_mm_memory_unblocked(&self, ctx: &SyscallContext) -> SyscallResult {
+        let addr = ctx.arg1;
+        let size = ctx.arg2;
+        log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x}, size=0x{:x}", addr, size);
+
+        // Check if the buffer is within an unblocked memory region
+        let is_valid = UNBLOCKED_MEMORY_TRACKER.is_within_unblocked_region(addr, size);
+
+        if !is_valid {
+            log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x} size=0x{:x} not in unblocked region", addr, size);
+            return SyscallResult::success(0); // FALSE
+        }
+
+        // TODO: Additional check - verify buffer is in user-owned space
+        // (InspectTargetRangeOwnership equivalent)
+
+        log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x} size=0x{:x} is valid", addr, size);
+        SyscallResult::success(1) // TRUE
     }
 
-    // ========================================================================
-    // Accessors
-    // ========================================================================
+    /// Handles MM is communication buffer check syscall.
+    ///
+    /// Verifies that a given memory range is a valid communication buffer.
+    /// - Arg1: Buffer address
+    /// - Arg2: Buffer size
+    /// - Returns: 1 (TRUE) if valid comm buffer, 0 (FALSE) otherwise
+    fn handle_mm_is_comm_buffer(&self, ctx: &SyscallContext) -> SyscallResult {
+        log::trace!("MM_IS_COMM_BUFFER: addr=0x{:x}, size=0x{:x}", ctx.arg1, ctx.arg2);
 
-    /// Gets the registered Ring 3 handler jump pointer.
-    pub fn get_ring3_handler_jump(&self) -> u64 {
-        self.registered_ring3_jump_pointer.load(Ordering::Acquire)
-    }
-
-    /// Gets the registered AP Ring 3 jump pointer.
-    pub fn get_ap_ring3_jump(&self) -> u64 {
-        self.reg_ap_ring3_jump_pointer.load(Ordering::Acquire)
-    }
-
-    /// Gets the registered error report jump pointer.
-    pub fn get_error_report_jump(&self) -> u64 {
-        self.reg_error_report_jump_pointer.load(Ordering::Acquire)
-    }
-
-    /// Gets the user MM System Table pointer.
-    pub fn get_user_mmst(&self) -> u64 {
-        self.user_mmst.load(Ordering::Acquire)
+        // TODO: Implement VerifyRequestUserCommBuffer equivalent
+        // This should check if the buffer was passed down as a valid communication buffer
+        log::warn!("MM_IS_COMM_BUFFER: Not yet implemented");
+        SyscallResult::success(0) // FALSE - conservative default
     }
 }
 
@@ -433,7 +930,7 @@ pub extern "efiapi" fn syscall_dispatcher(
     // For now, just return the value. In the future, we may need to handle
     // error codes differently.
     if result.status != 0 {
-        result.status
+        panic!("Syscall error: status=0x{:x}", result.status);
     } else {
         result.value
     }

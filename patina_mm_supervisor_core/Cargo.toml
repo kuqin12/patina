@@ -27,6 +27,10 @@ patina_paging = { workspace = true }
 patina_stacktrace = { workspace = true }
 r-efi = { workspace = true }
 spin = { workspace = true }
+x86_64 = { workspace = true, features = [
+    "instructions",
+    "abi_x86_interrupt",
+] }
 
 [dev-dependencies]
 mockall = { workspace = true }
