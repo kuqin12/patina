@@ -875,7 +875,7 @@ where
         let is_bsp = self.cpu_manager.is_bsp(cpu_id);
 
         if is_bsp {
-            log::info!("BSP (CPU {}) entering request serving routine...", cpu_id);
+            log::trace!("BSP (CPU {}) entering request serving routine...", cpu_id);
             // Enter the main request serving loop
             self.bsp_request_loop(cpu_id as usize)
         } else {
@@ -1184,7 +1184,7 @@ where
         };
         let target = RequestTarget::from(&status);
 
-        log::info!(
+        log::trace!(
             "Processing request: valid={}, talk_to_supervisor={}, target={:?}",
             status.is_comm_buffer_valid,
             status.talk_to_supervisor,
@@ -1216,7 +1216,7 @@ where
     /// 5. Demotes to the user entry point via `invoke_demoted_routine`
     /// 6. On return, copies back the user comm buffer and reads the updated status
     fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
-        log::info!("Processing User request...");
+        log::trace!("Processing User request...");
 
         // Validate buffers
         if config.user_comm_buffer == 0 || config.user_comm_buffer_internal == 0 {
@@ -1382,7 +1382,7 @@ where
     /// 6. Update the status buffer with return status and total response size
     /// 7. Copy the internal buffer back to the external buffer
     fn process_supervisor_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
-        log::info!("Processing Supervisor request on CPU {}...", cpu_index);
+        log::trace!("Processing Supervisor request on CPU {}...", cpu_index);
 
         // Validate buffers
         if config.supv_comm_buffer == 0 || config.supv_comm_buffer_internal == 0 {
