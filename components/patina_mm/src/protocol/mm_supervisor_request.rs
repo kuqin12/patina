@@ -151,3 +151,37 @@ pub mod responses {
     /// Operation failed with error.
     pub const ERROR: u64 = 0xFFFFFFFFFFFFFFFF;
 }
+
+// ============================================================================
+// Unblock Memory Params
+// ============================================================================
+
+use r_efi::efi;
+
+/// MM Supervisor Unblock Memory Parameters.
+///
+/// Matches the C `MM_SUPERVISOR_UNBLOCK_MEMORY_PARAMS` layout. The C header
+/// defines this under `#pragma pack(push, 1)`, but because `efi::MemoryDescriptor`
+/// (40 bytes) and `Guid` (16 bytes) are both naturally aligned, the packed
+/// and natural layouts are identical (56 bytes total).
+///
+/// ## Layout
+///
+/// ```text
+/// Offset  Size  Field
+/// 0x00    40    memory_descriptor   — EFI_MEMORY_DESCRIPTOR (r-efi efi::MemoryDescriptor)
+/// 0x28    16    identifier_guid     — Requester identification GUID
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct MmSupervisorUnblockMemoryParams {
+    /// Memory descriptor identifying the region to unblock.
+    pub memory_descriptor: efi::MemoryDescriptor,
+    /// GUID identifying the requesting driver/module.
+    pub identifier_guid: Guid,
+}
+
+impl MmSupervisorUnblockMemoryParams {
+    /// Size of this structure in bytes (56).
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+}
