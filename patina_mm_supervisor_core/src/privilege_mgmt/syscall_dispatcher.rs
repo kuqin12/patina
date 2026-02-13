@@ -707,7 +707,7 @@ impl SyscallDispatcher {
         let alloc_type = ctx.arg1 as AllocateType;
         let mem_type = ctx.arg2 as MemoryType;
         let page_count = ctx.arg3;
-        log::info!("ALLOC_PAGE: alloc_type={}, mem_type={}, count={}", alloc_type, mem_type, page_count);
+        log::trace!("ALLOC_PAGE: alloc_type={}, mem_type={}, count={}", alloc_type, mem_type, page_count);
 
         // Only BSP can allocate pages (AP allocating involves page table updates)
         if !crate::is_bsp() {
