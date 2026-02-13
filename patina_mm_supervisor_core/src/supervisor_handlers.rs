@@ -44,12 +44,19 @@
 
 use r_efi::efi;
 
+use patina_paging::{MemoryAttributes, PageTable};
+
+use crate::mm_mem::PAGE_ALLOCATOR;
 use crate::request_handler::{
     MmSupervisorRequestHeader, MmSupervisorVersionInfo,
     requests, responses, SIGNATURE, REVISION,
 };
+use crate::unblock_memory::{UnblockError, UNBLOCKED_MEMORY_TRACKER};
 
-use patina_mm::protocol::mm_supervisor_request::MM_SUPERVISOR_REQUEST_HANDLER_GUID;
+use patina_mm::protocol::mm_supervisor_request::{
+    MM_SUPERVISOR_REQUEST_HANDLER_GUID,
+    MmSupervisorUnblockMemoryParams,
+};
 
 // ============================================================================
 // Supervisor MMI Handler Infrastructure
@@ -355,13 +362,277 @@ fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
 /// Handle an UNBLOCK_MEM request.
 ///
 /// Unblocks a memory region so that user-mode MM drivers can access it.
+///
+/// ## Validation (stricter than the C `ProcessUnblockPages` implementation)
+///
+/// 1. **Ready-to-lock check** — reject if core init is complete (post-lock state).
+/// 2. **Buffer size** — must hold header + [`MmSupervisorUnblockMemoryParams`].
+/// 3. **Zero-GUID** — the identifier GUID must be non-zero.
+/// 4. **Page alignment** — `PhysicalStart` must be 4 KiB aligned.
+/// 5. **Non-zero page count** — `NumberOfPages` must be > 0.
+/// 6. **Overflow** — `NumberOfPages * PAGE_SIZE` and `PhysicalStart + size` must not overflow.
+/// 7. **MMRAM overlap** — region must not overlap supervisor RAM.
+/// 8. **Duplicate / conflict** — checked by the [`UNBLOCKED_MEMORY_TRACKER`].
+/// 9. **Page attributes** — pages must be not-present (RP set) and not read-only.
+/// 10. **Page table update** — make pages present, R/W, NX; optionally supervisor-only (SP).
 fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("UNBLOCK_MEM request");
 
-    // TODO: Parse the memory region descriptor from the payload, validate
-    // against the memory policy, and update page table permissions.
+    const PAGE_SIZE: u64 = 0x1000;
+
+    // 1. Ready-to-lock check
+    // After core initialization is complete, unblock requests are rejected.
+    // This mirrors the C `mMmReadyToLockDone` guard.
+    if UNBLOCKED_MEMORY_TRACKER.is_core_init_complete() {
+        log::error!("UNBLOCK_MEM: rejected — core initialization already complete (post ready-to-lock)");
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::ACCESS_DENIED;
+    }
+
+    // 2. Buffer size check
+    let min_size = MmSupervisorRequestHeader::SIZE + MmSupervisorUnblockMemoryParams::SIZE;
+    if *comm_buffer_size < min_size {
+        log::error!(
+            "UNBLOCK_MEM: buffer too small ({} bytes, need at least {})",
+            *comm_buffer_size,
+            min_size,
+        );
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::BUFFER_TOO_SMALL;
+    }
+
+    // 3. Parse the payload
+    // SAFETY: We verified the buffer is large enough for header + params.
+    let params = unsafe {
+        &*(comm_buffer.add(MmSupervisorRequestHeader::SIZE) as *const MmSupervisorUnblockMemoryParams)
+    };
+
+    let physical_start = params.memory_descriptor.physical_start;
+    let number_of_pages = params.memory_descriptor.number_of_pages;
+    let attribute = params.memory_descriptor.attribute;
+    let identifier_guid = params.identifier_guid;
+
+    log::info!(
+        "UNBLOCK_MEM: request from {:?} — PhysicalStart=0x{:016x}, Pages={}, Attr=0x{:x}",
+        identifier_guid,
+        physical_start,
+        number_of_pages,
+        attribute,
+    );
+
+    // 4. Zero-GUID check
+    if *identifier_guid.as_bytes() == [0u8; 16] {
+        log::error!("UNBLOCK_MEM: identifier GUID is zero");
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::INVALID_PARAMETER;
+    }
+
+    // 5. Page alignment check (stricter than C)
+    if physical_start & (PAGE_SIZE - 1) != 0 {
+        log::error!(
+            "UNBLOCK_MEM: PhysicalStart 0x{:016x} is not page-aligned",
+            physical_start,
+        );
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::INVALID_PARAMETER;
+    }
+
+    // 6. Non-zero page count
+    if number_of_pages == 0 {
+        log::error!("UNBLOCK_MEM: NumberOfPages is 0");
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::INVALID_PARAMETER;
+    }
+
+    // 7. Overflow checks
+    let region_size = match number_of_pages.checked_mul(PAGE_SIZE) {
+        Some(s) => s,
+        None => {
+            log::error!(
+                "UNBLOCK_MEM: NumberOfPages ({}) * PAGE_SIZE overflows u64",
+                number_of_pages,
+            );
+            write_request_result(comm_buffer, responses::ERROR);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::INVALID_PARAMETER;
+        }
+    };
+
+    if physical_start.checked_add(region_size).is_none() {
+        log::error!(
+            "UNBLOCK_MEM: address range 0x{:016x} + 0x{:x} overflows",
+            physical_start,
+            region_size,
+        );
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::INVALID_PARAMETER;
+    }
+
+    // 8. MMRAM overlap check
+    if PAGE_ALLOCATOR.is_region_inside_mmram(physical_start, region_size) {
+        log::error!(
+            "UNBLOCK_MEM: region 0x{:016x}-0x{:016x} overlaps with MMRAM",
+            physical_start,
+            physical_start + region_size,
+        );
+        write_request_result(comm_buffer, responses::ERROR);
+        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+        return efi::Status::SECURITY_VIOLATION;
+    }
+
+    // 9. Duplicate / conflict check via tracker
+    // We use the tracker's region count to distinguish newly-added vs idempotent.
+    // For newly-added regions we must additionally verify page attributes and
+    // apply page table changes. For idempotent (exact duplicate) requests we
+    // can short-circuit with SUCCESS.
+    let is_supervisor_page = (attribute & efi::MEMORY_SP) != 0;
+    let track_attributes: u32 = if is_supervisor_page {
+        patina_mm_policy::RESOURCE_ATTR_READ | patina_mm_policy::RESOURCE_ATTR_WRITE
+            | 0x80000000 // high bit tag for supervisor-only tracking
+    } else {
+        patina_mm_policy::RESOURCE_ATTR_READ | patina_mm_policy::RESOURCE_ATTR_WRITE
+    };
+
+    let count_before = UNBLOCKED_MEMORY_TRACKER.region_count();
+    match UNBLOCKED_MEMORY_TRACKER.unblock_memory(physical_start, region_size, track_attributes) {
+        Ok(()) => {
+            let count_after = UNBLOCKED_MEMORY_TRACKER.region_count();
+            if count_after == count_before {
+                // Idempotent — already tracked with same attributes, nothing more to do.
+                log::info!(
+                    "UNBLOCK_MEM: region 0x{:016x}-0x{:016x} already unblocked (idempotent)",
+                    physical_start,
+                    physical_start + region_size,
+                );
+                write_request_result(comm_buffer, responses::SUCCESS);
+                *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                return efi::Status::SUCCESS;
+            }
+            // Newly added — continue to verify page attributes and update page table.
+        }
+        Err(UnblockError::ConflictingAttributes) => {
+            log::error!(
+                "UNBLOCK_MEM: region 0x{:016x}-0x{:016x} conflicts with existing entry",
+                physical_start,
+                physical_start + region_size,
+            );
+            write_request_result(comm_buffer, responses::ERROR);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::SECURITY_VIOLATION;
+        }
+        Err(e) => {
+            log::error!(
+                "UNBLOCK_MEM: tracker rejected request for 0x{:016x}-0x{:016x}: {:?}",
+                physical_start,
+                physical_start + region_size,
+                e,
+            );
+            write_request_result(comm_buffer, responses::ERROR);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::INVALID_PARAMETER;
+        }
+    }
+
+    // 10. Verify current page attributes
+    // Pages must be not-present (ReadProtect) and NOT read-only. This ensures
+    // we only unblock pages that were explicitly guarded, matching the C
+    // `VerifyUnblockRequest` logic with an additional RO check.
+    {
+        let pt_guard = crate::PAGE_TABLE.lock();
+        if let Some(ref pt) = *pt_guard {
+            match pt.query_memory_region(physical_start, region_size) {
+                Ok(current_attrs) => {
+                    if !current_attrs.contains(MemoryAttributes::ReadProtect) {
+                        log::error!(
+                            "UNBLOCK_MEM: pages at 0x{:016x} are already present (attrs: {:?}). \
+                             Only not-present pages may be unblocked.",
+                            physical_start,
+                            current_attrs,
+                        );
+                        write_request_result(comm_buffer, responses::ERROR);
+                        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                        return efi::Status::SECURITY_VIOLATION;
+                    }
+
+                    if current_attrs.contains(MemoryAttributes::ReadOnly) {
+                        log::error!(
+                            "UNBLOCK_MEM: pages at 0x{:016x} have ReadOnly attribute (attrs: {:?}). \
+                             Read-only pages cannot be unblocked.",
+                            physical_start,
+                            current_attrs,
+                        );
+                        write_request_result(comm_buffer, responses::ERROR);
+                        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                        return efi::Status::SECURITY_VIOLATION;
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "UNBLOCK_MEM: failed to query page attributes for 0x{:016x}-0x{:016x}: {:?}",
+                        physical_start,
+                        physical_start + region_size,
+                        e,
+                    );
+                    for _ in 0.. {
+                        core::hint::spin_loop();
+                    }
+                    write_request_result(comm_buffer, responses::ERROR);
+                    *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                    return efi::Status::DEVICE_ERROR;
+                }
+            }
+        } else {
+            log::error!("UNBLOCK_MEM: page table not initialized");
+            write_request_result(comm_buffer, responses::ERROR);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::NOT_READY;
+        }
+    }
+
+    // 11. Apply page table changes
+    // Make the region:
+    //   - Present (clear ReadProtect)
+    //   - Read/Write (clear ReadOnly)
+    //   - Non-executable (set ExecuteProtect) — data pages must be W^X
+    //   - Optionally Supervisor-only (set Special) if EFI_MEMORY_SP requested
+    {
+        let mut pt_guard = crate::PAGE_TABLE.lock();
+        if let Some(ref mut pt) = *pt_guard {
+            let mut new_attrs = MemoryAttributes::ExecuteProtect; // NX — data pages are non-executable
+            if is_supervisor_page {
+                new_attrs = new_attrs | MemoryAttributes::Special; // Supervisor-only (U/S=0)
+            }
+
+            if let Err(e) = pt.map_memory_region(physical_start, region_size, new_attrs) {
+                log::error!(
+                    "UNBLOCK_MEM: failed to update page table for 0x{:016x}-0x{:016x}: {:?}",
+                    physical_start,
+                    physical_start + region_size,
+                    e,
+                );
+                write_request_result(comm_buffer, responses::ERROR);
+                *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                return efi::Status::DEVICE_ERROR;
+            }
+        }
+        // If page table is None, we already returned NOT_READY above.
+    }
+
+    log::info!(
+        "UNBLOCK_MEM: SUCCESS — unblocked 0x{:016x}-0x{:016x} ({} pages, {})",
+        physical_start,
+        physical_start + region_size,
+        number_of_pages,
+        if is_supervisor_page { "supervisor-only" } else { "user-accessible" },
+    );
+
     write_request_result(comm_buffer, responses::SUCCESS);
     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
-
-    efi::Status::UNSUPPORTED
+    efi::Status::SUCCESS
 }
