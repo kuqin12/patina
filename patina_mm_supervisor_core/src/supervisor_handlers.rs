@@ -606,7 +606,7 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
         if let Some(ref mut pt) = *pt_guard {
             let mut new_attrs = MemoryAttributes::ExecuteProtect; // NX — data pages are non-executable
             if is_supervisor_page {
-                new_attrs = new_attrs | MemoryAttributes::Special; // Supervisor-only (U/S=0)
+                new_attrs = new_attrs | MemoryAttributes::SpecialPurpose; // Supervisor-only (U/S=0)
             }
 
             if let Err(e) = pt.map_memory_region(physical_start, region_size, new_attrs) {
