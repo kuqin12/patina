@@ -44,7 +44,7 @@
 
 use r_efi::efi;
 
-use patina_paging::{MemoryAttributes, PageTable};
+use patina_paging::{MemoryAttributes, PageTable, PtError};
 
 use crate::mm_mem::PAGE_ALLOCATOR;
 use crate::request_handler::{
@@ -548,29 +548,18 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
         if let Some(ref pt) = *pt_guard {
             match pt.query_memory_region(physical_start, region_size) {
                 Ok(current_attrs) => {
-                    if !current_attrs.contains(MemoryAttributes::ReadProtect) {
-                        log::error!(
-                            "UNBLOCK_MEM: pages at 0x{:016x} are already present (attrs: {:?}). \
-                             Only not-present pages may be unblocked.",
-                            physical_start,
-                            current_attrs,
-                        );
-                        write_request_result(comm_buffer, responses::ERROR);
-                        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
-                        return efi::Status::SECURITY_VIOLATION;
-                    }
-
-                    if current_attrs.contains(MemoryAttributes::ReadOnly) {
-                        log::error!(
-                            "UNBLOCK_MEM: pages at 0x{:016x} have ReadOnly attribute (attrs: {:?}). \
-                             Read-only pages cannot be unblocked.",
-                            physical_start,
-                            current_attrs,
-                        );
-                        write_request_result(comm_buffer, responses::ERROR);
-                        *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
-                        return efi::Status::SECURITY_VIOLATION;
-                    }
+                    log::error!(
+                        "UNBLOCK_MEM: pages at 0x{:016x} are already present (attrs: {:?}). \
+                            Only not-present pages may be unblocked.",
+                        physical_start,
+                        current_attrs,
+                    );
+                    write_request_result(comm_buffer, responses::ERROR);
+                    *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+                    return efi::Status::SECURITY_VIOLATION;
+                }
+                Err(PtError::NoMapping) => {
+                    // Expected case — pages are currently not present, so we can unblock them.
                 }
                 Err(e) => {
                     log::error!(
@@ -579,9 +568,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                         physical_start + region_size,
                         e,
                     );
-                    for _ in 0.. {
-                        core::hint::spin_loop();
-                    }
                     write_request_result(comm_buffer, responses::ERROR);
                     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
                     return efi::Status::DEVICE_ERROR;

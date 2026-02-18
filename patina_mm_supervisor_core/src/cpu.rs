@@ -215,7 +215,7 @@ impl<const MAX_CPUS: usize> CpuManager<MAX_CPUS> {
         self.bsp_id() == Some(cpu_id)
     }
 
-    /// Finds the slot index for a given CPU ID.
+    /// Finds the slot index for a given CPU ID (APIC ID).
     fn find_slot(&self, cpu_id: u32) -> Option<usize> {
         for (index, slot) in self.slots.iter().enumerate() {
             if slot.get_cpu_id() == Some(cpu_id) {
@@ -223,6 +223,36 @@ impl<const MAX_CPUS: usize> CpuManager<MAX_CPUS> {
             }
         }
         None
+    }
+
+    /// Finds the slot index for a given CPU ID (public wrapper).
+    pub fn find_cpu_index(&self, cpu_id: u32) -> Option<usize> {
+        self.find_slot(cpu_id)
+    }
+
+    /// Gets the APIC ID of the CPU at the given slot index.
+    ///
+    /// Returns `None` if the index is out of range or the slot is unused.
+    pub fn get_cpu_id_by_index(&self, index: usize) -> Option<u32> {
+        if index >= MAX_CPUS {
+            return None;
+        }
+        self.slots[index].get_cpu_id()
+    }
+
+    /// Gets the AP state by slot index.
+    ///
+    /// Returns `None` if the index is out of range or the slot is unused.
+    pub fn get_ap_state_by_index(&self, index: usize) -> Option<ApState> {
+        if index >= MAX_CPUS {
+            return None;
+        }
+        let slot = &self.slots[index];
+        if slot.is_used() {
+            Some(ApState::from(slot.state.load(Ordering::Acquire)))
+        } else {
+            None
+        }
     }
 
     /// Gets the state of an AP.

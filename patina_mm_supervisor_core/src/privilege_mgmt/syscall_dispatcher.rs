@@ -803,18 +803,76 @@ impl SyscallDispatcher {
 
     /// Handles start AP procedure syscall.
     ///
+    /// Validates the request and delegates to the platform-specific AP startup
+    /// function registered during [`MmSupervisorCore`] initialization.
+    ///
+    /// Checks performed before dispatch:
+    /// - Procedure pointer is non-null
+    /// - Procedure pointer is within user-accessible memory (unblocked region)
+    /// - Argument pointer (if non-null) is within user-accessible memory
+    ///
+    /// The remaining validation (CPU index range, BSP check, AP busy check) and
+    /// the actual dispatch are handled by the registered AP startup function,
+    /// which has access to the CPU manager and mailbox manager.
+    ///
     /// - Arg1: Procedure function pointer
     /// - Arg2: CPU index
     /// - Arg3: Argument pointer
     fn handle_start_ap_proc(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("START_AP_PROC: proc=0x{:x}, cpu={}, arg=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+        let procedure = ctx.arg1;
+        let cpu_index = ctx.arg2;
+        let argument = ctx.arg3;
 
-        // TODO: Validate procedure pointer is in user-owned range
-        // TODO: Validate CPU index is within NumberOfCpus
-        // TODO: Validate argument pointer (if non-null) is in user-owned range
-        // TODO: Delegate to MmStartupThisAp equivalent (must ensure procedure runs demoted)
-        log::warn!("START_AP_PROC: Not yet implemented");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        log::info!(
+            "START_AP_PROC: proc=0x{:x}, cpu={}, arg=0x{:x}",
+            procedure, cpu_index, argument
+        );
+
+        // 1. Validate procedure pointer is non-null
+        if procedure == 0 {
+            log::error!("START_AP_PROC: Null procedure pointer");
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // 2. Validate procedure pointer is within mapped memory via page table query
+        if crate::query_address_ownership(procedure, core::mem::size_of::<usize>() as u64).is_none() {
+            log::error!(
+                "START_AP_PROC: Procedure 0x{:x} not in mapped memory",
+                procedure
+            );
+            return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+        }
+
+        // 3. Validate argument pointer (if non-null) is within mapped memory
+        if argument != 0 {
+            if crate::query_address_ownership(argument, core::mem::size_of::<usize>() as u64).is_none() {
+                log::error!(
+                    "START_AP_PROC: Argument 0x{:x} not in mapped memory",
+                    argument
+                );
+                return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
+            }
+        }
+
+        // 4. Delegate to the registered AP startup function
+        match crate::AP_STARTUP_FN.get() {
+            Some(start_fn) => {
+                log::info!(
+                    "START_AP_PROC: Dispatching to AP startup function at {:p} for CPU {}",
+                    *start_fn as *const (), cpu_index
+                );
+                let status = start_fn(cpu_index, procedure, argument);
+                if status == 0 {
+                    SyscallResult::success(0)
+                } else {
+                    SyscallResult::error(status)
+                }
+            }
+            None => {
+                log::error!("START_AP_PROC: AP startup not initialized");
+                SyscallResult::error(SyscallResult::EFI_NOT_READY)
+            }
+        }
     }
 
     /// Handles extended save state read syscall.

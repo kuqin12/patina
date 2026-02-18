@@ -26,44 +26,39 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Commands that can be sent from BSP to APs via the mailbox.
+///
+/// APs sit in a holding pen polling for commands. When no command is pending
+/// the AP simply keeps spinning — there is no explicit "no-op" variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApCommand {
-    /// No operation - used for testing or keepalive.
-    Nop,
-    /// Execute a specific handler.
-    Execute {
-        /// The ID of the handler to execute.
-        handler_id: u32,
-        /// Context data for the handler.
-        context: u64,
+    /// Run a procedure on the AP, with potential demotion to user mode.
+    ///
+    /// The AP checks buffer ownership and demotes to Ring 3 if the procedure
+    /// lives in user-owned memory, otherwise calls it directly in Ring 0.
+    RunProcedure {
+        /// The procedure function pointer.
+        procedure: u64,
+        /// The argument to pass to the procedure.
+        argument: u64,
     },
-    /// Shutdown the AP.
-    Shutdown,
+    /// Exit the holding pen and return to the caller.
+    Return,
 }
 
 impl ApCommand {
-    /// Converts the command to a u64 for atomic storage.
+    /// Converts the command to a u64 tag for atomic storage.
     fn to_u64(self) -> u64 {
         match self {
-            ApCommand::Nop => 0,
-            ApCommand::Execute { handler_id, .. } => {
-                // Pack handler_id in upper 32 bits
-                1 | ((handler_id as u64) << 32)
-            }
-            ApCommand::Shutdown => 2,
+            ApCommand::RunProcedure { .. } => 1,
+            ApCommand::Return => 2,
         }
     }
 
-    /// Converts a u64 back to a command.
-    fn from_u64(value: u64, context: u64) -> Option<Self> {
-        let cmd_type = value & 0xFF;
-        match cmd_type {
-            0 => Some(ApCommand::Nop),
-            1 => {
-                let handler_id = (value >> 32) as u32;
-                Some(ApCommand::Execute { handler_id, context })
-            }
-            2 => Some(ApCommand::Shutdown),
+    /// Converts a u64 tag back to a command.
+    fn from_u64(tag: u64, procedure: u64, argument: u64) -> Option<Self> {
+        match tag & 0xFF {
+            1 => Some(ApCommand::RunProcedure { procedure, argument }),
+            2 => Some(ApCommand::Return),
             _ => None,
         }
     }
@@ -140,16 +135,18 @@ impl From<u32> for MailboxState {
 pub struct ApMailbox {
     /// Current state of the mailbox.
     state: AtomicU32,
-    /// The command data (packed into u64).
+    /// The command tag (discriminant packed into u64).
     command: AtomicU64,
-    /// Additional context data for the command.
-    command_context: AtomicU64,
+    /// The procedure function pointer (for RunProcedure).
+    procedure: AtomicU64,
+    /// The argument to pass to the procedure (for RunProcedure).
+    argument: AtomicU64,
     /// The response data (packed into u64).
     response: AtomicU64,
     /// The CPU ID this mailbox is assigned to (u32::MAX = unassigned).
     assigned_cpu: AtomicU32,
     /// Padding to ensure cache-line alignment.
-    _padding: [u8; 20],
+    _padding: [u8; 12],
 }
 
 impl ApMailbox {
@@ -158,10 +155,11 @@ impl ApMailbox {
         Self {
             state: AtomicU32::new(MailboxState::Empty as u32),
             command: AtomicU64::new(0),
-            command_context: AtomicU64::new(0),
+            procedure: AtomicU64::new(0),
+            argument: AtomicU64::new(0),
             response: AtomicU64::new(0),
             assigned_cpu: AtomicU32::new(u32::MAX),
-            _padding: [0; 20],
+            _padding: [0; 12],
         }
     }
 
@@ -208,9 +206,10 @@ impl ApMailbox {
         );
 
         if result.is_ok() {
-            let cmd = self.command.load(Ordering::Acquire);
-            let ctx = self.command_context.load(Ordering::Acquire);
-            ApCommand::from_u64(cmd, ctx)
+            let tag = self.command.load(Ordering::Acquire);
+            let proc = self.procedure.load(Ordering::Acquire);
+            let arg = self.argument.load(Ordering::Acquire);
+            ApCommand::from_u64(tag, proc, arg)
         } else {
             None
         }
@@ -235,13 +234,17 @@ impl ApMailbox {
         );
 
         if result.is_ok() {
-            // Store context first
-            if let ApCommand::Execute { context, .. } = command {
-                self.command_context.store(context, Ordering::Release);
-            } else {
-                self.command_context.store(0, Ordering::Release);
+            // Store payload fields first, then the command tag (publish signal)
+            match command {
+                ApCommand::RunProcedure { procedure, argument } => {
+                    self.procedure.store(procedure, Ordering::Release);
+                    self.argument.store(argument, Ordering::Release);
+                }
+                ApCommand::Return => {
+                    self.procedure.store(0, Ordering::Release);
+                    self.argument.store(0, Ordering::Release);
+                }
             }
-            // Then store the command
             self.command.store(command.to_u64(), Ordering::Release);
             true
         } else {
@@ -404,6 +407,40 @@ impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
         success_count
     }
 
+    /// Waits for all assigned APs to post responses, with a timeout.
+    ///
+    /// Returns the number of APs that responded within the timeout.
+    pub fn wait_all_responses(&self, timeout_us: u64) -> usize {
+        let iterations = timeout_us * 10; // Rough approximation
+        let mut responded = 0;
+        let total = self.assigned_count();
+
+        for _ in 0..iterations {
+            responded = 0;
+            for mailbox in &self.mailboxes {
+                if mailbox.assigned_cpu().is_some() {
+                    // Count APs that have already been consumed (Empty) or have response ready
+                    if mailbox.is_empty() || mailbox.has_response() {
+                        responded += 1;
+                    }
+                }
+            }
+            if responded >= total {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Drain all pending responses
+        for mailbox in &self.mailboxes {
+            if mailbox.assigned_cpu().is_some() && mailbox.has_response() {
+                let _ = mailbox.get_response();
+            }
+        }
+
+        responded
+    }
+
     /// Gets the number of assigned mailboxes.
     pub fn assigned_count(&self) -> usize {
         self.assigned_count.load(Ordering::SeqCst) as usize
@@ -455,15 +492,15 @@ mod tests {
         mailbox.assign(1);
 
         // Send a command
-        assert!(mailbox.send_command(ApCommand::Nop));
+        assert!(mailbox.send_command(ApCommand::Return));
         assert!(mailbox.has_pending_command());
 
         // Cannot send another while one is pending
-        assert!(!mailbox.send_command(ApCommand::Shutdown));
+        assert!(!mailbox.send_command(ApCommand::Return));
 
         // Take the command
         let cmd = mailbox.take_command();
-        assert_eq!(cmd, Some(ApCommand::Nop));
+        assert_eq!(cmd, Some(ApCommand::Return));
         assert!(!mailbox.has_pending_command());
 
         // Post response
@@ -477,20 +514,20 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_command() {
+    fn test_run_procedure_command() {
         let mailbox = ApMailbox::new();
         mailbox.assign(1);
 
-        let cmd = ApCommand::Execute {
-            handler_id: 42,
-            context: 0x12345678,
+        let cmd = ApCommand::RunProcedure {
+            procedure: 0xDEAD_BEEF,
+            argument: 0x12345678,
         };
 
         assert!(mailbox.send_command(cmd));
         let received = mailbox.take_command();
         assert!(matches!(
             received,
-            Some(ApCommand::Execute { handler_id: 42, context: 0x12345678 })
+            Some(ApCommand::RunProcedure { procedure: 0xDEAD_BEEF, argument: 0x12345678 })
         ));
     }
 
@@ -505,12 +542,12 @@ mod tests {
         let manager: MailboxManager<4> = MailboxManager::new();
 
         // Send command (implicitly assigns mailbox)
-        assert!(manager.send_command(1, ApCommand::Nop).is_ok());
+        assert!(manager.send_command(1, ApCommand::Return).is_ok());
         assert_eq!(manager.assigned_count(), 1);
 
         // Check mailbox
         let cmd = manager.check_mailbox(1);
-        assert_eq!(cmd, Some(ApCommand::Nop));
+        assert_eq!(cmd, Some(ApCommand::Return));
 
         // Post response
         manager.post_response(1, ApResponse::Success);
@@ -525,23 +562,23 @@ mod tests {
         let manager: MailboxManager<4> = MailboxManager::new();
 
         // Assign mailboxes for multiple APs
-        manager.send_command(1, ApCommand::Nop).ok();
+        manager.send_command(1, ApCommand::Return).ok();
         manager.check_mailbox(1); // Clear command
         manager.post_response(1, ApResponse::Success);
         manager.wait_response(1, 1);
 
-        manager.send_command(2, ApCommand::Nop).ok();
+        manager.send_command(2, ApCommand::Return).ok();
         manager.check_mailbox(2);
         manager.post_response(2, ApResponse::Success);
         manager.wait_response(2, 1);
 
-        manager.send_command(3, ApCommand::Nop).ok();
+        manager.send_command(3, ApCommand::Return).ok();
         manager.check_mailbox(3);
         manager.post_response(3, ApResponse::Success);
         manager.wait_response(3, 1);
 
         // Broadcast
-        let count = manager.broadcast_command(ApCommand::Shutdown);
+        let count = manager.broadcast_command(ApCommand::Return);
         assert_eq!(count, 3);
     }
 

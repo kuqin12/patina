@@ -89,7 +89,7 @@ use core::{
 };
 
 use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
-use patina_paging::{PagingType, x64::X64PageTable};
+use patina_paging::{MemoryAttributes, PageTable, PagingType, x64::X64PageTable};
 use r_efi::efi;
 
 use patina_mm_policy::{walk_page_table, MemDescriptorV1_0};
@@ -273,6 +273,70 @@ pub(crate) static POLICY_GATE: Once<patina_mm_policy::PolicyGate> = Once::new();
 /// allocating memory.
 pub(crate) static PAGE_TABLE: Mutex<Option<X64PageTable<SharedPagingAllocator>>> = Mutex::new(None);
 
+/// Result of a page table ownership query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageOwnership {
+    /// The page is user-accessible (U/S = 1, SpecialPurpose clear).
+    User,
+    /// The page is supervisor-only (U/S = 0, SpecialPurpose set).
+    Supervisor,
+}
+
+/// Aligns an address and size to page boundaries for page table queries.
+///
+/// Rounds the address down to the nearest page boundary and adjusts the size
+/// upward so the entire original range `[address, address+size)` is covered.
+///
+/// Returns `(page_aligned_address, page_aligned_size)`.
+#[inline]
+fn page_align_range(address: u64, size: u64) -> (u64, u64) {
+    const PAGE_MASK: u64 = (PAGE_SIZE as u64) - 1;
+    let aligned_start = address & !PAGE_MASK;
+    let end = address.saturating_add(size);
+    let aligned_end = end.saturating_add(PAGE_MASK) & !PAGE_MASK;
+    (aligned_start, aligned_end.saturating_sub(aligned_start))
+}
+
+/// Queries the page table to determine whether an address is mapped and accessible.
+///
+/// The address and size are page-aligned before querying (rounded down / up respectively).
+///
+/// Returns `Ok(true)` if the address is mapped (regardless of privilege level),
+/// `Ok(false)` if the page table is not initialized, or `Err(PtError)` if the
+/// query fails (e.g., unmapped address).
+pub(crate) fn is_address_mapped(address: u64, size: u64) -> Result<bool, patina_paging::PtError> {
+    let (aligned_addr, aligned_size) = page_align_range(address, size);
+    let page_table = PAGE_TABLE.lock();
+    match page_table.as_ref() {
+        Some(pt) => {
+            pt.query_memory_region(aligned_addr, aligned_size)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Queries the page table to determine the ownership (user vs supervisor) of an address.
+///
+/// The address and size are page-aligned before querying (rounded down / up respectively).
+///
+/// Checks the `SpecialPurpose` attribute which maps to the U/S bit on X64:
+///   - `SpecialPurpose` set  => `PageOwnership::Supervisor` (U/S = 0)
+///   - `SpecialPurpose` clear => `PageOwnership::User` (U/S = 1)
+///
+/// Returns `None` if the page table is not initialized or the address is unmapped.
+pub(crate) fn query_address_ownership(address: u64, size: u64) -> Option<PageOwnership> {
+    let (aligned_addr, aligned_size) = page_align_range(address, size);
+    let page_table = PAGE_TABLE.lock();
+    let pt = page_table.as_ref()?;
+    let attrs = pt.query_memory_region(aligned_addr, aligned_size).ok()?;
+    if attrs.contains(MemoryAttributes::SpecialPurpose) {
+        Some(PageOwnership::Supervisor)
+    } else {
+        Some(PageOwnership::User)
+    }
+}
+
 // ============================================================================
 // Communication Buffer Pointers (from PassDown HOB)
 // ============================================================================
@@ -309,6 +373,17 @@ static USER_ENTRY_POINT: Once<u64> = Once::new();
 /// Pointer to the SMM_CPU_PRIVATE_DATA structure from the PassDown HOB.
 /// This is used to access the SmmCoreEntryContext for user request dispatch.
 static SMM_CPU_PRIVATE: Once<u64> = Once::new();
+
+/// Type-erased function pointer for AP startup dispatch.
+///
+/// This is set during [`MmSupervisorCore`] initialization. The function is monomorphized
+/// for the concrete `PlatformInfo` type so the syscall dispatcher can invoke it without
+/// knowing the platform's const-generic parameters.
+///
+/// Signature: `fn(cpu_index: u64, procedure: u64, argument: u64) -> u64`
+///
+/// Returns 0 on success, or an EFI status code on failure.
+pub(crate) static AP_STARTUP_FN: Once<fn(u64, u64, u64) -> u64> = Once::new();
 
 /// MM Communication Buffer Status Structure.
 /// Matches the C structure MM_COMM_BUFFER_STATUS from MmCommBuffer.h
@@ -470,6 +545,8 @@ pub enum UserCommandType {
     StartUserCore,
     /// Command to execute a user level request from the supervisor
     UserRequest,
+    /// Command to implement a user AP procedure
+    UserApProcedure,
 }
 
 
@@ -621,10 +698,16 @@ where
     /// Sets the static supervisor instance for global access.
     ///
     /// Returns true if the address was successfully stored, false if already set.
+    /// Also registers the type-erased AP startup function pointer.
     #[must_use]
     fn set_instance(&'static self) -> bool {
         let physical_address = NonNull::from_ref(self).expose_provenance();
-        &physical_address == __SUPERVISOR.call_once(|| physical_address)
+        let stored = &physical_address == __SUPERVISOR.call_once(|| physical_address);
+        if stored {
+            // Register the monomorphized AP startup function for this platform
+            AP_STARTUP_FN.call_once(|| Self::start_ap_procedure_trampoline);
+        }
+        stored
     }
 
     /// Gets the static MM Supervisor Core instance for global access.
@@ -704,6 +787,10 @@ where
                     return;
                 }
             };
+
+            // SAFETY: We are transitioning from the supervisor (CPL0) to the user module (CPL3) for the first time.
+            // The entry point and stack have been validated and set up during initialization, and the user module is
+            // will be responsible for validating any further inputs.
             let ret = unsafe {
                 invoke_demoted_routine (
                     cpu_index,
@@ -826,8 +913,7 @@ where
         let user_entry_point = unsafe { self.discover_user_module_entry(hob_list) };
         if let Some(entry) = user_entry_point {
             log::info!("Discovered MM User module entry point: 0x{:016x}", entry);
-            // TODO: Store this entry point for later invocation
-        // Store entry point in static for use during request processing
+            // Store entry point in static for use during request processing
             USER_ENTRY_POINT.call_once(|| entry);
         } else {
             log::warn!("MM User module entry point not found in HOB list");
@@ -869,20 +955,72 @@ where
 
     /// Enter runtime mode (called on subsequent entries after init is complete).
     ///
-    /// BSP enters the request serving loop, APs enter the holding pen.
-    /// This function does not return.
+    /// Implements the MP synchronization protocol:
+    /// 1. APs check in by setting their state to `InHoldingPen` and entering the holding pen
+    /// 2. BSP waits (with timeout) for all registered APs to arrive
+    /// 3. BSP processes the pending request via `bsp_request_loop`
+    /// 4. BSP broadcasts `Return` to all APs so they exit the holding pen
+    /// 5. BSP waits for all AP responses before returning
     fn enter_runtime(&'static self, cpu_id: u32) {
-        let is_bsp = self.cpu_manager.is_bsp(cpu_id);
+        let is_bsp = cpu::is_bsp();
 
         if is_bsp {
+            log::trace!("BSP (CPU {}) waiting for APs to arrive...", cpu_id);
+
+            // Wait for all registered APs to check in (set state to InHoldingPen)
+            let expected_aps = self.cpu_manager.registered_count().saturating_sub(1) as usize;
+            self.wait_for_ap_arrival(expected_aps);
+
+            // All APs (or timeout) — proceed with request processing
             log::trace!("BSP (CPU {}) entering request serving routine...", cpu_id);
-            // Enter the main request serving loop
-            self.bsp_request_loop(cpu_id as usize)
+            self.bsp_request_loop(cpu_id as usize);
+
+            // BSP is done handling the request — broadcast Return to all APs
+            log::trace!("BSP (CPU {}) broadcasting Return to all APs...", cpu_id);
+            let sent = self.mailbox_manager.broadcast_command(ApCommand::Return);
+            log::trace!("BSP (CPU {}) sent Return to {} APs, waiting for acknowledgement...", cpu_id, sent);
+
+            // Wait for all APs to acknowledge the Return command
+            const RETURN_TIMEOUT_US: u64 = 100_000; // 100 ms
+            let responded = self.mailbox_manager.wait_all_responses(RETURN_TIMEOUT_US);
+            log::trace!(
+                "BSP (CPU {}) done: {}/{} APs acknowledged Return",
+                cpu_id, responded, sent
+            );
         } else {
-            log::trace!("AP (CPU {}) entering holding pen...", cpu_id);
-            // Enter the holding pen
-            self.ap_holding_pen(cpu_id)
+            // AP: check in by marking state, then enter holding pen
+            self.cpu_manager.set_ap_state(cpu_id, cpu::ApState::InHoldingPen);
+            log::trace!("AP (CPU {}) checked in, entering holding pen...", cpu_id);
+            self.ap_holding_pen(cpu_id);
         }
+    }
+
+    /// Waits for APs to arrive with a timeout.
+    ///
+    /// Spins until the expected number of APs have set their state to `InHoldingPen`,
+    /// or the timeout expires (whichever comes first).
+    fn wait_for_ap_arrival(&self, expected_aps: usize) {
+        if expected_aps == 0 {
+            return;
+        }
+
+        // Approximate timeout via spin loop iterations (~100 ms worth of spins)
+        const AP_ARRIVAL_TIMEOUT_ITERS: u64 = 1_000_000;
+
+        for _ in 0..AP_ARRIVAL_TIMEOUT_ITERS {
+            let arrived = self.cpu_manager.count_aps_in_state(cpu::ApState::InHoldingPen);
+            if arrived >= expected_aps {
+                log::trace!("All {} APs arrived", arrived);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+
+        let arrived = self.cpu_manager.count_aps_in_state(cpu::ApState::InHoldingPen);
+        log::warn!(
+            "AP arrival timeout: {}/{} APs arrived, proceeding with available cores",
+            arrived, expected_aps
+        );
     }
 
     /// Discovers the MM Supervisor User module entry point from the HOB list.
@@ -1084,8 +1222,6 @@ where
                     match unsafe { patina_mm_policy::PolicyGate::new(policy_ptr) } {
                         Ok(gate) => {
                             log::info!("Policy gate initialized successfully");
-                            // TODO: Store the policy gate for later use
-                            // For now, dump the policy for debugging
                             // SAFETY: policy_ptr points to valid policy data as validated above.
                             unsafe { patina_mm_policy::dump_policy(policy_ptr) };
                             // Store the initialized policy gate in the static variable for global access
@@ -1534,7 +1670,8 @@ where
     /// The holding pen for APs.
     ///
     /// APs wait here, polling their mailbox for commands from the BSP.
-    fn ap_holding_pen(&'static self, cpu_id: u32) -> ! {
+    /// The loop exits when the AP receives a `Return` command.
+    fn ap_holding_pen(&'static self, cpu_id: u32) {
         log::trace!("AP (CPU {}) in holding pen, polling mailbox...", cpu_id);
 
         loop {
@@ -1543,10 +1680,16 @@ where
                 log::trace!("AP (CPU {}) received command: {:?}", cpu_id, command);
 
                 // Execute the command
-                let response = self.execute_ap_command(cpu_id, command);
+                let response = self.execute_ap_command(cpu_id, &command);
 
                 // Post the response
                 self.mailbox_manager.post_response(cpu_id, response);
+
+                // Break out of the holding pen on Return
+                if matches!(command, ApCommand::Return) {
+                    log::trace!("AP (CPU {}) exiting holding pen", cpu_id);
+                    break;
+                }
             }
 
             // Pause to avoid spinning too aggressively
@@ -1558,21 +1701,202 @@ where
     }
 
     /// Execute a command received by an AP.
-    fn execute_ap_command(&self, cpu_id: u32, command: ApCommand) -> ApResponse {
-        match command {
-            ApCommand::Nop => {
-                log::trace!("AP (CPU {}) executing NOP", cpu_id);
+    fn execute_ap_command(&self, cpu_id: u32, command: &ApCommand) -> ApResponse {
+        match *command {
+            ApCommand::RunProcedure { procedure, argument } => {
+                self.run_procedure_on_ap(cpu_id, procedure, argument)
+            }
+            ApCommand::Return => {
+                log::trace!("AP (CPU {}) received return command", cpu_id);
                 ApResponse::Success
             }
-            ApCommand::Execute { handler_id, context } => {
-                log::trace!("AP (CPU {}) executing handler {}", cpu_id, handler_id);
-                // TODO: Look up and execute the handler
-                let _ = context;
-                ApResponse::Success
+        }
+    }
+
+    /// Run a procedure on an AP, demoting to user mode if the procedure is in user-owned range.
+    ///
+    /// This is the AP-side handler for `ApCommand::RunProcedure`. It mirrors the C
+    /// `ProcedureWrapper` logic: inspects the procedure pointer ownership and either
+    /// calls it directly (supervisor-owned) or demotes to Ring 3 (user-owned).
+    fn run_procedure_on_ap(&self, cpu_id: u32, procedure: u64, argument: u64) -> ApResponse {
+        log::info!(
+            "AP (CPU {}) running procedure 0x{:x} with arg 0x{:x}",
+            cpu_id, procedure, argument
+        );
+
+        // Determine if the procedure is in user-owned (Ring 3) range by querying the
+        // page table via the centralized helper.
+        let is_user_range = match query_address_ownership(procedure, core::mem::size_of::<usize>() as u64) {
+            Some(PageOwnership::User) => true,
+            Some(PageOwnership::Supervisor) => false,
+            None => {
+                log::error!(
+                    "AP (CPU {}) failed to query ownership for 0x{:x} (unmapped or page table not ready)",
+                    cpu_id, procedure
+                );
+                return ApResponse::Error(efi::Status::DEVICE_ERROR.as_usize() as u32);
             }
-            ApCommand::Shutdown => {
-                log::trace!("AP (CPU {}) received shutdown command", cpu_id);
-                ApResponse::Success
+        };
+
+        if is_user_range {
+            // Resolve the cpu_index (slot index) for this APIC ID
+            let cpu_index = match self.cpu_manager.find_cpu_index(cpu_id) {
+                Some(idx) => idx,
+                None => {
+                    log::error!("AP (CPU {}) has no registered slot, cannot demote", cpu_id);
+                    return ApResponse::Error(efi::Status::DEVICE_ERROR.as_usize() as u32);
+                }
+            };
+
+            // Get the CPL3 stack for this CPU
+            let cpl3_stack = match self.syscall_interface.get_cpl3_stack(cpu_index) {
+                Ok(stack) => stack,
+                Err(e) => {
+                    log::error!("AP (CPU {}) failed to get CPL3 stack: {:?}", cpu_id, e);
+                    return ApResponse::Error(efi::Status::DEVICE_ERROR.as_usize() as u32);
+                }
+            };
+
+            let user_entry = match USER_ENTRY_POINT.get() {
+                Some(&entry) if entry != 0 => entry,
+                _ => {
+                    log::error!("User entry point not configured, cannot demote AP (CPU {})", cpu_id);
+                    return ApResponse::Error(efi::Status::DEVICE_ERROR.as_usize() as u32);
+                }
+            };
+
+            // Demote to user mode and call the procedure
+            // The procedure signature is: void (EFIAPI *)(void *ProcedureArgument)
+            log::info!(
+                "AP (CPU {}) demoting to user: proc=0x{:x}, stack=0x{:x}, arg=0x{:x}",
+                cpu_id, procedure, cpl3_stack, argument
+            );
+
+            let _ret = unsafe {
+                invoke_demoted_routine(
+                    cpu_index,
+                    user_entry,
+                    cpl3_stack,
+                    3,
+                    UserCommandType::UserApProcedure as u64,
+                    procedure,
+                    argument,
+                )
+            };
+
+            log::info!("AP (CPU {}) returned from demoted procedure: 0x{:x}", cpu_id, _ret);
+            ApResponse::Success
+        } else {
+            // Supervisor-owned: call directly in Ring 0
+            log::info!("AP (CPU {}) calling supervisor procedure directly at 0x{:x}", cpu_id, procedure);
+
+            // SAFETY: The BSP validated the procedure pointer before dispatching.
+            // The procedure follows the EFI AP_PROCEDURE calling convention.
+            type EfiApProcedure = unsafe extern "efiapi" fn(*mut core::ffi::c_void);
+            let proc_fn: EfiApProcedure = unsafe { core::mem::transmute(procedure) };
+            unsafe { proc_fn(argument as *mut core::ffi::c_void) };
+
+            ApResponse::Success
+        }
+    }
+
+    /// Type-erased trampoline for AP startup, called from the syscall dispatcher.
+    ///
+    /// This function is monomorphized for the concrete `P: PlatformInfo` type
+    /// and stored as a `fn(u64, u64, u64) -> u64` in [`AP_STARTUP_FN`].
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu_index` - The EFI processor index (slot index) of the target AP
+    /// * `procedure` - The procedure function pointer to execute on the AP
+    /// * `argument` - The argument to pass to the procedure
+    ///
+    /// # Returns
+    ///
+    /// 0 on success, or an EFI status code (as u64) on failure.
+    fn start_ap_procedure_trampoline(cpu_index: u64, procedure: u64, argument: u64) -> u64 {
+        let core = Self::instance();
+        core.start_ap_procedure(cpu_index, procedure, argument)
+    }
+
+    /// Validate and dispatch a procedure to a specific AP.
+    ///
+    /// Performs validation checks similar to the C `InternalSmmStartupThisAp`:
+    /// 1. CPU index is within range of registered CPUs
+    /// 2. CPU at that index is present (registered)
+    /// 3. CPU is not the BSP
+    /// 4. Procedure pointer is non-null
+    /// 5. Sends the command via the mailbox (fails if AP is busy)
+    /// 6. Waits for the AP to complete (blocking)
+    fn start_ap_procedure(&self, cpu_index: u64, procedure: u64, argument: u64) -> u64 {
+        let cpu_index = cpu_index as usize;
+
+        // 1. Validate CPU index is within registered count
+        let registered = self.cpu_manager.registered_count();
+        if cpu_index >= registered {
+            log::error!(
+                "START_AP: CpuIndex({}) >= registered_count({})",
+                cpu_index, registered
+            );
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        // 2. Look up the APIC ID for this index
+        let cpu_id = match self.cpu_manager.get_cpu_id_by_index(cpu_index) {
+            Some(id) => id,
+            None => {
+                log::error!("START_AP: CpuIndex({}) has no registered CPU", cpu_index);
+                return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+            }
+        };
+
+        // 3. Check that the target is not the BSP
+        if self.cpu_manager.is_bsp(cpu_id) {
+            log::error!("START_AP: CpuIndex({}) is the BSP, cannot start as AP", cpu_index);
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        // 4. Validate procedure pointer is non-null
+        if procedure == 0 {
+            log::error!("START_AP: Null procedure pointer");
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        // 5. Send the RunProcedure command to the AP via mailbox
+        //    This will fail if the AP's mailbox is not empty (AP is busy).
+        let command = ApCommand::RunProcedure { procedure, argument };
+        if let Err(()) = self.mailbox_manager.send_command(cpu_id, command) {
+            log::error!(
+                "START_AP: AP (CPU {}, index {}) is busy or mailbox unavailable",
+                cpu_id, cpu_index
+            );
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        log::trace!(
+            "START_AP: Dispatched proc=0x{:x} arg=0x{:x} to CPU {} (index {})",
+            procedure, argument, cpu_id, cpu_index
+        );
+
+        // 6. Wait for the AP to complete (blocking mode)
+        //    Use a generous timeout (10 seconds = 10_000_000 microseconds)
+        const AP_TIMEOUT_US: u64 = 10_000_000;
+        match self.mailbox_manager.wait_response(cpu_id, AP_TIMEOUT_US) {
+            Some(ApResponse::Success) => {
+                log::trace!("START_AP: AP (CPU {}) completed successfully", cpu_id);
+                efi::Status::SUCCESS.as_usize() as u64
+            }
+            Some(ApResponse::Error(code)) => {
+                log::error!("START_AP: AP (CPU {}) returned error: 0x{:x}", cpu_id, code);
+                code as u64
+            }
+            Some(ApResponse::Busy) => {
+                log::error!("START_AP: AP (CPU {}) reported busy", cpu_id);
+                efi::Status::NOT_READY.as_usize() as u64
+            }
+            Some(ApResponse::None) | None => {
+                log::error!("START_AP: AP (CPU {}) timed out or no response", cpu_id);
+                efi::Status::TIMEOUT.as_usize() as u64
             }
         }
     }
