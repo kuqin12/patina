@@ -1719,7 +1719,7 @@ where
     /// `ProcedureWrapper` logic: inspects the procedure pointer ownership and either
     /// calls it directly (supervisor-owned) or demotes to Ring 3 (user-owned).
     fn run_procedure_on_ap(&self, cpu_id: u32, procedure: u64, argument: u64) -> ApResponse {
-        log::info!(
+        log::trace!(
             "AP (CPU {}) running procedure 0x{:x} with arg 0x{:x}",
             cpu_id, procedure, argument
         );
@@ -1767,7 +1767,7 @@ where
 
             // Demote to user mode and call the procedure
             // The procedure signature is: void (EFIAPI *)(void *ProcedureArgument)
-            log::info!(
+            log::trace!(
                 "AP (CPU {}) demoting to user: proc=0x{:x}, stack=0x{:x}, arg=0x{:x}",
                 cpu_id, procedure, cpl3_stack, argument
             );
@@ -1784,11 +1784,11 @@ where
                 )
             };
 
-            log::info!("AP (CPU {}) returned from demoted procedure: 0x{:x}", cpu_id, _ret);
+            log::trace!("AP (CPU {}) returned from demoted procedure: 0x{:x}", cpu_id, _ret);
             ApResponse::Success
         } else {
             // Supervisor-owned: call directly in Ring 0
-            log::info!("AP (CPU {}) calling supervisor procedure directly at 0x{:x}", cpu_id, procedure);
+            log::trace!("AP (CPU {}) calling supervisor procedure directly at 0x{:x}", cpu_id, procedure);
 
             // SAFETY: The BSP validated the procedure pointer before dispatching.
             // The procedure follows the EFI AP_PROCEDURE calling convention.
