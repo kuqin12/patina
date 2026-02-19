@@ -344,6 +344,63 @@ const IA32_APIC_BASE_MSR_INDEX: u32 = 0x1B;
 /// BSP flag bit in IA32_APIC_BASE MSR (bit 8).
 const IA32_APIC_BSP: u64 = 1 << 8;
 
+/// MSR index for SMM Base Address (SMBASE).
+pub const IA32_MSR_SMBASE: u32 = 0x9E;
+
+/// Reads a Model-Specific Register (MSR) by index.
+///
+/// # Safety
+///
+/// The caller must ensure the MSR index is valid and readable on the current platform.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn read_msr(msr: u32) -> Result<u64, &'static str> {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack),
+        );
+    }
+    Ok(((hi as u64) << 32) | (lo as u64))
+}
+
+/// Reads a Model-Specific Register (stub for non-x86_64).
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn read_msr(_msr: u32) -> Result<u64, &'static str> {
+    Err("rdmsr not supported on this architecture")
+}
+
+/// Writes a 64-bit value to a Model-Specific Register (MSR).
+///
+/// # Safety
+///
+/// The caller must ensure the MSR index is valid and writable on the current platform.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn write_msr(msr: u32, value: u64) -> Result<(), &'static str> {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack),
+        );
+    }
+    Ok(())
+}
+
+/// Writes a Model-Specific Register (stub for non-x86_64).
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn write_msr(_msr: u32, _value: u64) -> Result<(), &'static str> {
+    Err("wrmsr not supported on this architecture")
+}
+
 /// Checks if the current processor is the Bootstrap Processor (BSP).
 ///
 /// This reads the IA32_APIC_BASE MSR and checks the BSP flag (bit 8).

@@ -190,6 +190,10 @@ pub struct MmSupvPassDownHobData {
     pub mm_supv_memory_policy_buffer: u64,
     /// Size of MM Supervisor memory policy buffer
     pub mm_supv_memory_policy_buffer_size: u64,
+    /// Size of the MMI entry point structure (for validating against expected size in supervisor)
+    pub mmi_entrypoint_size: u64,
+    /// Base address of the BSP MM
+    pub bsp_mm_base_address: u64,
 }
 
 /// Errors that can occur during policy initialization.
@@ -633,6 +637,79 @@ fn read_cr3() -> u64 {
     _value
 }
 
+use x86_64::structures::DescriptorTablePointer;
+
+// ============================================================================
+// SMI Handler Fixup Constants
+// ============================================================================
+
+/// Offset from SMBASE where the SMI handler code is located.
+const SMM_HANDLER_OFFSET: u64 = 0x8000;
+
+/// Index into the Fixup64 array for the SMI handler IDTR pointer.
+const FIXUP64_SMI_HANDLER_IDTR: usize = 5;
+
+/// Per-core MMI entry structure header.
+///
+/// This packed structure is embedded at the end of the SMI handler binary template.
+/// It contains offsets (relative to the header start) to fixup arrays that the
+/// relocation code uses to patch per-CPU values into the binary.
+///
+/// Layout matches the C `PER_CORE_MMI_ENTRY_STRUCT_HDR` from SeaResponder.h.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct PerCoreMmiEntryStructHdr {
+    /// Header version (4 for version 4).
+    header_version: u32,
+    /// Offset from header start to FixUpStruct array.
+    fixup_struct_offset: u8,
+    /// Number of FixUpStruct array entries.
+    fixup_struct_num: u8,
+    /// Offset from header start to Fixup64 array.
+    fixup64_offset: u8,
+    /// Number of Fixup64 array entries.
+    fixup64_num: u8,
+    /// Offset from header start to Fixup32 array.
+    fixup32_offset: u8,
+    /// Number of Fixup32 array entries.
+    fixup32_num: u8,
+    /// Offset from header start to Fixup8 array.
+    fixup8_offset: u8,
+    /// Number of Fixup8 array entries.
+    fixup8_num: u8,
+    /// SMI entry binary version.
+    binary_version: u16,
+    /// SPL value for SMI entry binary.
+    spl_value: u32,
+    /// Reserved for future use.
+    reserved: u32,
+}
+
+/// Read the current IDT Register (IDTR) via the `SIDT` instruction.
+///
+/// Returns a [`DescriptorTablePointer`] containing the IDT base and limit.
+fn read_idtr() -> DescriptorTablePointer {
+    let mut descriptor = DescriptorTablePointer {
+        limit: 0,
+        base: x86_64::VirtAddr::zero(),
+    };
+
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    {
+        // SAFETY: SIDT stores the 10-byte IDTR pseudo-descriptor to the specified
+        // memory location. This is a read-only operation on CPU state.
+        unsafe {
+            asm!(
+                "sidt [{}]",
+                in(reg) &mut descriptor as *mut DescriptorTablePointer,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    descriptor
+}
+
 // ============================================================================
 // Per-Core Initialization Status Helpers
 // ============================================================================
@@ -933,6 +1010,90 @@ where
         log::trace!("BSP one-time initialization complete.");
     }
 
+    /// Patches the SMI handler's IDT descriptor to point to Rust interrupt handlers.
+    ///
+    /// Navigates the per-core MMI entry fixup structure embedded at the end of the
+    /// SMI handler binary to locate the `gSmiHandlerIdtr` pointer, then overwrites
+    /// it with the current IDT descriptor (base + limit).
+    ///
+    /// # Arguments
+    ///
+    /// * `mmi_entry_size` - Size of the MMI entry binary from the PassDown HOB.
+    fn patch_smi_handler_idt(mmbase: u64, mmi_entry_size: u64) {
+        if mmi_entry_size == 0 {
+            log::warn!("MMI entry size is 0 in PassDown HOB, cannot navigate fixup structure");
+            return;
+        }
+
+        // SAFETY: Reading SMBASE MSR is safe during BSP init in SMM context.
+        let mut smbase = unsafe { cpu::read_msr(cpu::IA32_MSR_SMBASE) }.unwrap_or_else(|err| {
+            panic!("Failed to read IA32_MSR_SMBASE: {:?}", err);
+        });
+
+        if smbase == 0 {
+            smbase = mmbase;
+        }
+
+        let mmi_entry_base = smbase + SMM_HANDLER_OFFSET;
+        log::info!("MMI entry at 0x{:016x} with size 0x{:x}", mmi_entry_base, mmi_entry_size);
+
+        // The last u32 in the MMI entry binary is the total fixup structure size.
+        let whole_struct_size_addr = mmi_entry_base + mmi_entry_size - 4;
+        // SAFETY: whole_struct_size_addr points into the SMI handler template in SMRAM.
+        let whole_struct_size = unsafe {
+            core::ptr::read_unaligned(whole_struct_size_addr as *const u32)
+        };
+
+        // The structure header starts before the trailing size field.
+        let hdr_addr = (mmi_entry_base + mmi_entry_size - 4 - whole_struct_size as u64)
+            as *const PerCoreMmiEntryStructHdr;
+        // SAFETY: hdr_addr points to the packed fixup header within the SMI handler binary.
+        let hdr = unsafe { core::ptr::read_unaligned(hdr_addr) };
+
+        let hdr_version = hdr.header_version;
+        let f64_offset = hdr.fixup64_offset;
+        let f64_num = hdr.fixup64_num;
+        log::trace!(
+            "Fixup header at 0x{:016x}: version={}, fixup64_offset={}, fixup64_num={}",
+            hdr_addr as u64, hdr_version, f64_offset, f64_num
+        );
+
+        // Validate the Fixup64 array has the IDTR entry.
+        if (FIXUP64_SMI_HANDLER_IDTR as u8) >= f64_num {
+            log::error!(
+                "Fixup64 array too small: need index {} but only {} entries",
+                FIXUP64_SMI_HANDLER_IDTR, f64_num
+            );
+            return;
+        }
+
+        // Navigate to the Fixup64 array and read the IDTR entry.
+        let fixup64_base = (hdr_addr as u64 + f64_offset as u64) as *const u64;
+        // SAFETY: fixup64_base + index is within the fixup array in the SMI handler binary.
+        let idt_desc_addr = unsafe {
+            core::ptr::read_unaligned(fixup64_base.add(FIXUP64_SMI_HANDLER_IDTR))
+        };
+
+        if idt_desc_addr == 0 {
+            log::warn!("Fixup64[{}] (SMI_HANDLER_IDTR) is null", FIXUP64_SMI_HANDLER_IDTR);
+            return;
+        }
+
+        // Overwrite the IA32_DESCRIPTOR with our Rust IDT's base/limit.
+        let idt_desc_ptr = idt_desc_addr as *mut DescriptorTablePointer;
+        let idtr = read_idtr();
+
+        // SAFETY: idt_desc_ptr points to an IA32_DESCRIPTOR allocated by the C relocation
+        // code via AllocateCodePages(1). Both DescriptorTablePointer (packed(2)) and
+        // IA32_DESCRIPTOR (packed(1)) have the same 10-byte {u16, u64} layout.
+        unsafe { core::ptr::write_unaligned(idt_desc_ptr, idtr) };
+
+        log::info!(
+            "Patched SMI handler IDT descriptor at 0x{:016x}: base=0x{:016x}, limit=0x{:04x}",
+            idt_desc_addr, idtr.base.as_u64(), idtr.limit
+        );
+    }
+
     /// Per-core initialization.
     ///
     /// This is called on every core (BSP and APs) during the first entry.
@@ -1144,6 +1305,17 @@ where
                     let supv_to_user_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_to_user_buffer_size).read() };
                     let cpl3_stack_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_stack_base).read() };
                     let cpl3_stack_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_per_core_stack_size).read() };
+                    let mmi_entry_size = unsafe { core::ptr::addr_of!(pass_down.mmi_entrypoint_size).read() };
+                    let mmbase = unsafe { core::ptr::addr_of!(pass_down.bsp_mm_base_address).read() };
+
+                    // Patch the SMI entry IDT descriptor to point to our interrupt handlers.
+                    // The C relocation code patches each CPU's SMI handler template with fixup
+                    // arrays. The Fixup64 array at index FIXUP64_SMI_HANDLER_IDTR contains the
+                    // address of an IA32_DESCRIPTOR (gSmiHandlerIdtr). On SMI entry, the assembly
+                    // loads that address and does `lidt [rax]`. We navigate the fixup structure
+                    // in the BSP's SMI handler to find this pointer, then overwrite the descriptor
+                    // with our Rust IDT's base/limit.
+                    Self::patch_smi_handler_idt(mmbase, mmi_entry_size);
 
                     // Extract CPU private data pointer
                     let cpu_private = unsafe { core::ptr::addr_of!(pass_down.mm_supv_cpu_private).read() };

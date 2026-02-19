@@ -61,47 +61,6 @@ fn efi_io_width_to_io_width(width: u64) -> Option<IoWidth> {
 // Hardware Operation Helpers
 // ============================================================================
 
-/// Reads a 64-bit MSR value.
-///
-/// # Safety
-///
-/// The caller must ensure the MSR index is valid and access is allowed by policy.
-#[inline]
-unsafe fn read_msr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack),
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-/// Writes a 64-bit value to an MSR.
-///
-/// # Safety
-///
-/// The caller must ensure the MSR index is valid and access is allowed by policy.
-#[inline]
-unsafe fn write_msr(msr: u32, value: u64) {
-    let lo = value as u32;
-    let hi = (value >> 32) as u32;
-    unsafe {
-        asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") lo,
-            in("edx") hi,
-            options(nomem, nostack),
-        );
-    }
-}
-
 /// Reads an 8-bit value from an I/O port.
 ///
 /// # Safety
@@ -464,7 +423,10 @@ impl SyscallDispatcher {
         }
 
         // Policy allows - execute the MSR read
-        let value = unsafe { read_msr(msr_index) };
+        let value = unsafe { crate::cpu::read_msr(msr_index) }.unwrap_or_else(|e| {
+            log::error!("RDMSR: rdmsr failed: {}", e);
+            0
+        });
         log::debug!("RDMSR: MSR 0x{:x} = 0x{:x}", msr_index, value);
         SyscallResult::success(value)
     }
@@ -494,7 +456,10 @@ impl SyscallDispatcher {
         }
 
         // Policy allows - execute the MSR write
-        unsafe { write_msr(msr_index, value) };
+        if let Err(e) = unsafe { crate::cpu::write_msr(msr_index, value) } {
+            log::error!("WRMSR: wrmsr failed: {}", e);
+            return SyscallResult::error(SyscallResult::EFI_UNSUPPORTED);
+        }
         log::debug!("WRMSR: MSR 0x{:x} written with 0x{:x}", msr_index, value);
         SyscallResult::success(0)
     }
