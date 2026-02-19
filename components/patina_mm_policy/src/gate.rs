@@ -4,6 +4,8 @@
 //! and provides methods to check if various operations are allowed.
 
 use crate::types::*;
+use crate::helpers::{walk_page_table, IsInsideMmramFn};
+use spin::Once;
 
 // ============================================================================
 // Error Types
@@ -58,8 +60,17 @@ pub enum PolicyError {
 /// }
 /// ```
 pub struct PolicyGate {
-    /// Pointer to the policy data.
+    /// Pointer to the firmware policy data (static, read-only).
     policy_ptr: *const u8,
+    /// Memory policy buffer (written by `walk_page_table` during snapshot).
+    memory_policy_buffer: *mut MemDescriptorV1_0,
+    /// Maximum number of `MemDescriptorV1_0` entries the memory policy buffer can hold.
+    memory_policy_max_count: usize,
+    /// Number of descriptors stored in the snapshot buffer.
+    ///
+    /// `None` means the ready-to-lock transition has **not** occurred.
+    /// `Some(count)` means a snapshot was taken with `count` entries.
+    snapshot_count: Once<usize>,
 }
 
 // SAFETY: PolicyGate only holds a pointer to read-only policy data.
@@ -87,7 +98,37 @@ impl PolicyGate {
             return Err(PolicyError::InvalidVersion);
         }
 
-        Ok(Self { policy_ptr })
+        Ok(Self {
+            policy_ptr,
+            memory_policy_buffer: core::ptr::null_mut(),
+            memory_policy_max_count: 0,
+            snapshot_count: Once::new(),
+        })
+    }
+
+    /// Sets the memory policy buffer for page-table-derived snapshots.
+    ///
+    /// Must be called before [`take_snapshot`](Self::take_snapshot). Typically
+    /// the buffer address and size come from the PassDown HOB.
+    ///
+    /// # Safety
+    ///
+    /// # Safety Contract (deferred)
+    ///
+    /// The caller must ensure that `buffer` points to a valid memory region
+    /// that can hold at least `max_count` `MemDescriptorV1_0` entries and that
+    /// this memory remains valid for the lifetime of the `PolicyGate`.
+    ///
+    /// Storing the pointer is safe; the contract is enforced when the buffer
+    /// is later dereferenced by [`take_snapshot`], [`verify_snapshot`], or
+    /// [`fetch_n_update_policy`].
+    pub fn set_memory_policy_buffer(
+        &mut self,
+        buffer: *mut MemDescriptorV1_0,
+        max_count: usize,
+    ) {
+        self.memory_policy_buffer = buffer;
+        self.memory_policy_max_count = max_count;
     }
 
     /// Gets a reference to the policy header.
@@ -379,6 +420,252 @@ impl PolicyGate {
     /// Gets the raw policy pointer.
     pub fn as_ptr(&self) -> *const u8 {
         self.policy_ptr
+    }
+
+    // ====================================================================
+    // Memory Policy Snapshot
+    // ====================================================================
+
+    /// Returns `true` if the ready-to-lock snapshot has been taken.
+    pub fn is_locked(&self) -> bool {
+        self.snapshot_count.get().is_some()
+    }
+
+    /// Returns the snapshot descriptor count, or `None` if not yet locked.
+    pub fn snapshot_count(&self) -> Option<usize> {
+        self.snapshot_count.get().copied()
+    }
+
+    /// Returns the firmware policy blob size (from `SecurePolicyDataV1_0::size`).
+    ///
+    /// Returns `0` if the policy pointer is null (should not happen after construction).
+    pub fn firmware_policy_size(&self) -> usize {
+        self.policy().size as usize
+    }
+
+    /// Returns the raw memory policy buffer pointer.
+    ///
+    /// After [`take_snapshot`](Self::take_snapshot) this buffer contains the
+    /// snapshot descriptors.
+    pub fn memory_policy_buffer(&self) -> *const MemDescriptorV1_0 {
+        self.memory_policy_buffer as *const MemDescriptorV1_0
+    }
+
+    /// Returns the memory policy buffer capacity in descriptor count.
+    pub fn memory_policy_max_count(&self) -> usize {
+        self.memory_policy_max_count
+    }
+
+    /// Takes a page-table memory policy snapshot and transitions to the locked
+    /// state.
+    ///
+    /// Walks the active page table, writes the resulting descriptors into the
+    /// memory policy buffer, and atomically saves the descriptor count. After
+    /// this call, [`is_locked`](Self::is_locked) returns `true`.
+    ///
+    /// If the gate is already locked, the snapshot is **not** re-taken and the
+    /// existing descriptor count is returned.
+    ///
+    /// # Safety
+    ///
+    /// * `cr3` must point to a valid, stable PML4 table.
+    /// * The memory policy buffer (set via [`set_memory_policy_buffer`])
+    ///   must still be valid and large enough.
+    pub unsafe fn take_snapshot(
+        &self,
+        cr3: u64,
+        is_inside_mmram: IsInsideMmramFn,
+    ) -> Result<usize, PolicyError> {
+        // Idempotent: if already locked, return the saved count.
+        if let Some(&count) = self.snapshot_count.get() {
+            return Ok(count);
+        }
+
+        if self.memory_policy_buffer.is_null() || self.memory_policy_max_count == 0 {
+            log::error!("take_snapshot: memory policy buffer not configured");
+            return Err(PolicyError::InternalError);
+        }
+
+        // SAFETY: The caller guarantees that `cr3` points to a valid PML4 and
+        // that the memory policy buffer (set via `set_memory_policy_buffer`) is
+        // valid and can hold `memory_policy_max_count` descriptors.
+        let count = unsafe {
+            walk_page_table(cr3, self.memory_policy_buffer, self.memory_policy_max_count, is_inside_mmram)
+        }.map_err(|e| {
+            log::error!("take_snapshot: walk_page_table failed: {:?}", e);
+            PolicyError::InternalError
+        })?;
+
+        self.snapshot_count.call_once(|| count);
+        log::info!("Policy snapshot taken: {} descriptors, ready-to-lock is now TRUE", count);
+        Ok(count)
+    }
+
+    /// Verifies that the current page table still matches the saved snapshot.
+    ///
+    /// The caller must provide a scratch buffer (typically allocated from the
+    /// page allocator) large enough to hold the walk results. This avoids
+    /// overwriting the saved snapshot during comparison.
+    ///
+    /// Returns `Ok(())` if the tables match, or `Err(PolicyError::AccessDenied)`
+    /// if they differ ("security violation").
+    ///
+    /// # Safety
+    ///
+    /// * `cr3` must point to a valid, stable PML4 table.
+    /// * `scratch` must point to a buffer of at least `scratch_max_count`
+    ///   `MemDescriptorV1_0` entries.
+    pub unsafe fn verify_snapshot(
+        &self,
+        cr3: u64,
+        is_inside_mmram: IsInsideMmramFn,
+        scratch: *mut MemDescriptorV1_0,
+        scratch_max_count: usize,
+    ) -> Result<(), PolicyError> {
+        let saved_count = match self.snapshot_count.get() {
+            Some(&c) => c,
+            None => {
+                log::warn!("verify_snapshot: no snapshot available, skipping verification");
+                return Ok(());
+            }
+        };
+
+        // SAFETY: The caller guarantees that `cr3` points to a valid PML4 and
+        // that `scratch` can hold `scratch_max_count` descriptors. The saved
+        // snapshot buffer (`self.memory_policy_buffer`) was populated by a
+        // prior `take_snapshot` call with `saved_count` entries.
+        unsafe {
+            let fresh_count = walk_page_table(cr3, scratch, scratch_max_count, is_inside_mmram)
+                .map_err(|e| {
+                    log::error!("verify_snapshot: walk_page_table failed: {:?}", e);
+                    PolicyError::InternalError
+                })?;
+
+            if fresh_count != saved_count {
+                log::error!(
+                    "verify_snapshot: descriptor count mismatch (saved={}, fresh={})",
+                    saved_count, fresh_count,
+                );
+                return Err(PolicyError::AccessDenied);
+            }
+
+            let snapshot_ptr = self.memory_policy_buffer as *const MemDescriptorV1_0;
+            for i in 0..saved_count {
+                let saved = core::ptr::read(snapshot_ptr.add(i));
+                let fresh = core::ptr::read(scratch.add(i));
+                if saved != fresh {
+                    log::error!(
+                        "verify_snapshot: descriptor {} mismatch - \
+                         saved=(base=0x{:x}, size=0x{:x}, attrs=0x{:x}) vs \
+                         fresh=(base=0x{:x}, size=0x{:x}, attrs=0x{:x})",
+                        i,
+                        saved.base_address, saved.size, saved.mem_attributes,
+                        fresh.base_address, fresh.size, fresh.mem_attributes,
+                    );
+                    return Err(PolicyError::AccessDenied);
+                }
+            }
+        }
+
+        log::info!(
+            "verify_snapshot: page table matches saved snapshot ({} descriptors)",
+            saved_count,
+        );
+        Ok(())
+    }
+
+    /// Writes the merged memory + firmware policy into `dest`.
+    ///
+    /// Mirrors the C `FetchNUpdateSecurityPolicy` function. The caller is
+    /// responsible for ensuring the snapshot has been taken first (via
+    /// [`take_snapshot`](Self::take_snapshot)).
+    ///
+    /// ## Layout written to `dest`
+    ///
+    /// ```text
+    /// |----------------------------------|
+    /// | MemDescriptorV1_0[0..N]          |  ← memory policy snapshot
+    /// |----------------------------------|
+    /// | SecurePolicyDataV1_0 + payload   |  ← firmware policy blob
+    /// |----------------------------------|
+    /// ```
+    ///
+    /// Note: the caller is responsible for writing/reserving any request header
+    /// *before* the region pointed to by `dest`.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest` - Destination buffer for the merged policy.
+    /// * `dest_size` - Available bytes at `dest`.
+    ///
+    /// # Returns
+    ///
+    /// The total number of bytes written to `dest`.
+    ///
+    /// # Safety
+    ///
+    /// * `dest` must point to a writable buffer of at least `dest_size` bytes.
+    pub unsafe fn fetch_n_update_policy(
+        &self,
+        dest: *mut u8,
+        dest_size: usize,
+    ) -> Result<usize, PolicyError> {
+        let count = self.snapshot_count.get().copied().ok_or_else(|| {
+            log::error!("fetch_n_update_policy: no snapshot taken");
+            PolicyError::InternalError
+        })?;
+
+        let desc_size = core::mem::size_of::<MemDescriptorV1_0>();
+        let mem_policy_bytes = count.checked_mul(desc_size).ok_or_else(|| {
+            log::error!("fetch_n_update_policy: descriptor count overflow");
+            PolicyError::InternalError
+        })?;
+
+        let fw_size = self.firmware_policy_size();
+        if fw_size == 0 {
+            log::error!("fetch_n_update_policy: firmware policy size is 0");
+            return Err(PolicyError::InternalError);
+        }
+
+        let total_bytes = mem_policy_bytes.checked_add(fw_size).ok_or_else(|| {
+            log::error!("fetch_n_update_policy: total size overflow");
+            PolicyError::InternalError
+        })?;
+
+        if dest_size < total_bytes {
+            log::error!(
+                "fetch_n_update_policy: buffer too small ({} bytes, need {})",
+                dest_size,
+                total_bytes,
+            );
+            return Err(PolicyError::InternalError);
+        }
+
+        // SAFETY: The caller guarantees that `dest` is writable for at least
+        // `dest_size` bytes (verified >= `total_bytes` above). The memory
+        // policy buffer holds `count` valid descriptors from a prior snapshot,
+        // and `self.policy_ptr` points to a valid firmware policy blob of
+        // `fw_size` bytes (validated at construction).
+        unsafe {
+            // Copy memory policy descriptors.
+            if mem_policy_bytes > 0 {
+                let src = self.memory_policy_buffer as *const u8;
+                core::ptr::copy_nonoverlapping(src, dest, mem_policy_bytes);
+            }
+
+            // Copy firmware policy blob.
+            let fw_dest = dest.add(mem_policy_bytes);
+            core::ptr::copy_nonoverlapping(self.policy_ptr, fw_dest, fw_size);
+        }
+
+        log::info!(
+            "fetch_n_update_policy: wrote {} bytes (mem_policy={} ({} descs), fw_policy={})",
+            total_bytes,
+            mem_policy_bytes,
+            count,
+            fw_size,
+        );
+        Ok(total_bytes)
     }
 }
 
