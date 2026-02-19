@@ -42,11 +42,11 @@ pub const MM_SUPERVISOR_REQUEST_HANDLER_GUID: Guid = Guid::from_fields(
 ///
 /// ```text
 /// Offset  Size  Field
-/// 0x00    4     signature   — Must be [`SIGNATURE`] ('MSUP' as little-endian u32)
-/// 0x04    4     revision    — Protocol revision, must be <= [`REVISION`]
-/// 0x08    4     request     — Request type (see [`requests`] module)
-/// 0x0C    4     reserved    — Reserved for alignment, must be 0
-/// 0x10    8     result      — Return status (0 = success, set by supervisor on response)
+/// 0x00    4     signature   - Must be [`SIGNATURE`] ('MSUP' as little-endian u32)
+/// 0x04    4     revision    - Protocol revision, must be <= [`REVISION`]
+/// 0x08    4     request     - Request type (see [`requests`] module)
+/// 0x0C    4     reserved    - Reserved for alignment, must be 0
+/// 0x10    8     result      - Return status (0 = success, set by supervisor on response)
 /// ```
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -92,9 +92,9 @@ impl MmSupervisorRequestHeader {
 ///
 /// ```text
 /// Offset  Size  Field
-/// 0x00    4     version                       — Supervisor version
-/// 0x04    4     patch_level                   — Supervisor patch level
-/// 0x08    8     max_supervisor_request_level  — Highest supported request type
+/// 0x00    4     version                       - Supervisor version
+/// 0x04    4     patch_level                   - Supervisor patch level
+/// 0x08    8     max_supervisor_request_level  - Highest supported request type
 /// ```
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -169,8 +169,8 @@ use r_efi::efi;
 ///
 /// ```text
 /// Offset  Size  Field
-/// 0x00    40    memory_descriptor   — EFI_MEMORY_DESCRIPTOR (r-efi efi::MemoryDescriptor)
-/// 0x28    16    identifier_guid     — Requester identification GUID
+/// 0x00    40    memory_descriptor   - EFI_MEMORY_DESCRIPTOR (r-efi efi::MemoryDescriptor)
+/// 0x28    16    identifier_guid     - Requester identification GUID
 /// ```
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]

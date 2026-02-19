@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// Commands that can be sent from BSP to APs via the mailbox.
 ///
 /// APs sit in a holding pen polling for commands. When no command is pending
-/// the AP simply keeps spinning — there is no explicit "no-op" variant.
+/// the AP simply keeps spinning - there is no explicit "no-op" variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApCommand {
     /// Run a procedure on the AP, with potential demotion to user mode.
