@@ -49,14 +49,20 @@ use patina_paging::{MemoryAttributes, PageTable, PtError};
 use crate::mm_mem::PAGE_ALLOCATOR;
 use crate::request_handler::{
     MmSupervisorRequestHeader, MmSupervisorVersionInfo,
-    requests, responses, SIGNATURE, REVISION,
+    requests, SIGNATURE, REVISION,
 };
 use crate::unblock_memory::{UnblockError, UNBLOCKED_MEMORY_TRACKER};
+use crate::{
+    POLICY_GATE,
+    is_buffer_inside_mmram, read_cr3,
+};
 
 use patina_mm::protocol::mm_supervisor_request::{
     MM_SUPERVISOR_REQUEST_HANDLER_GUID,
     MmSupervisorUnblockMemoryParams,
 };
+
+use patina_mm_policy::{MemDescriptorV1_0, PolicyError};
 
 // ============================================================================
 // Supervisor MMI Handler Infrastructure
@@ -165,15 +171,36 @@ static SUPV_REQUEST_HANDLER: SupervisorMmiHandler = SupervisorMmiHandler {
 /// MmReadyToLock handler implementation.
 ///
 /// Called when the DXE phase signals that MM should transition to a locked state.
-/// After this runs, no new memory regions can be unblocked and certain MMI handlers
-/// are unregistered.
+/// After this runs, no new memory regions can be unblocked and the memory policy
+/// snapshot stored inside `PolicyGate` is considered the reference baseline.
 fn mm_ready_to_lock_handler(_comm_buffer: *mut u8, _comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("MmReadyToLockHandler invoked");
 
-    // TODO: Implement the actual ready-to-lock logic, such as:
-    // - Take a memory policy snapshot
-    // - Mark the supervisor as locked (mMmReadyToLockDone = true)
-    // - Unregister any handlers that should not survive past ready-to-lock
+    let gate = match POLICY_GATE.get() {
+        Some(g) => g,
+        None => {
+            log::error!("MmReadyToLock: POLICY_GATE not initialized");
+            return efi::Status::NOT_READY;
+        }
+    };
+
+    // If already locked, this is a no-op (idempotent).
+    if gate.is_locked() {
+        log::warn!("MmReadyToLock: already locked, ignoring duplicate");
+        return efi::Status::SUCCESS;
+    }
+
+    // Take a snapshot and mark as locked.
+    let cr3 = read_cr3();
+    // SAFETY: cr3 points to the active PML4 table inside SMM,
+    // and the memory policy buffer was configured during init.
+    if let Err(e) = unsafe { gate.take_snapshot(cr3, is_buffer_inside_mmram) } {
+        log::error!("MmReadyToLock: take_snapshot failed: {:?}", e);
+        return efi::Status::DEVICE_ERROR;
+    }
+
+    // And mark the unblock memory tracker as locked as well since unblock memory is no longer allowed after this point.
+    UNBLOCKED_MEMORY_TRACKER.set_core_init_complete();
 
     efi::Status::SUCCESS
 }
@@ -264,26 +291,32 @@ fn mm_supv_request_handler(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -
         }
         unknown => {
             log::warn!("MmSupvRequestHandler: unsupported request type 0x{:08X}", unknown);
-            // Write error result into the header
-            write_request_result(comm_buffer, responses::ERROR);
             *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
-            return efi::Status::UNSUPPORTED;
+            efi::Status::UNSUPPORTED
         }
     };
 
-    status
+    // Write the final status into the request header's result field.
+    write_request_result(comm_buffer, status);
+
+    // The handler's return value is only for indicating communication-level errors
+    // (e.g., interrupt is being handled or not), in this case we handled the request successfully.
+    efi::Status::SUCCESS
 }
 
-/// Write a result value into the request header's `result` field.
+/// Write an [`efi::Status`] into the request header's `result` field.
+///
+/// The status is stored as its raw `usize` representation cast to `u64`,
+/// matching the C `MM_SUPERVISOR_REQUEST_HEADER.Result` convention.
 ///
 /// # Safety
 ///
 /// `comm_buffer` must point to at least `MmSupervisorRequestHeader::SIZE` bytes of writable memory.
-fn write_request_result(comm_buffer: *mut u8, result: u64) {
+fn write_request_result(comm_buffer: *mut u8, status: efi::Status) {
     // SAFETY: caller guarantees buffer is large enough for the header.
     unsafe {
         let header = &mut *(comm_buffer as *mut MmSupervisorRequestHeader);
-        header.result = result;
+        header.result = status.as_usize() as u64;
     }
 }
 
@@ -299,13 +332,9 @@ fn handle_version_info(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> ef
             *comm_buffer_size,
             response_size,
         );
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::BUFFER_TOO_SMALL;
     }
-
-    // Write success into the header
-    write_request_result(comm_buffer, responses::SUCCESS);
 
     // Write version info payload after the header
     let version_info = MmSupervisorVersionInfo {
@@ -333,16 +362,150 @@ fn handle_version_info(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> ef
 
 /// Handle a FETCH_POLICY request.
 ///
-/// Returns the current security policy to the caller.
+/// Returns the merged memory + firmware policy to the caller.
+///
+/// ## Behaviour
+///
+/// 1. **First-time call (before lock):** takes a memory policy snapshot, saves it,
+///    and sets the ready-to-lock flag (whichever of `MmReadyToLock` or `FETCH_POLICY`
+///    fires first performs this).
+/// 2. **Subsequent calls (after lock):** re-walks the page table and compares the
+///    fresh result against the saved snapshot. Any discrepancy is a security
+///    violation.
+/// 3. **Merges** the memory policy snapshot with the static firmware policy blob
+///    from `POLICY_GATE` and writes the combined result into `comm_buffer`.
+///
+/// ## Response layout
+///
+/// ```text
+/// |----------------------------------|
+/// | MmSupervisorRequestHeader (24 B) |
+/// |----------------------------------|
+/// | MemDescriptorV1_0[0..N]          |  ← memory policy snapshot
+/// |----------------------------------|
+/// | SecurePolicyDataV1_0 + payload   |  ← firmware policy blob (raw copy)
+/// |----------------------------------|
+/// ```
 fn handle_fetch_policy(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("FETCH_POLICY request");
 
-    // TODO: Return the actual memory protection policy from the policy engine.
-    // For now, write success and indicate empty policy.
-    write_request_result(comm_buffer, responses::SUCCESS);
-    *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+    // -- 0. Obtain the PolicyGate -------------------------------------
+    let gate = match POLICY_GATE.get() {
+        Some(g) => g,
+        None => {
+            log::error!("FETCH_POLICY: POLICY_GATE not initialized");
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::NOT_READY;
+        }
+    };
 
-    efi::Status::UNSUPPORTED
+    let cr3 = read_cr3();
+
+    // -- 1. Ensure we have a snapshot (lock if not yet locked) ------------
+    if !gate.is_locked() {
+        // Policy requested prior to ready to lock - enforce lock now.
+        log::info!("FETCH_POLICY: not yet locked - taking snapshot and locking now");
+        // SAFETY: cr3 is valid and the memory policy buffer was configured during init.
+        if let Err(e) = unsafe { gate.take_snapshot(cr3, is_buffer_inside_mmram) } {
+            log::error!("FETCH_POLICY: take_snapshot failed: {:?}", e);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::DEVICE_ERROR;
+        }
+    } else {
+        // -- 2. Already locked - verify that current page table matches snapshot
+        if let Err(status) = verify_policy_snapshot(gate, cr3) {
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return status;
+        }
+    }
+
+    // -- 3. Write the merged policy into the comm buffer (after the header) -
+    let payload_capacity = match comm_buffer_size
+        .checked_sub(MmSupervisorRequestHeader::SIZE)
+    {
+        Some(c) => c,
+        None => {
+            log::error!("FETCH_POLICY: comm_buffer_size too small for header");
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::BUFFER_TOO_SMALL;
+        }
+    };
+
+    // SAFETY: comm_buffer + header offset is valid writable memory.
+    let dest = unsafe { comm_buffer.add(MmSupervisorRequestHeader::SIZE) };
+    let payload_written = match unsafe { gate.fetch_n_update_policy(dest, payload_capacity) } {
+        Ok(n) => n,
+        Err(PolicyError::InternalError) => {
+            // Could be buffer-too-small, size overflow, or missing snapshot.
+            log::error!("FETCH_POLICY: fetch_n_update_policy failed");
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::BUFFER_TOO_SMALL;
+        }
+        Err(e) => {
+            log::error!("FETCH_POLICY: fetch_n_update_policy unexpected error: {:?}", e);
+            *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
+            return efi::Status::DEVICE_ERROR;
+        }
+    };
+
+    let total_response = MmSupervisorRequestHeader::SIZE + payload_written;
+    *comm_buffer_size = total_response;
+    log::info!("FETCH_POLICY: response {} bytes (header={}, payload={})", total_response, MmSupervisorRequestHeader::SIZE, payload_written);
+
+    efi::Status::SUCCESS
+}
+
+// ============================================================================
+// Policy Snapshot Helpers
+// ============================================================================
+
+/// Walks the page table and compares the result against the saved snapshot
+/// inside `PolicyGate`. Allocates a temporary scratch buffer from the page
+/// allocator for the fresh walk.
+///
+/// Returns `Ok(())` if the tables match, or an `efi::Status` error on mismatch
+/// or allocation failure.
+fn verify_policy_snapshot(
+    gate: &patina_mm_policy::PolicyGate,
+    cr3: u64,
+) -> Result<(), efi::Status> {
+    let saved_count = match gate.snapshot_count() {
+        Some(c) => c,
+        None => {
+            log::warn!("verify_policy_snapshot: no snapshot available, skipping");
+            return Ok(());
+        }
+    };
+
+    let desc_size = core::mem::size_of::<MemDescriptorV1_0>();
+    let needed_bytes = saved_count.checked_mul(desc_size).ok_or_else(|| {
+        log::error!("verify_policy_snapshot: descriptor count overflow");
+        efi::Status::DEVICE_ERROR
+    })?;
+    let needed_pages = (needed_bytes + 0xFFF) / 0x1000;
+
+    let scratch_base = PAGE_ALLOCATOR
+        .allocate_pages(needed_pages)
+        .map_err(|e| {
+            log::error!("verify_policy_snapshot: failed to allocate scratch buffer: {:?}", e);
+            efi::Status::OUT_OF_RESOURCES
+        })?;
+
+    let scratch_ptr = scratch_base as *mut MemDescriptorV1_0;
+    let scratch_max_count = (needed_pages * 0x1000) / desc_size;
+
+    // SAFETY: scratch_ptr was just allocated and scratch_max_count is correct.
+    let result = unsafe {
+        gate.verify_snapshot(cr3, is_buffer_inside_mmram, scratch_ptr, scratch_max_count)
+    };
+
+    // Free the scratch buffer regardless of the result.
+    let _ = PAGE_ALLOCATOR.free_pages(scratch_base, needed_pages);
+
+    result.map_err(|e| {
+        log::error!("verify_policy_snapshot: snapshot verification failed: {:?}", e);
+        efi::Status::SECURITY_VIOLATION
+    })
 }
 
 /// Handle a COMM_UPDATE request.
@@ -353,7 +516,6 @@ fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
 
     // TODO: Parse the new communication buffer descriptor from the payload,
     // validate it against SMRAM, and update the internal comm buffer config.
-    write_request_result(comm_buffer, responses::SUCCESS);
     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
 
     efi::Status::UNSUPPORTED
@@ -365,16 +527,16 @@ fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
 ///
 /// ## Validation (stricter than the C `ProcessUnblockPages` implementation)
 ///
-/// 1. **Ready-to-lock check** — reject if core init is complete (post-lock state).
-/// 2. **Buffer size** — must hold header + [`MmSupervisorUnblockMemoryParams`].
-/// 3. **Zero-GUID** — the identifier GUID must be non-zero.
-/// 4. **Page alignment** — `PhysicalStart` must be 4 KiB aligned.
-/// 5. **Non-zero page count** — `NumberOfPages` must be > 0.
-/// 6. **Overflow** — `NumberOfPages * PAGE_SIZE` and `PhysicalStart + size` must not overflow.
-/// 7. **MMRAM overlap** — region must not overlap supervisor RAM.
-/// 8. **Duplicate / conflict** — checked by the [`UNBLOCKED_MEMORY_TRACKER`].
-/// 9. **Page attributes** — pages must be not-present (RP set) and not read-only.
-/// 10. **Page table update** — make pages present, R/W, NX; optionally supervisor-only (SP).
+/// 1. **Ready-to-lock check** - reject if core init is complete (post-lock state).
+/// 2. **Buffer size** - must hold header + [`MmSupervisorUnblockMemoryParams`].
+/// 3. **Zero-GUID** - the identifier GUID must be non-zero.
+/// 4. **Page alignment** - `PhysicalStart` must be 4 KiB aligned.
+/// 5. **Non-zero page count** - `NumberOfPages` must be > 0.
+/// 6. **Overflow** - `NumberOfPages * PAGE_SIZE` and `PhysicalStart + size` must not overflow.
+/// 7. **MMRAM overlap** - region must not overlap supervisor RAM.
+/// 8. **Duplicate / conflict** - checked by the [`UNBLOCKED_MEMORY_TRACKER`].
+/// 9. **Page attributes** - pages must be not-present (RP set) and not read-only.
+/// 10. **Page table update** - make pages present, R/W, NX; optionally supervisor-only (SP).
 fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("UNBLOCK_MEM request");
 
@@ -384,8 +546,7 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     // After core initialization is complete, unblock requests are rejected.
     // This mirrors the C `mMmReadyToLockDone` guard.
     if UNBLOCKED_MEMORY_TRACKER.is_core_init_complete() {
-        log::error!("UNBLOCK_MEM: rejected — core initialization already complete (post ready-to-lock)");
-        write_request_result(comm_buffer, responses::ERROR);
+        log::error!("UNBLOCK_MEM: rejected - core initialization already complete (post ready-to-lock)");
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::ACCESS_DENIED;
     }
@@ -398,7 +559,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
             *comm_buffer_size,
             min_size,
         );
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::BUFFER_TOO_SMALL;
     }
@@ -415,7 +575,7 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     let identifier_guid = params.identifier_guid;
 
     log::info!(
-        "UNBLOCK_MEM: request from {:?} — PhysicalStart=0x{:016x}, Pages={}, Attr=0x{:x}",
+        "UNBLOCK_MEM: request from {:?} - PhysicalStart=0x{:016x}, Pages={}, Attr=0x{:x}",
         identifier_guid,
         physical_start,
         number_of_pages,
@@ -425,7 +585,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     // 4. Zero-GUID check
     if *identifier_guid.as_bytes() == [0u8; 16] {
         log::error!("UNBLOCK_MEM: identifier GUID is zero");
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::INVALID_PARAMETER;
     }
@@ -436,7 +595,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
             "UNBLOCK_MEM: PhysicalStart 0x{:016x} is not page-aligned",
             physical_start,
         );
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::INVALID_PARAMETER;
     }
@@ -444,7 +602,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     // 6. Non-zero page count
     if number_of_pages == 0 {
         log::error!("UNBLOCK_MEM: NumberOfPages is 0");
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::INVALID_PARAMETER;
     }
@@ -457,7 +614,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                 "UNBLOCK_MEM: NumberOfPages ({}) * PAGE_SIZE overflows u64",
                 number_of_pages,
             );
-            write_request_result(comm_buffer, responses::ERROR);
             *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
             return efi::Status::INVALID_PARAMETER;
         }
@@ -469,7 +625,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
             physical_start,
             region_size,
         );
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::INVALID_PARAMETER;
     }
@@ -481,7 +636,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
             physical_start,
             physical_start + region_size,
         );
-        write_request_result(comm_buffer, responses::ERROR);
         *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
         return efi::Status::SECURITY_VIOLATION;
     }
@@ -504,17 +658,16 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
         Ok(()) => {
             let count_after = UNBLOCKED_MEMORY_TRACKER.region_count();
             if count_after == count_before {
-                // Idempotent — already tracked with same attributes, nothing more to do.
+                // Idempotent - already tracked with same attributes, nothing more to do.
                 log::info!(
                     "UNBLOCK_MEM: region 0x{:016x}-0x{:016x} already unblocked (idempotent)",
                     physical_start,
                     physical_start + region_size,
                 );
-                write_request_result(comm_buffer, responses::SUCCESS);
                 *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
                 return efi::Status::SUCCESS;
             }
-            // Newly added — continue to verify page attributes and update page table.
+            // Newly added - continue to verify page attributes and update page table.
         }
         Err(UnblockError::ConflictingAttributes) => {
             log::error!(
@@ -522,7 +675,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                 physical_start,
                 physical_start + region_size,
             );
-            write_request_result(comm_buffer, responses::ERROR);
             *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
             return efi::Status::SECURITY_VIOLATION;
         }
@@ -533,7 +685,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                 physical_start + region_size,
                 e,
             );
-            write_request_result(comm_buffer, responses::ERROR);
             *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
             return efi::Status::INVALID_PARAMETER;
         }
@@ -554,12 +705,11 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                         physical_start,
                         current_attrs,
                     );
-                    write_request_result(comm_buffer, responses::ERROR);
                     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
                     return efi::Status::SECURITY_VIOLATION;
                 }
                 Err(PtError::NoMapping) => {
-                    // Expected case — pages are currently not present, so we can unblock them.
+                    // Expected case - pages are currently not present, so we can unblock them.
                 }
                 Err(e) => {
                     log::error!(
@@ -568,14 +718,12 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                         physical_start + region_size,
                         e,
                     );
-                    write_request_result(comm_buffer, responses::ERROR);
                     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
                     return efi::Status::DEVICE_ERROR;
                 }
             }
         } else {
             log::error!("UNBLOCK_MEM: page table not initialized");
-            write_request_result(comm_buffer, responses::ERROR);
             *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
             return efi::Status::NOT_READY;
         }
@@ -585,12 +733,12 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     // Make the region:
     //   - Present (clear ReadProtect)
     //   - Read/Write (clear ReadOnly)
-    //   - Non-executable (set ExecuteProtect) — data pages must be W^X
+    //   - Non-executable (set ExecuteProtect) - data pages must be W^X
     //   - Optionally Supervisor-only (set Special) if EFI_MEMORY_SP requested
     {
         let mut pt_guard = crate::PAGE_TABLE.lock();
         if let Some(ref mut pt) = *pt_guard {
-            let mut new_attrs = MemoryAttributes::ExecuteProtect; // NX — data pages are non-executable
+            let mut new_attrs = MemoryAttributes::ExecuteProtect; // NX - data pages are non-executable
             if is_supervisor_page {
                 new_attrs = new_attrs | MemoryAttributes::SpecialPurpose; // Supervisor-only (U/S=0)
             }
@@ -602,7 +750,6 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
                     physical_start + region_size,
                     e,
                 );
-                write_request_result(comm_buffer, responses::ERROR);
                 *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
                 return efi::Status::DEVICE_ERROR;
             }
@@ -611,14 +758,13 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     }
 
     log::info!(
-        "UNBLOCK_MEM: SUCCESS — unblocked 0x{:016x}-0x{:016x} ({} pages, {})",
+        "UNBLOCK_MEM: SUCCESS - unblocked 0x{:016x}-0x{:016x} ({} pages, {})",
         physical_start,
         physical_start + region_size,
         number_of_pages,
         if is_supervisor_page { "supervisor-only" } else { "user-accessible" },
     );
 
-    write_request_result(comm_buffer, responses::SUCCESS);
     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
     efi::Status::SUCCESS
 }
