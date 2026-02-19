@@ -30,7 +30,7 @@ use r_efi::efi::{AllocateType, ALLOCATE_ANY_PAGES, MemoryType, RUNTIME_SERVICES_
 use patina_mm_policy::{AccessType, IoWidth, Instruction};
 
 use super::{PrivilegeError, PrivilegeResult};
-use crate::{POLICY_GATE, UNBLOCKED_MEMORY_TRACKER};
+use crate::{COMM_BUFFER_CONFIG, POLICY_GATE, UNBLOCKED_MEMORY_TRACKER, PageOwnership, query_address_ownership};
 
 global_asm!(include_str!("syscall_entry.asm"));
 
@@ -880,8 +880,19 @@ impl SyscallDispatcher {
             return SyscallResult::success(0); // FALSE
         }
 
-        // TODO: Additional check - verify buffer is in user-owned space
-        // (InspectTargetRangeOwnership equivalent)
+        // Additional check - verify buffer is in user-owned space
+        match query_address_ownership(addr, size) {
+            Some(owner) => {
+                if owner != PageOwnership::User {
+                    log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x} size=0x{:x} owned by {:?} - not valid", addr, size, owner);
+                    return SyscallResult::success(0); // FALSE
+                }
+            }
+            None => {
+                log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x} size=0x{:x} not in mapped memory", addr, size);
+                return SyscallResult::success(0); // FALSE
+            }
+        }
 
         log::trace!("MM_MEMORY_UNBLOCKED: addr=0x{:x} size=0x{:x} is valid", addr, size);
         SyscallResult::success(1) // TRUE
@@ -894,12 +905,27 @@ impl SyscallDispatcher {
     /// - Arg2: Buffer size
     /// - Returns: 1 (TRUE) if valid comm buffer, 0 (FALSE) otherwise
     fn handle_mm_is_comm_buffer(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("MM_IS_COMM_BUFFER: addr=0x{:x}, size=0x{:x}", ctx.arg1, ctx.arg2);
+        let address = ctx.arg1;
+        let size = ctx.arg2;
+        log::trace!("MM_IS_COMM_BUFFER: addr=0x{:x}, size=0x{:x}", address, size);
 
-        // TODO: Implement VerifyRequestUserCommBuffer equivalent
-        // This should check if the buffer was passed down as a valid communication buffer
-        log::warn!("MM_IS_COMM_BUFFER: Not yet implemented");
-        SyscallResult::success(0) // FALSE - conservative default
+        let config = match COMM_BUFFER_CONFIG.get() {
+            Some(c) => c,
+            None => {
+                log::error!("MM_IS_COMM_BUFFER: Comm buffer config not initialized");
+                return SyscallResult::success(0); // FALSE
+            }
+        };
+
+        let buf_start = config.user_comm_buffer_internal;
+        let buf_end = buf_start.saturating_add(config.user_comm_buffer_size);
+        let range_end = address.saturating_add(size);
+
+        // Check that the range is non-empty and falls entirely within the user comm buffer.
+        let is_valid = size > 0 && address >= buf_start && range_end <= buf_end;
+
+        log::debug!("MM_IS_COMM_BUFFER: addr=0x{:x} size=0x{:x} => {}", address, size, is_valid);
+        SyscallResult::success(if is_valid { 1 } else { 0 })
     }
 }
 
