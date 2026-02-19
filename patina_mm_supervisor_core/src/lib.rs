@@ -369,7 +369,7 @@ pub struct CommBufferConfig {
 }
 
 /// Communication buffer configuration initialized from PassDown HOB.
-static COMM_BUFFER_CONFIG: Once<CommBufferConfig> = Once::new();
+pub(crate) static COMM_BUFFER_CONFIG: Once<CommBufferConfig> = Once::new();
 
 /// User module entry point discovered from HOB list.
 static USER_ENTRY_POINT: Once<u64> = Once::new();
@@ -616,13 +616,13 @@ where
 {
 }
 
-fn is_buffer_inside_mmram(base: u64, size: u64) -> bool {
+pub(crate) fn is_buffer_inside_mmram(base: u64, size: u64) -> bool {
     // we will go over the page allocator to see if this region falls inside any of the MMRAM regions
     mm_mem::PAGE_ALLOCATOR.is_region_inside_mmram(base, size)
 }
 
 /// Read CR3 register.
-fn read_cr3() -> u64 {
+pub(crate) fn read_cr3() -> u64 {
     let mut _value = 0u64;
 
     #[cfg(all(not(test), target_arch = "x86_64"))]
@@ -933,12 +933,6 @@ where
             panic!("Failed to initialize Interrupt Manager: {:?}", err);
         });
 
-        // // For debugging: Dump the HOB list
-        // // SAFETY: The HOB list pointer is provided by the MM IPL and is guaranteed to be valid at this point.
-        // unsafe {
-        //     mm_mem::dump_hob_list(hob_list);
-        // }
-
         // Initialize the page allocator from the HOB list
         // This finds all SMRAM regions and sets up memory tracking
         // SAFETY: hob_list is provided by the MM IPL and is guaranteed to be valid
@@ -1004,8 +998,6 @@ where
                 log::error!("Failed to initialize policy gate: {:?}", e);
             }
         }
-
-        // TODO: Initialize request handler infrastructure
 
         log::trace!("BSP one-time initialization complete.");
     }
@@ -1102,11 +1094,6 @@ where
         let core_type = if is_bsp { "BSP" } else { "AP" };
         log::trace!("{} (CPU {}) performing per-core initialization...", core_type, cpu_id);
 
-        // // Initialize syscall MSRs for this core
-        // if let Err(e) = self.syscall_interface.init_for_cpu(cpu_id as usize) {
-        //     log::error!("CPU {}: Failed to initialize syscall interface: {:?}", cpu_id, e);
-        // }
-
         // TODO: Set up per-CPU GDT/TSS if needed
         // TODO: Set up per-CPU interrupt stacks
         // TODO: Initialize per-CPU data structures
@@ -1132,11 +1119,11 @@ where
             let expected_aps = self.cpu_manager.registered_count().saturating_sub(1) as usize;
             self.wait_for_ap_arrival(expected_aps);
 
-            // All APs (or timeout) — proceed with request processing
+            // All APs (or timeout) - proceed with request processing
             log::trace!("BSP (CPU {}) entering request serving routine...", cpu_id);
             self.bsp_request_loop(cpu_id as usize);
 
-            // BSP is done handling the request — broadcast Return to all APs
+            // BSP is done handling the request - broadcast Return to all APs
             log::trace!("BSP (CPU {}) broadcasting Return to all APs...", cpu_id);
             let sent = self.mailbox_manager.broadcast_command(ApCommand::Return);
             log::trace!("BSP (CPU {}) sent Return to {} APs, waiting for acknowledgement...", cpu_id, sent);
@@ -1349,7 +1336,7 @@ where
                         log::warn!("SMM CPU Private data pointer is null in PassDown HOB");
                     }
 
-                    // Store communication buffer configuration
+                    // Store communication buffer configuration.
                     COMM_BUFFER_CONFIG.call_once(|| CommBufferConfig {
                         supv_comm_buffer,
                         supv_comm_buffer_internal,
@@ -1392,10 +1379,21 @@ where
                     // SAFETY: We validated that policy_ptr is non-null above and comes from
                     // the PassDown HOB which is set up by the MM IPL.
                     match unsafe { patina_mm_policy::PolicyGate::new(policy_ptr) } {
-                        Ok(gate) => {
+                        Ok(mut gate) => {
                             log::info!("Policy gate initialized successfully");
                             // SAFETY: policy_ptr points to valid policy data as validated above.
                             unsafe { patina_mm_policy::dump_policy(policy_ptr) };
+
+                            // Configure the memory policy buffer on the gate so that
+                            // take_snapshot / verify_snapshot / fetch_n_update_policy
+                            // can use it.
+                            let mem_policy_max_count = memory_policy_buffer_size as usize
+                                / core::mem::size_of::<MemDescriptorV1_0>();
+                            gate.set_memory_policy_buffer(
+                                memory_policy_buffer as *mut MemDescriptorV1_0,
+                                mem_policy_max_count,
+                            );
+
                             // Store the initialized policy gate in the static variable for global access
                             POLICY_GATE.call_once(|| gate);
                         }
