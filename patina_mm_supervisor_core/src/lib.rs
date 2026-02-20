@@ -51,6 +51,7 @@ mod cpu;
 mod mailbox;
 pub mod mm_mem;
 pub mod paging_allocator;
+pub mod perf_timer;
 pub mod privilege_mgmt;
 pub mod supervisor_handlers;
 pub mod unblock_memory;
@@ -919,6 +920,10 @@ where
     fn bsp_init(&'static self, hob_list: *const c_void) {
         log::info!("BSP performing one-time initialization...");
 
+        // Initialize the performance timer early so all subsequent code
+        // can use real TSC-based timeouts.
+        perf_timer::init(P::CpuInfo::perf_timer_frequency().unwrap_or(0));
+
         let mut interrupt_manager = Interrupts::new();
         interrupt_manager.initialize().unwrap_or_else(|err| {
             panic!("Failed to initialize Interrupt Manager: {:?}", err);
@@ -1143,23 +1148,21 @@ where
             return;
         }
 
-        // TODO: Approximate timeout via spin loop iterations (~100 ms worth of spins)
-        const AP_ARRIVAL_TIMEOUT_ITERS: u64 = 1_000_000;
+        const AP_ARRIVAL_TIMEOUT_US: u64 = 100_000; // 100 ms
 
-        for _ in 0..AP_ARRIVAL_TIMEOUT_ITERS {
+        let all_arrived = perf_timer::spin_until(AP_ARRIVAL_TIMEOUT_US, || {
+            self.cpu_manager.count_aps_in_state(cpu::ApState::InHoldingPen) >= expected_aps
+        });
+
+        if all_arrived {
+            log::trace!("All {} APs arrived", expected_aps);
+        } else {
             let arrived = self.cpu_manager.count_aps_in_state(cpu::ApState::InHoldingPen);
-            if arrived >= expected_aps {
-                log::trace!("All {} APs arrived", arrived);
-                return;
-            }
-            core::hint::spin_loop();
+            log::warn!(
+                "AP arrival timeout: {}/{} APs arrived, proceeding with available cores",
+                arrived, expected_aps
+            );
         }
-
-        let arrived = self.cpu_manager.count_aps_in_state(cpu::ApState::InHoldingPen);
-        log::warn!(
-            "AP arrival timeout: {}/{} APs arrived, proceeding with available cores",
-            arrived, expected_aps
-        );
     }
 
     /// Discovers the MM Supervisor User module entry point from the HOB list.

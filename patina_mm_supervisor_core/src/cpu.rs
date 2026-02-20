@@ -40,6 +40,17 @@ pub trait CpuInfo {
     fn ap_poll_timeout_us() -> u64 {
         1000
     }
+
+    /// Returns the performance counter frequency in Hz, if known by the platform.
+    ///
+    /// For example, on QEMU Q35 the platform can calibrate the TSC frequency
+    /// from the ACPI PM Timer and return it here.
+    ///
+    /// If `None` is returned (the default), the supervisor will attempt
+    /// auto-detection via CPUID.
+    fn perf_timer_frequency() -> Option<u64> {
+        None
+    }
 }
 
 /// The state of an Application Processor (AP).

@@ -47,10 +47,20 @@ use patina_stacktrace::StackTrace;
 /// Platform configuration for the example MM Supervisor.
 struct ExamplePlatform;
 
+/// ACPI PM Timer port on QEMU Q35 (from FADT X_PM_TIMER_BLOCK).
+const PM_TIMER_PORT: u16 = 0x608;
+
 impl CpuInfo for ExamplePlatform {
     /// Override the default AP polling timeout if needed.
     fn ap_poll_timeout_us() -> u64 {
         1000 // 1ms polling interval
+    }
+
+    fn perf_timer_frequency() -> Option<u64> {
+        // SAFETY: On Q35 the PM Timer is always available at PM_TIMER_PORT.
+        Some(unsafe {
+            patina::component::service::timer::x86_64::calibrate_tsc_from_pm_timer(PM_TIMER_PORT)
+        })
     }
 }
 

@@ -25,6 +25,8 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::perf_timer;
+
 /// Commands that can be sent from BSP to APs via the mailbox.
 ///
 /// APs sit in a holding pen polling for commands. When no command is pending
@@ -408,19 +410,18 @@ impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
     /// Returns the response, or `None` if timeout.
     pub fn wait_response(&self, cpu_id: u32, timeout_us: u64) -> Option<ApResponse> {
         let mailbox = self.get_mailbox(cpu_id)?;
+        let mut result = None;
 
-        // Simple spin-wait with approximate timeout
-        // In a real implementation, this would use a proper timer
-        let iterations = timeout_us * 10; // Rough approximation
-
-        for _ in 0..iterations {
+        perf_timer::spin_until(timeout_us, || {
             if let Some(response) = mailbox.get_response() {
-                return Some(response);
+                result = Some(response);
+                true
+            } else {
+                false
             }
-            core::hint::spin_loop();
-        }
+        });
 
-        None
+        result
     }
 
     /// Broadcasts a command to all assigned APs.
@@ -454,12 +455,10 @@ impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
     ///
     /// Returns the number of APs that responded within the timeout.
     pub fn wait_all_responses(&self, timeout_us: u64) -> usize {
-        let iterations = timeout_us * 10; // Rough approximation
-        let mut responded = 0;
         let total = self.assigned_count();
 
-        for _ in 0..iterations {
-            responded = 0;
+        perf_timer::spin_until(timeout_us, || {
+            let mut responded = 0;
             for mailbox in &self.mailboxes {
                 if mailbox.assigned_cpu().is_some() {
                     // Count APs that have already been consumed (Empty) or have response ready
@@ -468,16 +467,19 @@ impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
                     }
                 }
             }
-            if responded >= total {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            responded >= total
+        });
 
-        // Drain all pending responses
+        // Drain all pending responses and count
+        let mut responded = 0;
         for mailbox in &self.mailboxes {
-            if mailbox.assigned_cpu().is_some() && mailbox.has_response() {
-                let _ = mailbox.get_response();
+            if mailbox.assigned_cpu().is_some() {
+                if mailbox.has_response() {
+                    let _ = mailbox.get_response();
+                    responded += 1;
+                } else if mailbox.is_empty() {
+                    responded += 1;
+                }
             }
         }
 
