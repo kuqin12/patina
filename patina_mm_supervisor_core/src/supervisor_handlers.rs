@@ -47,10 +47,6 @@ use r_efi::efi;
 use patina_paging::{MemoryAttributes, PageTable, PtError};
 
 use crate::mm_mem::PAGE_ALLOCATOR;
-use crate::request_handler::{
-    MmSupervisorRequestHeader, MmSupervisorVersionInfo,
-    requests, SIGNATURE, REVISION,
-};
 use crate::unblock_memory::{UnblockError, UNBLOCKED_MEMORY_TRACKER};
 use crate::{
     POLICY_GATE,
@@ -58,8 +54,12 @@ use crate::{
 };
 
 use patina_mm::protocol::mm_supervisor_request::{
+    MmSupervisorRequestHeader,
+    MmSupervisorVersionInfo,
+    requests,
     MM_SUPERVISOR_REQUEST_HANDLER_GUID,
     MmSupervisorUnblockMemoryParams,
+    REVISION, SIGNATURE,
 };
 
 use patina_mm_policy::{MemDescriptorV1_0, PolicyError};
@@ -518,7 +518,7 @@ fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     // validate it against SMRAM, and update the internal comm buffer config.
     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
 
-    efi::Status::UNSUPPORTED
+    efi::Status::ACCESS_DENIED
 }
 
 /// Handle an UNBLOCK_MEM request.
