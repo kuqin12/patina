@@ -19,7 +19,7 @@ use gdbstub::{
     conn::{Connection, ConnectionExt},
     stub::{GdbStubBuilder, SingleThreadStopReason, state_machine::GdbStubStateMachine},
 };
-use patina::{component::service::perf_timer::ArchTimerFunctionality, serial::SerialIO};
+use patina::{component::service::timer::ArchTimerFunctionality, serial::SerialIO};
 use patina_internal_cpu::interrupts::{ExceptionType, HandlerType, InterruptHandler, InterruptManager};
 use spin::Mutex;
 

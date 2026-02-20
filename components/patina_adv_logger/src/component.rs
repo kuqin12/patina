@@ -14,7 +14,7 @@ use patina::{
     boot_services::{BootServices, StandardBootServices},
     component::{
         component,
-        service::{Service, perf_timer::ArchTimerFunctionality},
+        service::{Service, timer::ArchTimerFunctionality},
     },
     error::{EfiError, Result},
     serial::SerialIO,

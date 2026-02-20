@@ -27,7 +27,7 @@
 //! extern crate patina;
 //! # extern crate patina_internal_cpu;
 //! # use patina_internal_cpu::interrupts::{Interrupts, InterruptManager};
-//! # use patina::component::service::perf_timer::ArchTimerFunctionality;
+//! # use patina::component::service::timer::ArchTimerFunctionality;
 //!
 //! static DEBUGGER: patina_debugger::PatinaDebugger<patina::serial::uart::UartNull> =
 //!     patina_debugger::PatinaDebugger::new(patina::serial::uart::UartNull{})
@@ -121,7 +121,7 @@ pub use debugger::PatinaDebugger;
 
 #[cfg(not(test))]
 use arch::{DebuggerArch, SystemArch};
-use patina::{component::service::perf_timer::ArchTimerFunctionality, serial::SerialIO};
+use patina::{component::service::timer::ArchTimerFunctionality, serial::SerialIO};
 use patina_internal_cpu::interrupts::{ExceptionContext, InterruptManager};
 
 /// Global instance of the debugger.

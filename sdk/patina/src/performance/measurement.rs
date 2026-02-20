@@ -21,7 +21,7 @@ use core::{
 
 use crate::{
     boot_services::BootServices,
-    component::service::{Service, perf_timer::ArchTimerFunctionality},
+    component::service::{Service, timer::ArchTimerFunctionality},
     error::EfiError,
     guids::EDKII_FPDT_EXTENDED_FIRMWARE_PERFORMANCE,
     performance::{

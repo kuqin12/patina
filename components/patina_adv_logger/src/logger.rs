@@ -13,7 +13,7 @@ use crate::memory_log::{self, AdvancedLog, LogEntry};
 use core::{ffi::c_void, marker::Send, ptr};
 use log::Level;
 use patina::{
-    component::service::{Service, perf_timer::ArchTimerFunctionality},
+    component::service::{Service, timer::ArchTimerFunctionality},
     error::EfiError,
     log::Format,
     pi::hob::{Hob, PhaseHandoffInformationTable},
@@ -303,7 +303,7 @@ mod tests {
 
     use alloc::boxed::Box;
     use patina::{
-        component::service::{IntoService, perf_timer::ArchTimerFunctionality},
+        component::service::{IntoService, timer::ArchTimerFunctionality},
         log::Format,
         pi::hob::{GUID_EXTENSION, GuidHob, header},
         serial::uart::UartNull,

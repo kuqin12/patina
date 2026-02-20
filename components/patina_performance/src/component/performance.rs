@@ -18,7 +18,7 @@ use patina::{
         component,
         hob::Hob,
         params::Config,
-        service::{Service, perf_timer::ArchTimerFunctionality},
+        service::{Service, timer::ArchTimerFunctionality},
     },
     error::EfiError,
     guids::{EVENT_GROUP_END_OF_DXE, PERFORMANCE_PROTOCOL},

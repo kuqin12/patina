@@ -8,7 +8,7 @@
 //!
 use crate::{
     boot_services::{StandardBootServices, tpl::Tpl},
-    component::service::{Service, perf_timer::ArchTimerFunctionality},
+    component::service::{Service, timer::ArchTimerFunctionality},
     performance::table::FBPT,
     tpl_mutex::TplMutex,
 };

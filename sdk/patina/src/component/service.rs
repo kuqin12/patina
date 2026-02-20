@@ -127,7 +127,7 @@ use crate::component::{
 };
 
 pub mod memory;
-pub mod perf_timer;
+pub mod timer;
 
 pub use patina_macro::IntoService;
 
