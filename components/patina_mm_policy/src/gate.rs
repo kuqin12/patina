@@ -574,7 +574,7 @@ impl PolicyGate {
         Ok(())
     }
 
-    /// Writes the merged memory + firmware policy into `dest`.
+    /// Writes the merged firmware + memory policy into `dest`.
     ///
     /// Mirrors the C `FetchNUpdateSecurityPolicy` function. The caller is
     /// responsible for ensuring the snapshot has been taken first (via
@@ -583,12 +583,18 @@ impl PolicyGate {
     /// ## Layout written to `dest`
     ///
     /// ```text
-    /// |----------------------------------|
-    /// | MemDescriptorV1_0[0..N]          |  ← memory policy snapshot
-    /// |----------------------------------|
-    /// | SecurePolicyDataV1_0 + payload   |  ← firmware policy blob
-    /// |----------------------------------|
+    /// |--------------------------------------|
+    /// | SecurePolicyDataV1_0 + payload       |  <- firmware policy blob (copied first)
+    /// |--------------------------------------|
+    /// | MemDescriptorV1_0[0..N]              |  <- memory policy snapshot (appended)
+    /// |--------------------------------------|
     /// ```
+    ///
+    /// After the copy the function patches the header in-place:
+    ///
+    /// * The `TYPE_MEM` policy root's `offset` → `fw_size` and `count` → snapshot count
+    /// * The header's `size` → `fw_size + mem_policy_bytes`
+    /// * The legacy `memory_policy_count` field is zeroed (unused with root-based layout)
     ///
     /// Note: the caller is responsible for writing/reserving any request header
     /// *before* the region pointed to by `dest`.
@@ -627,7 +633,7 @@ impl PolicyGate {
             return Err(PolicyError::InternalError);
         }
 
-        let total_bytes = mem_policy_bytes.checked_add(fw_size).ok_or_else(|| {
+        let total_bytes = fw_size.checked_add(mem_policy_bytes).ok_or_else(|| {
             log::error!("fetch_n_update_policy: total size overflow");
             PolicyError::InternalError
         })?;
@@ -642,28 +648,57 @@ impl PolicyGate {
         }
 
         // SAFETY: The caller guarantees that `dest` is writable for at least
-        // `dest_size` bytes (verified >= `total_bytes` above). The memory
-        // policy buffer holds `count` valid descriptors from a prior snapshot,
-        // and `self.policy_ptr` points to a valid firmware policy blob of
-        // `fw_size` bytes (validated at construction).
+        // `dest_size` bytes (verified >= `total_bytes` above).
+        // `self.policy_ptr` points to a valid firmware policy blob of `fw_size`
+        // bytes (validated at construction). The memory policy buffer holds
+        // `count` valid descriptors from a prior `take_snapshot` call.
         unsafe {
-            // Copy memory policy descriptors.
+            // 1. Copy the firmware policy blob first (header + payload).
+            core::ptr::copy_nonoverlapping(self.policy_ptr, dest, fw_size);
+
+            // 2. Append memory policy descriptors after the firmware blob.
             if mem_policy_bytes > 0 {
+                let mem_dest = dest.add(fw_size);
                 let src = self.memory_policy_buffer as *const u8;
-                core::ptr::copy_nonoverlapping(src, dest, mem_policy_bytes);
+                core::ptr::copy_nonoverlapping(src, mem_dest, mem_policy_bytes);
             }
 
-            // Copy firmware policy blob.
-            let fw_dest = dest.add(mem_policy_bytes);
-            core::ptr::copy_nonoverlapping(self.policy_ptr, fw_dest, fw_size);
+            // 3. Fix up the copied header to reflect the appended memory policy.
+            let header = &mut *(dest as *mut SecurePolicyDataV1_0);
+
+            // Find the TYPE_MEM policy root and patch its offset/count.
+            let roots_ptr = (dest as *mut u8).add(header.policy_root_offset as usize)
+                as *mut PolicyRootV1;
+            let mut found_mem_root = false;
+            for i in 0..header.policy_root_count as usize {
+                let root = &mut *roots_ptr.add(i);
+                if root.policy_type == TYPE_MEM {
+                    root.access_attr = ACCESS_ATTR_ALLOW;
+                    root.offset = fw_size as u32;
+                    root.count = count as u32;
+                    found_mem_root = true;
+                    break;
+                }
+            }
+
+            if !found_mem_root {
+                log::error!(
+                    "fetch_n_update_policy: firmware policy has no TYPE_MEM policy root"
+                );
+                return Err(PolicyError::PolicyRootNotFound);
+            }
+
+            // Update the total size and clear the legacy memory_policy_count.
+            header.size = total_bytes as u32;
+            header.memory_policy_count = 0;
         }
 
         log::info!(
-            "fetch_n_update_policy: wrote {} bytes (mem_policy={} ({} descs), fw_policy={})",
+            "fetch_n_update_policy: wrote {} bytes (fw_policy={}, mem_policy={} ({} descs))",
             total_bytes,
+            fw_size,
             mem_policy_bytes,
             count,
-            fw_size,
         );
         Ok(total_bytes)
     }

@@ -381,9 +381,9 @@ fn handle_version_info(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> ef
 /// |----------------------------------|
 /// | MmSupervisorRequestHeader (24 B) |
 /// |----------------------------------|
-/// | MemDescriptorV1_0[0..N]          |  ← memory policy snapshot
+/// | MemDescriptorV1_0[0..N]          |  <- memory policy snapshot
 /// |----------------------------------|
-/// | SecurePolicyDataV1_0 + payload   |  ← firmware policy blob (raw copy)
+/// | SecurePolicyDataV1_0 + payload   |  <- firmware policy blob (raw copy)
 /// |----------------------------------|
 /// ```
 fn handle_fetch_policy(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
@@ -514,8 +514,8 @@ fn verify_policy_snapshot(
 fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("COMM_UPDATE request");
 
-    // TODO: Parse the new communication buffer descriptor from the payload,
-    // validate it against SMRAM, and update the internal comm buffer config.
+    // We do not support dynamic communication buffer updates in this implementation, because
+    // we expect the runtime allocation will fall into PEI memory bin.
     *comm_buffer_size = MmSupervisorRequestHeader::SIZE;
 
     efi::Status::ACCESS_DENIED
