@@ -93,46 +93,6 @@ static LOGGER: AdvancedLogger<Uart16550> = AdvancedLogger::new(
 );
 
 // =============================================================================
-// Request Handlers (Examples)
-// =============================================================================
-
-/// Example: Version info request handler.
-struct VersionInfoHandler;
-
-impl RequestHandler for VersionInfoHandler {
-    fn guid(&self) -> r_efi::efi::Guid {
-        // MM Supervisor Request Handler GUID
-        // This should match gMmSupervisorRequestHandlerGuid from the EDK2 headers
-        r_efi::efi::Guid::from_fields(
-            0x2e6b1cb5,
-            0x7d56,
-            0x40e9,
-            0xa3,
-            0x16,
-            &[0x4a, 0x0e, 0xf4, 0xef, 0x85, 0x53],
-        )
-    }
-
-    fn handle(&self, context: &mut RequestContext) -> RequestResult {
-        // TODO: Parse the request header and return version info
-        // This is where you'd implement the VERSION_INFO request handling
-        let _ = context;
-        RequestResult::Success
-    }
-
-    fn name(&self) -> &'static str {
-        "VersionInfoHandler"
-    }
-
-    fn requires_supervisor(&self) -> bool {
-        false // Can be called from user channel
-    }
-}
-
-/// Static instance of the version info handler.
-static VERSION_INFO_HANDLER: VersionInfoHandler = VersionInfoHandler;
-
-// =============================================================================
 // Panic Handler
 // =============================================================================
 
@@ -178,11 +138,8 @@ fn panic(info: &PanicInfo) -> ! {
 /// when loading the supervisor.
 #[unsafe(export_name = "rust_main")]
 pub extern "efiapi" fn mm_supervisor_main(cpu_index: usize, hob_list: *const c_void) {
-    // TODO: should not have it here because we will get back here everytime an MM call is made
 
-    // Register platform-specific handlers before entering the main loop
-    // Note: Only BSP will actually process these, but it's safe for APs to
-    // call register_handler as well (they'll just fail to register duplicates)
+    // Initialize the advanced logger on the first CPU to arrive (BSP)
     if !ADV_LOGGER_INIT_COMPLETE.swap(true, core::sync::atomic::Ordering::SeqCst) {
         log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace)).unwrap();
         // SAFETY: The physical_hob_list pointer is considered valid at this point as it's provided by the core
@@ -194,22 +151,4 @@ pub extern "efiapi" fn mm_supervisor_main(cpu_index: usize, hob_list: *const c_v
 
     // The entry_point handles BSP vs AP routing internally
     SUPERVISOR.entry_point(cpu_index, hob_list)
-}
-
-// =============================================================================
-// Optional: Pre-BSP Initialization Hook
-// =============================================================================
-
-/// Optional early initialization that runs before the supervisor core starts.
-///
-/// This can be used to set up logging, debugging, or other early infrastructure.
-/// Called by the entry point before `SUPERVISOR.entry_point()`.
-#[allow(dead_code)]
-fn early_init() {
-    // Example: Initialize a serial logger
-    // log::set_logger(&MY_LOGGER).ok();
-
-    // Example: Register handlers
-    // Note: Must be done before entry_point() or by the BSP during bsp_init()
-    let _ = SUPERVISOR.register_handler(&VERSION_INFO_HANDLER);
 }
