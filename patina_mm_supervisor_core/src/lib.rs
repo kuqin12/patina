@@ -52,7 +52,6 @@ mod mailbox;
 pub mod mm_mem;
 pub mod paging_allocator;
 pub mod privilege_mgmt;
-mod request_handler;
 pub mod supervisor_handlers;
 pub mod unblock_memory;
 
@@ -66,11 +65,6 @@ pub use mm_mem::{
 pub use paging_allocator::{
     PagingPoolAllocator, PagingAllocError, SharedPagingAllocator,
     PAGING_ALLOCATOR, DEFAULT_PAGING_POOL_PAGES,
-};
-pub use request_handler::{
-    RequestContext, RequestHandler, RequestResult, RequestDispatcher,
-    MmSupervisorRequestHeader, MmSupervisorVersionInfo,
-    mm_supv_protocol, requests, responses, SIGNATURE, REVISION,
 };
 pub use unblock_memory::{
     UnblockedMemoryTracker, UnblockedMemoryEntry, UnblockError,
@@ -592,8 +586,6 @@ where
     cpu_manager: CpuManager<{ P::MAX_CPU_COUNT }>,
     /// Manager for AP mailboxes.
     mailbox_manager: MailboxManager<{ P::MAX_CPU_COUNT }>,
-    /// Request dispatcher for handling incoming requests.
-    request_dispatcher: RequestDispatcher<{ P::MAX_HANDLERS }>,
     /// Syscall interface for privilege transitions.
     syscall_interface: SyscallInterface<{ P::MAX_CPU_COUNT }>,
     /// Flag indicating if the core has been initialized.
@@ -765,7 +757,6 @@ where
         Self {
             cpu_manager: CpuManager::new(),
             mailbox_manager: MailboxManager::new(),
-            request_dispatcher: RequestDispatcher::new(),
             syscall_interface: SyscallInterface::new(),
             initialized: AtomicBool::new(false),
             _phantom: core::marker::PhantomData,
@@ -1128,7 +1119,7 @@ where
             let sent = self.mailbox_manager.broadcast_command(ApCommand::Return);
             log::trace!("BSP (CPU {}) sent Return to {} APs, waiting for acknowledgement...", cpu_id, sent);
 
-            // Wait for all APs to acknowledge the Return command
+            // TODO: Wait for all APs to acknowledge the Return command
             const RETURN_TIMEOUT_US: u64 = 100_000; // 100 ms
             let responded = self.mailbox_manager.wait_all_responses(RETURN_TIMEOUT_US);
             log::trace!(
@@ -1152,7 +1143,7 @@ where
             return;
         }
 
-        // Approximate timeout via spin loop iterations (~100 ms worth of spins)
+        // TODO: Approximate timeout via spin loop iterations (~100 ms worth of spins)
         const AP_ARRIVAL_TIMEOUT_ITERS: u64 = 1_000_000;
 
         for _ in 0..AP_ARRIVAL_TIMEOUT_ITERS {
@@ -1861,12 +1852,6 @@ where
                     break;
                 }
             }
-
-            // Pause to avoid spinning too aggressively
-            // In a production system, this might use MWAIT or HLT
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-            }
         }
     }
 
@@ -2071,15 +2056,6 @@ where
         }
     }
 
-    /// Register a request handler with the supervisor.
-    ///
-    /// Handlers are invoked when matching requests are received.
-    ///
-    /// Returns `true` if the handler was registered, `false` if the handler table is full.
-    pub fn register_handler(&self, handler: &'static dyn RequestHandler) -> bool {
-        self.request_dispatcher.register(handler)
-    }
-
     /// Get the CPU manager.
     pub fn cpu_manager(&self) -> &CpuManager<{ P::MAX_CPU_COUNT }> {
         &self.cpu_manager
@@ -2088,11 +2064,6 @@ where
     /// Get the mailbox manager.
     pub fn mailbox_manager(&self) -> &MailboxManager<{ P::MAX_CPU_COUNT }> {
         &self.mailbox_manager
-    }
-
-    /// Get the request dispatcher.
-    pub fn request_dispatcher(&self) -> &RequestDispatcher<{ P::MAX_HANDLERS }> {
-        &self.request_dispatcher
     }
 
     /// Send a command to a specific AP.

@@ -224,28 +224,38 @@ impl ApMailbox {
     /// Sends a command to this mailbox (called by BSP).
     ///
     /// Returns `true` if the command was successfully posted, `false` if the mailbox is busy.
+    ///
+    /// The payload (command tag, procedure, argument) is written first with `Relaxed`
+    /// ordering, then `state` is set to `CommandPending` with `Release` ordering.
+    /// The AP acquires `state`, which guarantees it sees the fully-written payload.
     pub fn send_command(&self, command: ApCommand) -> bool {
         // Only allow sending if mailbox is empty
         let result = self.state.compare_exchange(
             MailboxState::Empty as u32,
-            MailboxState::CommandPending as u32,
+            MailboxState::Empty as u32, // keep Empty while we fill the payload
             Ordering::AcqRel,
             Ordering::Acquire,
         );
 
         if result.is_ok() {
-            // Store payload fields first, then the command tag (publish signal)
+            // Write all payload fields before publishing.
+            // Relaxed is fine here — the Release store to `state` below
+            // will fence all prior writes.
             match command {
                 ApCommand::RunProcedure { procedure, argument } => {
-                    self.procedure.store(procedure, Ordering::Release);
-                    self.argument.store(argument, Ordering::Release);
+                    self.procedure.store(procedure, Ordering::Relaxed);
+                    self.argument.store(argument, Ordering::Relaxed);
                 }
                 ApCommand::Return => {
-                    self.procedure.store(0, Ordering::Release);
-                    self.argument.store(0, Ordering::Release);
+                    self.procedure.store(0, Ordering::Relaxed);
+                    self.argument.store(0, Ordering::Relaxed);
                 }
             }
-            self.command.store(command.to_u64(), Ordering::Release);
+            self.command.store(command.to_u64(), Ordering::Relaxed);
+
+            // Publish: the AP polls on `state` with Acquire, so this
+            // Release ensures it sees the payload written above.
+            self.state.store(MailboxState::CommandPending as u32, Ordering::Release);
             true
         } else {
             false
@@ -269,6 +279,30 @@ impl ApMailbox {
             Some(ApResponse::from_u64(resp))
         } else {
             None
+        }
+    }
+
+    /// Spins until the mailbox reaches the `Empty` state, draining any pending response.
+    ///
+    /// This is analogous to the C code's `WaitForAllAPsNotBusy(TRUE)` which
+    /// acquires+releases each AP's Busy spinlock, blocking until the AP is done.
+    ///
+    /// If the mailbox is in `ResponseReady`, the response is consumed to transition
+    /// it back to `Empty`. If it is in `CommandPending` or `Processing`, this spins
+    /// until the AP finishes and posts a response (which is then drained).
+    fn drain_to_empty(&self) {
+        loop {
+            match self.state() {
+                MailboxState::Empty => return,
+                MailboxState::ResponseReady => {
+                    // Consume the response to transition back to Empty.
+                    let _ = self.get_response();
+                }
+                _ => {
+                    // CommandPending or Processing — AP is still working.
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 
@@ -391,16 +425,25 @@ impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
 
     /// Broadcasts a command to all assigned APs.
     ///
+    /// For each assigned mailbox, this first drains any pending response
+    /// (spinning until the mailbox is `Empty`), then sends the command.
+    /// This mirrors the C code's `WaitForAllAPsNotBusy(TRUE)` followed
+    /// by `ReleaseAllAPs()`, ensuring no AP is ever skipped.
+    ///
     /// Returns the number of APs that received the command.
     pub fn broadcast_command(&self, command: ApCommand) -> usize {
         let mut success_count = 0;
 
         for mailbox in &self.mailboxes {
             if let Some(cpu_id) = mailbox.assigned_cpu() {
-                if mailbox.send_command(command) {
-                    success_count += 1;
-                    log::trace!("Broadcast command to CPU {}", cpu_id);
-                }
+                // Drain any in-flight work so the mailbox is Empty.
+                mailbox.drain_to_empty();
+
+                // Mailbox is now guaranteed Empty — send_command must succeed.
+                let sent = mailbox.send_command(command);
+                debug_assert!(sent, "send_command failed after drain_to_empty for CPU {}", cpu_id);
+                success_count += 1;
+                log::trace!("Broadcast command to CPU {}", cpu_id);
             }
         }
 
