@@ -272,10 +272,7 @@ invoke_demoted_routine:
     #Return status should still be in rax, save it before calling other functions
     push    rax
 
-    add     rsp, 8
-
-    pop     rax
-    pop     rax
+    add     rsp, 24
 
     pop     rax
     pop     rdx
@@ -302,7 +299,7 @@ invoke_demoted_routine:
     mov     rcx, MSR_IA32_STAR
     wrmsr
 
-    mov     rax, [rsp + 13 * 8]
+    mov     rax, [rsp - 13 * 8]
 
     xor     rcx, rcx
     mov     cx, LONG_DS_R0
