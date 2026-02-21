@@ -53,6 +53,7 @@ pub mod mm_mem;
 pub mod paging_allocator;
 pub mod perf_timer;
 pub mod privilege_mgmt;
+pub mod save_state;
 pub mod supervisor_handlers;
 pub mod unblock_memory;
 
@@ -1509,7 +1510,7 @@ where
     /// Process a request targeting the User module.
     ///
     /// This function implements the user-mode MMI dispatch pathway:
-    /// 1. Updates `SmmCoreEntryContext.CurrentlyExecutingCpu` in the CPU private data
+    /// 1. Builds a fresh `EfiMmEntryContext` with the current CPU index and CPU count
     /// 2. Copies the `EfiMmEntryContext` into the supervisor-to-user data buffer
     /// 3. Appends the `MmCommBufferStatus` immediately after the context
     /// 4. For synchronous MMIs, copies the user comm buffer to the internal copy
@@ -1538,15 +1539,6 @@ where
             }
         };
 
-        // Get SMM CPU private data pointer
-        let cpu_private_addr = match SMM_CPU_PRIVATE.get() {
-            Some(&addr) if addr != 0 => addr,
-            _ => {
-                log::error!("SMM CPU Private data not configured, cannot dispatch to user");
-                return;
-            }
-        };
-
         // Demote to user entry point to process the request
         let cpl3_stack = match self.syscall_interface.get_cpl3_stack(cpu_index) {
             Ok(stack) => stack,
@@ -1556,14 +1548,26 @@ where
             }
         };
 
-        // Update the currently executing CPU index in the SmmCoreEntryContext
-        // SAFETY: cpu_private_addr was provided by MM IPL via the PassDown HOB and points
-        // to a valid SMM_CPU_PRIVATE_DATA structure in SMRAM.
-        let cpu_private = unsafe { &mut *(cpu_private_addr as *mut SmmCpuPrivateData) };
-        cpu_private.smm_core_entry_context.currently_executing_cpu = cpu_index as u64;
+        // Build a fresh EfiMmEntryContext with only the fields the user actually needs.
+        // The legacy C structure carried pointers (mm_startup_this_ap, cpu_save_state,
+        // cpu_save_state_size) that are meaningless in the Rust supervisor model — the
+        // user module accesses those services through syscalls instead.
+        let entry_context = EfiMmEntryContext {
+            mm_startup_this_ap: 0,
+            currently_executing_cpu: cpu_index as u64,
+            number_of_cpus: self.cpu_manager.registered_count() as u64,
+            cpu_save_state_size: 0,
+            cpu_save_state: 0,
+        };
 
-        // Copy the EfiMmEntryContext into the supervisor-to-user data buffer so the user
-        // can read processor information after demotion
+        log::info!(
+            "Built EfiMmEntryContext: currently_executing_cpu={}, number_of_cpus={}",
+            entry_context.currently_executing_cpu,
+            entry_context.number_of_cpus
+        );
+
+        // Copy the EfiMmEntryContext + MmCommBufferStatus into the supervisor-to-user
+        // data buffer so the user can read processor information after demotion.
         let context_size = core::mem::size_of::<EfiMmEntryContext>();
         let status_size = core::mem::size_of::<MmCommBufferStatus>();
 
@@ -1582,7 +1586,7 @@ where
         unsafe {
             // Copy the EfiMmEntryContext to the start of the supervisor-to-user buffer
             core::ptr::copy_nonoverlapping(
-                &cpu_private.smm_core_entry_context as *const EfiMmEntryContext as *const u8,
+                &entry_context as *const EfiMmEntryContext as *const u8,
                 config.supv_to_user_buffer as *mut u8,
                 context_size,
             );
