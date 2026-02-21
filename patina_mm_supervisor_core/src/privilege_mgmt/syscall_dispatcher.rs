@@ -644,10 +644,15 @@ impl SyscallDispatcher {
     /// Handles save state read syscall (legacy).
     ///
     /// - Arg1: User MM CPU protocol pointer
-    /// - Arg2: Register to be read
+    /// - Arg2: Register to be read (`EFI_MM_SAVE_STATE_REGISTER`)
     /// - Arg3: CPU index to read from
     fn handle_save_state_read(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ: protocol=0x{:x}, register={}, cpu={}", ctx.arg1, ctx.arg2, ctx.arg3);
+        log::trace!(
+            "SAVE_STATE_READ: protocol=0x{:x}, register={}, cpu={}",
+            ctx.arg1,
+            ctx.arg2,
+            ctx.arg3
+        );
 
         // Validate parameters
         if ctx.arg1 == 0 {
@@ -655,11 +660,8 @@ impl SyscallDispatcher {
             return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
         }
 
-        // TODO: Validate Arg2 against EFI_MM_SAVE_STATE_REGISTER_PROCESSOR_ID range
-        // TODO: Validate Arg3 against NumberOfCpus
-        // TODO: Delegate to ProcessUserSaveStateAccess equivalent
-        log::warn!("SAVE_STATE_READ: Not yet implemented");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        // Delegate to save state module Phase 1
+        crate::save_state::save_state_read_phase1(ctx.arg1, ctx.arg2, ctx.arg3)
     }
 
     /// Handles page allocation syscall.
@@ -846,7 +848,12 @@ impl SyscallDispatcher {
     /// - Arg2: Width of buffer to read in bytes
     /// - Arg3: User buffer to hold return data
     fn handle_save_state_read2(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+        log::trace!(
+            "SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}",
+            ctx.arg1,
+            ctx.arg2,
+            ctx.arg3
+        );
 
         // Validate parameters
         if ctx.arg1 == 0 {
@@ -854,10 +861,8 @@ impl SyscallDispatcher {
             return SyscallResult::error(SyscallResult::EFI_INVALID_PARAMETER);
         }
 
-        // TODO: Validate buffer (Arg3) is in user-owned range with size Arg2
-        // TODO: Delegate to ProcessUserSaveStateAccess equivalent
-        log::warn!("SAVE_STATE_READ2: Not yet implemented");
-        SyscallResult::error(SyscallResult::EFI_UNSUPPORTED)
+        // Delegate to save state module Phase 2
+        crate::save_state::save_state_read_phase2(ctx.arg1, ctx.arg2, ctx.arg3)
     }
 
     /// Handles MM memory unblocked check syscall.
