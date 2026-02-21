@@ -44,3 +44,5 @@ serial_test = { workspace = true }
 default = []
 std = []
 doc = []
+save_state_intel = ["patina/save_state_intel"]
+save_state_amd = ["patina/save_state_amd"]

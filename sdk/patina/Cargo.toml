@@ -81,3 +81,5 @@ serde-with-yaml = ["serde", "dep:serde_yaml"]
 
 unstable = ["unstable-device-path"]
 unstable-device-path = []
+save_state_intel = []
+save_state_amd = []
