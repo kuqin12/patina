@@ -18,6 +18,7 @@ use core::{
 use patina::{
     base::{DEFAULT_CACHE_ATTR, UEFI_PAGE_SIZE, align_up},
     component::service::memory::{AllocationOptions, MemoryManager, PageFree},
+    device_path::walker::{DevicePathWalker, copy_device_path_to_boxed_slice, device_path_node_count},
     efi_types::EfiMemoryType,
     error::EfiError,
     guids,
@@ -32,7 +33,6 @@ use patina::{
     },
     uefi_size_to_pages,
 };
-use patina_internal_device_path::{DevicePathWalker, copy_device_path_to_boxed_slice, device_path_node_count};
 use r_efi::efi;
 
 use crate::{
@@ -1509,7 +1509,6 @@ mod tests {
             hob::{HobList, MemoryAllocationModule, header::MemoryAllocation},
         },
     };
-    use patina_internal_device_path::device_path_node_count;
     use r_efi::{
         efi,
         protocols::device_path::{End, Hardware, Media, TYPE_END, TYPE_HARDWARE, TYPE_MEDIA},
@@ -3308,6 +3307,8 @@ mod tests {
                 core::mem::size_of::<patina::pi::hob::header::Hob>(),
             )
         });
+
+        let hobs = hobs.leak();
 
         let mut hob_list = HobList::new();
         hob_list.discover_hobs(hobs.as_ptr() as *mut c_void);

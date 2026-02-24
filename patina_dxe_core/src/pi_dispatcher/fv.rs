@@ -6,24 +6,23 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-use core::{
-    ffi::c_void,
-    mem::{self, size_of},
-    num::NonZeroUsize,
-    ptr::NonNull,
-    slice,
-};
+use core::{ffi::c_void, mem::size_of, num::NonZeroUsize, ptr::NonNull, slice};
 
 use alloc::{boxed::Box, collections::BTreeMap};
-use patina::pi::{
-    self,
-    fw_fs::{ffs, fv, fvb},
-    hob,
+use patina::{
+    device_path::{
+        fv_types::{FvMemMapDevicePath, FvPiWgDevicePath},
+        walker::concat_device_path_to_boxed_slice,
+    },
+    pi::{
+        self,
+        fw_fs::{ffs, fv, fvb},
+        hob,
+    },
 };
 
 use patina::error::EfiError;
 use patina_ffs::{file::FileRef, section::SectionExtractor, volume::VolumeRef};
-use patina_internal_device_path::concat_device_path_to_boxed_slice;
 use r_efi::efi::{self, MEMORY_MAPPED_IO};
 
 use crate::{
@@ -416,31 +415,9 @@ impl<P: PlatformInfo> FvProtocolData<P> {
             }
             None => {
                 // Construct FvMemMapDevicePath
-                let device_path = FvMemMapDevicePath {
-                    mem_map_device_path: MemMapDevicePath {
-                        header: efi::protocols::device_path::Protocol {
-                            r#type: efi::protocols::device_path::TYPE_HARDWARE,
-                            sub_type: efi::protocols::device_path::Hardware::SUBTYPE_MMAP,
-                            length: [
-                                (mem::size_of::<MemMapDevicePath>() & 0xff) as u8,
-                                ((mem::size_of::<MemMapDevicePath>() >> 8) & 0xff) as u8,
-                            ],
-                        },
-                        memory_type: MEMORY_MAPPED_IO,
-                        starting_address: base_address,
-                        ending_address: base_address.saturating_add(fv.size()),
-                    },
-                    end_dev_path: efi::protocols::device_path::End {
-                        header: efi::protocols::device_path::Protocol {
-                            r#type: efi::protocols::device_path::TYPE_END,
-                            sub_type: efi::protocols::device_path::End::SUBTYPE_ENTIRE,
-                            length: [
-                                (mem::size_of::<efi::protocols::device_path::End>() & 0xff) as u8,
-                                ((mem::size_of::<efi::protocols::device_path::End>() >> 8) & 0xff) as u8,
-                            ],
-                        },
-                    },
-                };
+                let device_path =
+                    FvMemMapDevicePath::new(MEMORY_MAPPED_IO, base_address, base_address.saturating_add(fv.size()));
+
                 Box::into_raw(Box::new(device_path)) as *mut c_void
             }
         };
@@ -889,71 +866,6 @@ impl<P: PlatformInfo> FvProtocolData<P> {
     }
 }
 
-//Firmware Volume device path structures and functions
-#[repr(C)]
-struct MemMapDevicePath {
-    header: efi::protocols::device_path::Protocol,
-    memory_type: u32,
-    starting_address: u64,
-    ending_address: u64,
-}
-
-#[repr(C)]
-struct FvMemMapDevicePath {
-    mem_map_device_path: MemMapDevicePath,
-    end_dev_path: efi::protocols::device_path::End,
-}
-
-#[repr(C)]
-struct MediaFwVolDevicePath {
-    header: efi::protocols::device_path::Protocol,
-    name: efi::Guid,
-}
-
-#[repr(C)]
-struct FvPiWgDevicePath {
-    fv_dev_path: MediaFwVolDevicePath,
-    end_dev_path: efi::protocols::device_path::End,
-}
-
-impl FvPiWgDevicePath {
-    // instantiate a new FvPiWgDevicePath for a Firmware Volume
-    fn new_fv(fv_name: efi::Guid) -> Self {
-        Self::new_worker(fv_name, efi::protocols::device_path::Media::SUBTYPE_PIWG_FIRMWARE_VOLUME)
-    }
-    // instantiate a new FvPiWgDevicePath for a Firmware File
-    fn new_file(file_name: efi::Guid) -> Self {
-        Self::new_worker(file_name, efi::protocols::device_path::Media::SUBTYPE_PIWG_FIRMWARE_FILE)
-    }
-    // instantiate a new FvPiWgDevicePath with the given sub-type
-    fn new_worker(name: efi::Guid, sub_type: u8) -> Self {
-        FvPiWgDevicePath {
-            fv_dev_path: MediaFwVolDevicePath {
-                header: efi::protocols::device_path::Protocol {
-                    r#type: efi::protocols::device_path::TYPE_MEDIA,
-                    sub_type,
-                    length: [
-                        (mem::size_of::<MediaFwVolDevicePath>() & 0xff) as u8,
-                        ((mem::size_of::<MediaFwVolDevicePath>() >> 8) & 0xff) as u8,
-                    ],
-                },
-                name,
-            },
-            end_dev_path: efi::protocols::device_path::End {
-                header: efi::protocols::device_path::Protocol {
-                    r#type: efi::protocols::device_path::TYPE_END,
-                    sub_type: efi::protocols::device_path::End::SUBTYPE_ENTIRE,
-                    length: [
-                        (mem::size_of::<efi::protocols::device_path::End>() & 0xff) as u8,
-                        ((mem::size_of::<efi::protocols::device_path::End>() >> 8) & 0xff) as u8,
-                    ],
-                },
-            },
-        }
-    }
-}
-
-/// Returns a device path for the file specified by the given fv_handle and filename GUID.
 pub fn device_path_bytes_for_fv_file(fv_handle: efi::Handle, file_name: efi::Guid) -> Result<Box<[u8]>, efi::Status> {
     let fv_device_path = PROTOCOL_DB.get_interface_for_handle(fv_handle, efi::protocols::device_path::PROTOCOL_GUID)?;
     let file_node = &FvPiWgDevicePath::new_file(file_name);

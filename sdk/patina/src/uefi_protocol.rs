@@ -7,10 +7,8 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-#[cfg(feature = "unstable-device-path")]
-pub mod device_path;
-
 pub mod decompress;
+#[cfg(any(test, feature = "alloc"))]
 pub mod performance_measurement;
 pub mod status_code;
 
