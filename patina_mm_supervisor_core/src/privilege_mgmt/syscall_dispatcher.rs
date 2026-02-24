@@ -307,14 +307,6 @@ pub struct SyscallContext {
 pub struct SyscallDispatcher {
     /// Whether the dispatcher has been initialized.
     initialized: AtomicBool,
-    /// Registered Ring 3 handler jump pointer.
-    registered_ring3_jump_pointer: core::sync::atomic::AtomicU64,
-    /// Registered AP Ring 3 jump pointer.
-    reg_ap_ring3_jump_pointer: core::sync::atomic::AtomicU64,
-    /// Registered error report jump pointer.
-    reg_error_report_jump_pointer: core::sync::atomic::AtomicU64,
-    /// User MM System Table pointer.
-    user_mmst: core::sync::atomic::AtomicU64,
 }
 
 impl SyscallDispatcher {
@@ -322,10 +314,6 @@ impl SyscallDispatcher {
     pub const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
-            registered_ring3_jump_pointer: core::sync::atomic::AtomicU64::new(0),
-            reg_ap_ring3_jump_pointer: core::sync::atomic::AtomicU64::new(0),
-            reg_error_report_jump_pointer: core::sync::atomic::AtomicU64::new(0),
-            user_mmst: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -385,10 +373,10 @@ impl SyscallDispatcher {
             SyscallIndex::Wbinvd => self.handle_wbinvd(ctx),
             SyscallIndex::Hlt => self.handle_hlt(ctx),
             SyscallIndex::SaveStateRead => self.handle_save_state_read(ctx),
+            SyscallIndex::LegacyMax => panic!("Invalid syscall index: LegacyMax is not a real syscall"),
             SyscallIndex::AllocPage => self.handle_alloc_page(ctx),
             SyscallIndex::FreePage => self.handle_free_page(ctx),
             SyscallIndex::StartApProc => self.handle_start_ap_proc(ctx),
-            SyscallIndex::LegacyMax => panic!("Invalid syscall index: LegacyMax is not a real syscall"),
             SyscallIndex::SaveStateRead2 => self.handle_save_state_read2(ctx),
             SyscallIndex::MmMemoryUnblocked => self.handle_mm_memory_unblocked(ctx),
             SyscallIndex::MmIsCommBuffer => self.handle_mm_is_comm_buffer(ctx),

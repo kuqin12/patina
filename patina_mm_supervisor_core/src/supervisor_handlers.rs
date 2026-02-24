@@ -274,19 +274,19 @@ fn mm_supv_request_handler(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -
     // Dispatch by request type
     let status = match header.request {
         requests::VERSION_INFO => {
-            log::debug!("Processing VERSION_INFO request");
+            log::info!("Processing VERSION_INFO request");
             handle_version_info(comm_buffer, comm_buffer_size)
         }
         requests::FETCH_POLICY => {
-            log::debug!("Processing FETCH_POLICY request");
+            log::info!("Processing FETCH_POLICY request");
             handle_fetch_policy(comm_buffer, comm_buffer_size)
         }
         requests::COMM_UPDATE => {
-            log::debug!("Processing COMM_UPDATE request");
+            log::info!("Processing COMM_UPDATE request");
             handle_comm_update(comm_buffer, comm_buffer_size)
         }
         requests::UNBLOCK_MEM => {
-            log::debug!("Processing UNBLOCK_MEM request");
+            log::info!("Processing UNBLOCK_MEM request");
             handle_unblock_mem(comm_buffer, comm_buffer_size)
         }
         unknown => {
@@ -511,7 +511,7 @@ fn verify_policy_snapshot(
 /// Handle a COMM_UPDATE request.
 ///
 /// Updates the communication buffer address for future SMI entries.
-fn handle_comm_update(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
+fn handle_comm_update(_comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("COMM_UPDATE request");
 
     // We do not support dynamic communication buffer updates in this implementation, because

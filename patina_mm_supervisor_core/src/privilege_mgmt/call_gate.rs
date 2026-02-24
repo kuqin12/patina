@@ -60,33 +60,6 @@ pub struct CallGateDescriptor {
 }
 
 impl CallGateDescriptor {
-    /// Creates a new call gate descriptor.
-    ///
-    /// # Arguments
-    ///
-    /// * `target_offset` - The target code address
-    /// * `target_selector` - The target code segment selector
-    /// * `dpl` - Descriptor Privilege Level (0-3)
-    pub fn new(target_offset: u64, target_selector: u16, dpl: u8) -> Self {
-        Self {
-            offset_low: (target_offset & 0xFFFF) as u16,
-            selector: target_selector,
-            ist: 0,
-            // Type = 0xC (64-bit call gate), P = 1, DPL in bits 6:5
-            type_attr: 0x8C | ((dpl & 0x3) << 5),
-            offset_mid: ((target_offset >> 16) & 0xFFFF) as u16,
-            offset_high: ((target_offset >> 32) & 0xFFFFFFFF) as u32,
-            reserved: 0,
-        }
-    }
-
-    /// Gets the target offset from the descriptor.
-    pub fn get_offset(&self) -> u64 {
-        (self.offset_low as u64)
-            | ((self.offset_mid as u64) << 16)
-            | ((self.offset_high as u64) << 32)
-    }
-
     /// Sets the target offset in the descriptor.
     pub fn set_offset(&mut self, offset: u64) {
         self.offset_low = (offset & 0xFFFF) as u16;
@@ -118,34 +91,6 @@ pub struct TssDescriptor {
 }
 
 impl TssDescriptor {
-    /// Creates a new TSS descriptor.
-    ///
-    /// # Arguments
-    ///
-    /// * `base` - Base address of the TSS
-    /// * `limit` - Size of the TSS minus 1
-    pub fn new(base: u64, limit: u32) -> Self {
-        Self {
-            limit_low: (limit & 0xFFFF) as u16,
-            base_low: (base & 0xFFFF) as u16,
-            base_mid_low: ((base >> 16) & 0xFF) as u8,
-            // Type = 0x9 (64-bit TSS available), P = 1
-            type_attr: 0x89,
-            limit_flags: ((limit >> 16) & 0x0F) as u8,
-            base_mid_high: ((base >> 24) & 0xFF) as u8,
-            base_high: ((base >> 32) & 0xFFFFFFFF) as u32,
-            reserved: 0,
-        }
-    }
-
-    /// Gets the base address from the descriptor.
-    pub fn get_base(&self) -> u64 {
-        (self.base_low as u64)
-            | ((self.base_mid_low as u64) << 16)
-            | ((self.base_mid_high as u64) << 24)
-            | ((self.base_high as u64) << 32)
-    }
-
     /// Sets the base address in the descriptor.
     pub fn set_base(&mut self, base: u64) {
         self.base_low = (base & 0xFFFF) as u16;

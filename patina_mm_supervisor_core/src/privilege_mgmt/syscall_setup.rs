@@ -24,12 +24,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-use super::{
-    MSR_IA32_STAR, MSR_IA32_LSTAR, MSR_IA32_EFER,
-    MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
-    LONG_CS_R0, LONG_CS_R3_PH, EFER_SCE,
-    PrivilegeError,
-};
+use super::PrivilegeError;
 
 // ============================================================================
 // Error Types

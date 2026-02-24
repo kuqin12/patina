@@ -45,6 +45,8 @@
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![cfg(target_arch = "x86_64")]
 #![feature(coverage_attribute)]
+
+#![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 
 mod cpu;
@@ -85,7 +87,7 @@ use core::{
 };
 
 use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
-use patina_paging::{MemoryAttributes, PageTable, PagingType, x64::X64PageTable};
+use patina_paging::{MemoryAttributes, PageTable, PagingType, x64::{X64PageTable, disable_write_protection, enable_write_protection}};
 use r_efi::efi;
 
 use patina_mm_policy::{walk_page_table, MemDescriptorV1_0};
@@ -113,6 +115,56 @@ pub const MM_SUPERVISOR_USER_GUID: efi::Guid = efi::Guid::from_fields(
     0x13,
     &[0xab, 0xce, 0x21, 0xb0, 0x2b, 0xce],
 );
+
+// GUID for gMmCommonRegionHobGuid
+// { 0xd4ffc718, 0xfb82, 0x4274, { 0x9a, 0xfc, 0xaa, 0x8b, 0x1e, 0xef, 0x52, 0x93 } }
+pub const MM_COMMON_REGION_HOB_GUID: efi::Guid = efi::Guid::from_fields(
+    0xd4ffc718,
+    0xfb82,
+    0x4274,
+    0x9a,
+    0xfc,
+    &[0xaa, 0x8b, 0x1e, 0xef, 0x52, 0x93],
+);
+
+/// MM Common Region HOB Data Structure
+///
+/// This structure contains information about the common memory region used by the MM Supervisor.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct MmCommonRegionHobData {
+    /// Type of the common region, must be 0 to represent the MM Supervisor communication buffer region
+    pub region_type: u64,
+    /// Base address of the supervisor communication buffer region
+    pub addr: u64,
+    /// Number of pages in the supervisor communication buffer region
+    pub number_of_pages: u64,
+}
+
+// GUID for gMmCommBufferHobGuid
+// { 0x6c2a2520, 0x0131, 0x4aee, { 0xa7, 0x50, 0xcc, 0x38, 0x4a, 0xac, 0xe8, 0xc6 }}
+pub const MM_COMM_BUFFER_HOB_GUID: efi::Guid = efi::Guid::from_fields(
+    0x6c2a2520,
+    0x0131,
+    0x4aee,
+    0xa7,
+    0x50,
+    &[0xcc, 0x38, 0x4a, 0xac, 0xe8, 0xc6],
+);
+
+/// MM Common Buffer HOB Data Structure
+///
+/// This structure contains information about the common memory buffer used by the MM Supervisor.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct MmCommonBufferHobData {
+    /// Physical start address of the common region
+    pub physical_start: u64,
+    /// Number of pages in the supervisor communication buffer region
+    pub number_of_pages: u64,
+    /// Point to MM_COMM_BUFFER_STATUS structure.
+    pub status_buffer: u64,
+}
 
 // GUID for gMmSupervisorPassDownHobGuid
 // { 0x3f2d2d1a, 0x7c6a, 0x4e2e, { 0x91, 0x2e, 0x5c, 0x4f, 0x5b, 0x8c, 0x2a, 0x9d } }
@@ -148,44 +200,12 @@ pub struct MmSupvPassDownHobData {
     pub mm_supv_cpu_private: u64,
     /// Size of MM Supervisor CPU private data
     pub mm_supv_cpu_private_size: u64,
-    /// MM Supervisor MP sync data base address
-    pub mm_supv_mp_sync_data: u64,
-    /// Size of MM Supervisor MP sync data
-    pub mm_supv_mp_sync_data_size: u64,
-    /// MM Supervisor communication buffer base address
-    pub mm_supv_comm_buffer: u64,
-    /// MM Supervisor internal communication buffer base address
-    pub mm_supv_comm_buffer_internal: u64,
-    /// Size of MM Supervisor communication buffer
-    pub mm_supv_comm_buffer_size: u64,
-    /// MM User communication buffer base address
-    pub mm_user_comm_buffer: u64,
-    /// MM User internal communication buffer base address
-    pub mm_user_comm_buffer_internal: u64,
-    /// Size of MM User communication buffer
-    pub mm_user_comm_buffer_size: u64,
-    /// MM Supervisor status buffer base address
-    pub mm_supv_status_buffer: u64,
-    /// MM Supervisor to User buffer base address
-    pub mm_supv_to_user_buffer: u64,
-    /// Size of MM Supervisor to User buffer
-    pub mm_supv_to_user_buffer_size: u64,
-    /// MM Supervisor GDT buffer base address
-    pub mm_supv_gdt_buffer: u64,
-    /// Size of MM Supervisor GDT buffer
-    pub mm_supv_gdt_buffer_size: u64,
-    /// Step size of MM Supervisor GDT buffer per CPU
-    pub mm_supv_gdt_step_size: u64,
     /// MM Initialized buffer base address
     pub mm_initialized_buffer: u64,
     /// MM Supervisor firmware policy buffer base address
     pub mm_supv_firmware_policy_buffer: u64,
     /// Size of MM Supervisor firmware policy buffer
     pub mm_supv_firmware_policy_buffer_size: u64,
-    /// MM Supervisor memory policy buffer base address
-    pub mm_supv_memory_policy_buffer: u64,
-    /// Size of MM Supervisor memory policy buffer
-    pub mm_supv_memory_policy_buffer_size: u64,
     /// Size of the MMI entry point structure (for validating against expected size in supervisor)
     pub mmi_entrypoint_size: u64,
     /// Base address of the BSP MM
@@ -197,14 +217,18 @@ pub struct MmSupvPassDownHobData {
 pub enum PolicyInitError {
     /// The HOB list pointer is null.
     NullHobList,
-    /// PassDown HOB not found.
-    PassDownHobNotFound,
+    /// Some HOB not found.
+    HobNotFound,
     /// Invalid PassDown HOB revision.
     InvalidRevision { found: u32, expected: u32 },
     /// Firmware policy buffer is null or empty.
     NullFirmwarePolicyBuffer,
     /// Invalid policy data.
     InvalidPolicyData,
+    /// Memory allocation failed for policy buffers.
+    MemoryAllocationFailed,
+    /// One or more communication buffers are not properly initialized.
+    MissingCommunicationBuffer,
 }
 
 use spin::{Mutex, Once};
@@ -295,25 +319,6 @@ fn page_align_range(address: u64, size: u64) -> (u64, u64) {
     let end = address.saturating_add(size);
     let aligned_end = end.saturating_add(PAGE_MASK) & !PAGE_MASK;
     (aligned_start, aligned_end.saturating_sub(aligned_start))
-}
-
-/// Queries the page table to determine whether an address is mapped and accessible.
-///
-/// The address and size are page-aligned before querying (rounded down / up respectively).
-///
-/// Returns `Ok(true)` if the address is mapped (regardless of privilege level),
-/// `Ok(false)` if the page table is not initialized, or `Err(PtError)` if the
-/// query fails (e.g., unmapped address).
-pub(crate) fn is_address_mapped(address: u64, size: u64) -> Result<bool, patina_paging::PtError> {
-    let (aligned_addr, aligned_size) = page_align_range(address, size);
-    let page_table = PAGE_TABLE.lock();
-    match page_table.as_ref() {
-        Some(pt) => {
-            pt.query_memory_region(aligned_addr, aligned_size)?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
 }
 
 /// Queries the page table to determine the ownership (user vs supervisor) of an address.
@@ -1245,6 +1250,14 @@ where
                 .ok_or(PolicyInitError::NullHobList)?
         };
 
+        let mut supv_comm_buffer = 0 as u64;
+        let mut supv_comm_buffer_size = 0 as u64;
+        let mut supv_comm_buffer_internal  = 0 as u64;
+        let mut user_comm_buffer = 0 as u64;
+        let mut user_comm_buffer_size = 0 as u64;
+        let mut user_comm_buffer_internal = 0 as u64;
+        let mut status_buffer = 0 as u64;
+
         let hob = Hob::Handoff(hob_list_info);
 
         // Walk through HOBs to find the PassDown HOB
@@ -1272,19 +1285,8 @@ where
                     let mm_initialized_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_initialized_buffer).read() };
                     let firmware_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer).read() };
                     let firmware_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_firmware_policy_buffer_size).read() };
-                    let memory_policy_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer).read() };
-                    let memory_policy_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_memory_policy_buffer_size).read() };
 
                     // Extract communication buffer pointers
-                    let supv_comm_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer).read() };
-                    let supv_comm_buffer_internal = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer_internal).read() };
-                    let supv_comm_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_comm_buffer_size).read() };
-                    let user_comm_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer).read() };
-                    let user_comm_buffer_internal = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer_internal).read() };
-                    let user_comm_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_user_comm_buffer_size).read() };
-                    let status_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_status_buffer).read() };
-                    let supv_to_user_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supv_to_user_buffer).read() };
-                    let supv_to_user_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supv_to_user_buffer_size).read() };
                     let cpl3_stack_buffer = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_stack_base).read() };
                     let cpl3_stack_buffer_size = unsafe { core::ptr::addr_of!(pass_down.mm_supervisor_cpl3_per_core_stack_size).read() };
                     let mmi_entry_size = unsafe { core::ptr::addr_of!(pass_down.mmi_entrypoint_size).read() };
@@ -1331,34 +1333,10 @@ where
                         log::warn!("SMM CPU Private data pointer is null in PassDown HOB");
                     }
 
-                    // Store communication buffer configuration.
-                    COMM_BUFFER_CONFIG.call_once(|| CommBufferConfig {
-                        supv_comm_buffer,
-                        supv_comm_buffer_internal,
-                        supv_comm_buffer_size,
-                        user_comm_buffer,
-                        user_comm_buffer_internal,
-                        user_comm_buffer_size,
-                        status_buffer,
-                        supv_to_user_buffer,
-                        supv_to_user_buffer_size,
-                    });
-                    log::info!(
-                        "Comm buffers: supv=0x{:x}/0x{:x} size=0x{:x}, user=0x{:x}/0x{:x} size=0x{:x}, status=0x{:x}",
-                        supv_comm_buffer, supv_comm_buffer_internal, supv_comm_buffer_size,
-                        user_comm_buffer, user_comm_buffer_internal, user_comm_buffer_size,
-                        status_buffer
-                    );
-
                     log::info!(
                         "PassDown HOB: FirmwarePolicyBuffer=0x{:x}, Size=0x{:x}",
                         firmware_policy_buffer,
                         firmware_policy_buffer_size
-                    );
-                    log::info!(
-                        "PassDown HOB: MemoryPolicyBuffer=0x{:x}, Size=0x{:x}",
-                        memory_policy_buffer,
-                        memory_policy_buffer_size
                     );
 
                     // Validate firmware policy buffer
@@ -1371,6 +1349,12 @@ where
 
                     // Initialize the policy gate with the firmware policy buffer
                     let policy_ptr = firmware_policy_buffer as *const u8;
+                    // allocate one page for the memory policy buffer which will be filled in by walk_page_table
+                    let memory_policy_buffer =
+                        mm_mem::PAGE_ALLOCATOR.allocate_pages(1).map_err(|e| {
+                            log::error!("Failed to allocate page for memory policy buffer: {:?}", e);
+                            PolicyInitError::MemoryAllocationFailed
+                        })?;
                     // SAFETY: We validated that policy_ptr is non-null above and comes from
                     // the PassDown HOB which is set up by the MM IPL.
                     match unsafe { patina_mm_policy::PolicyGate::new(policy_ptr) } {
@@ -1382,7 +1366,7 @@ where
                             // Configure the memory policy buffer on the gate so that
                             // take_snapshot / verify_snapshot / fetch_n_update_policy
                             // can use it.
-                            let mem_policy_max_count = memory_policy_buffer_size as usize
+                            let mem_policy_max_count = PAGE_SIZE as usize
                                 / core::mem::size_of::<MemDescriptorV1_0>();
                             gate.set_memory_policy_buffer(
                                 memory_policy_buffer as *mut MemDescriptorV1_0,
@@ -1417,7 +1401,7 @@ where
                         walk_page_table(
                             cr3,
                             memory_policy_buffer as *mut MemDescriptorV1_0,
-                            memory_policy_buffer_size as usize,
+                            PAGE_SIZE as usize,
                             |base, size| is_buffer_inside_mmram(base, size), // Your MMRAM check
                         )
                     };
@@ -1445,14 +1429,176 @@ where
                     }
 
                     log::info!("Generated {} memory policy descriptors", count.unwrap_or(0));
+                } else if guid_hob.name == MM_COMMON_REGION_HOB_GUID {
+                    // This is a hob describing the supervisor communication region (user goes through a different one now)
+                    log::info!("Found MM Common Region HOB");
 
-                    return Ok(());
+                    // Cast to comm buffer HOB data structure
+                    let supv_buffer_hob = unsafe { &*(data.as_ptr() as *const MmCommonRegionHobData) };
+                    supv_comm_buffer = unsafe { core::ptr::addr_of!(supv_buffer_hob.addr).read() };
+
+                    let supv_comm_buffer_pages = unsafe { core::ptr::addr_of!(supv_buffer_hob.number_of_pages).read() };
+                    // safe multiplication with checked arithmetic to prevent overflow
+                    supv_comm_buffer_size = supv_comm_buffer_pages.checked_mul(PAGE_SIZE as u64).unwrap_or_else(|| {
+                        panic!(
+                            "Invalid supervisor common buffer size: {} pages * {} page size overflows",
+                            supv_comm_buffer_pages, PAGE_SIZE
+                        );
+                    });
+
+                    // Check to see if this region is outside of MMRAM and has the supervisor/read/write attribute
+                    if !is_buffer_inside_mmram(supv_comm_buffer, supv_comm_buffer_size) {
+                        match query_address_ownership(supv_comm_buffer, supv_comm_buffer_size) {
+                            Some(PageOwnership::User) => {
+                                panic!(
+                                    "Supervisor common buffer at 0x{:016x}-0x{:016x} is not marked as supervisor-owned",
+                                    supv_comm_buffer,
+                                    supv_comm_buffer + supv_comm_buffer_size
+                                );
+                            },
+                            Some(PageOwnership::Supervisor) => {
+                                // Do nothing
+                            },
+                            None => {
+                                panic!(
+                                    "Failed to query page ownership for supervisor common buffer at 0x{:016x}",
+                                    supv_comm_buffer
+                                );
+                            }
+                        };
+                    }
+
+                    // All checked out, make a copy of this supervisor to be used when handling incoming requests
+                    supv_comm_buffer_internal = mm_mem::PAGE_ALLOCATOR.allocate_pages_with_type(
+                        supv_comm_buffer_pages as usize,
+                        mm_mem::AllocationType::Supervisor,
+                    ).map_err(|e| {
+                        log::error!("Failed to allocate internal supervisor common buffer: {:?}", e);
+                        PolicyInitError::MemoryAllocationFailed
+                    })?;
+                } else if guid_hob.name == MM_COMM_BUFFER_HOB_GUID {
+                    // This is a hob describing the communication buffer
+                    log::info!("Found MM Communication Buffer HOB");
+
+                    // Cast to comm buffer HOB data structure
+                    let comm_buffer_hob = data.as_ptr() as *mut MmCommonBufferHobData;
+                    user_comm_buffer = unsafe { core::ptr::addr_of!((*comm_buffer_hob).physical_start).read() };
+
+                    let user_comm_buffer_pages = unsafe { core::ptr::addr_of!((*comm_buffer_hob).number_of_pages).read() };
+                    // safe multiplication with checked arithmetic to prevent overflow
+                    user_comm_buffer_size = user_comm_buffer_pages.checked_mul(PAGE_SIZE as u64).unwrap_or_else(|| {
+                        panic!(
+                            "Invalid user common buffer size: {} pages * {} page size overflows",
+                            user_comm_buffer_pages, PAGE_SIZE
+                        );
+                    });
+
+                    // Check to see if this region is outside of MMRAM and has the supervisor/read/write attribute
+                    if !is_buffer_inside_mmram(user_comm_buffer, user_comm_buffer_size) {
+                        match query_address_ownership(user_comm_buffer, user_comm_buffer_size) {
+                            Some(PageOwnership::User) => {
+                                panic!(
+                                    "User common buffer at 0x{:016x}-0x{:016x} is not marked as user-owned",
+                                    user_comm_buffer,
+                                    user_comm_buffer + user_comm_buffer_size
+                                );
+                            },
+                            Some(PageOwnership::Supervisor) => {
+                                // Do nothing
+                            },
+                            None => {
+                                panic!(
+                                    "Failed to query page ownership for user common buffer at 0x{:016x}",
+                                    user_comm_buffer
+                                );
+                            }
+                        };
+                    }
+
+                    status_buffer = unsafe { core::ptr::addr_of!((*comm_buffer_hob).status_buffer).read() };
+
+                    // Validate that the status buffer is also within the supervisor common buffer region (so that the user do not have direct access)
+                    if !is_buffer_inside_mmram(status_buffer, core::mem::size_of::<MmCommBufferStatus>() as u64) {
+                        match query_address_ownership(status_buffer, core::mem::size_of::<MmCommBufferStatus>() as u64) {
+                            Some(PageOwnership::User) => {
+                                panic!(
+                                    "User common buffer at 0x{:016x}-0x{:016x} is not marked as user-exposed",
+                                    user_comm_buffer,
+                                    user_comm_buffer + user_comm_buffer_size
+                                );
+                            },
+                            Some(PageOwnership::Supervisor) => {
+                                // Do nothing
+                            },
+                            None => {
+                                panic!(
+                                    "Failed to query page ownership for status buffer at 0x{:016x}",
+                                    status_buffer
+                                );
+                            }
+                        };
+                    }
+
+                    // All checked out, make a copy of this buffer to be used when handling incoming requests
+                    user_comm_buffer_internal = mm_mem::PAGE_ALLOCATOR.allocate_pages_with_type(
+                        user_comm_buffer_pages as usize,
+                        mm_mem::AllocationType::User,
+                    ).map_err(|e| {
+                        log::error!("Failed to allocate internal user common buffer: {:?}", e);
+                        PolicyInitError::MemoryAllocationFailed
+                    })?;
+
+                    // TODO: HACKHACK: this updates the hob passed to user module with the internal buffer address, which is a bit gross but it works for now.
+                    // SAFETY: We have exclusive access to the HOB data structure at this point during initialization, and we're just updating the physical_start field to point to our internal buffer copy.
+                    unsafe {
+                        // Disable page protection to allow writing to the HOB data structure if needed
+                        let original_cr0 = disable_write_protection();
+
+                        core::ptr::write_volatile(
+                            core::ptr::addr_of_mut!((*comm_buffer_hob).physical_start),
+                            user_comm_buffer_internal
+                        );
+
+                        // Restore original CR0 value to re-enable page protection
+                        enable_write_protection(original_cr0);
+                    }
                 }
             }
         }
 
-        log::error!("PassDown HOB not found in HOB list");
-        Err(PolicyInitError::PassDownHobNotFound)
+        // allocate one page for the buffer that the supervisor will use to send messages to the user module
+        let supv_to_user_buffer = mm_mem::PAGE_ALLOCATOR.allocate_pages_with_type(1, mm_mem::AllocationType::User).map_err(|e| {
+            log::error!("Failed to allocate page for supervisor-to-user buffer: {:?}", e);
+            PolicyInitError::MemoryAllocationFailed
+        })?;
+
+        // At this point, none of the following buffers may be zero.
+        if supv_comm_buffer == 0 || user_comm_buffer == 0 || status_buffer == 0 || supv_to_user_buffer == 0 {
+            log::error!("One or more communication buffers are not properly initialized");
+            return Err(PolicyInitError::MissingCommunicationBuffer);
+        }
+
+        // Store communication buffer configuration.
+        COMM_BUFFER_CONFIG.call_once(|| CommBufferConfig {
+            supv_comm_buffer,
+            supv_comm_buffer_internal,
+            supv_comm_buffer_size,
+            user_comm_buffer,
+            user_comm_buffer_internal,
+            user_comm_buffer_size,
+            status_buffer,
+            supv_to_user_buffer,
+            supv_to_user_buffer_size: PAGE_SIZE as u64,
+        });
+        log::info!(
+            "Comm buffers: supv=0x{:x}/0x{:x} size=0x{:x}, user=0x{:x}/0x{:x} size=0x{:x}, status=0x{:x}",
+            supv_comm_buffer, supv_comm_buffer_internal, supv_comm_buffer_size,
+            user_comm_buffer, user_comm_buffer_internal, user_comm_buffer_size,
+            status_buffer
+        );
+
+
+        Ok(())
     }
 
     /// The main request serving loop for the BSP.
@@ -1822,16 +1968,6 @@ where
                 return_buffer_size,
             };
             core::ptr::write_volatile(status_ptr, updated);
-            // Dump the content from the status_ptr
-            let dumped_status = core::ptr::read_volatile(status_ptr);
-            log::info!("written to supervisor status buffer at 0x{:x}", status_ptr as usize);
-            log::info!(
-                "Updated supervisor status buffer: is_comm_buffer_valid={}, talk_to_supervisor={}, return_status=0x{:x}, return_buffer_size=0x{:x}",
-                dumped_status.is_comm_buffer_valid,
-                dumped_status.talk_to_supervisor,
-                dumped_status.return_status,
-                dumped_status.return_buffer_size
-            );
         }
     }
 

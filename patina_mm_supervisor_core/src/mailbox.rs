@@ -166,7 +166,7 @@ impl ApMailbox {
     }
 
     /// Gets the current state of the mailbox.
-    pub fn state(&self) -> MailboxState {
+    fn state(&self) -> MailboxState {
         self.state.load(Ordering::Acquire).into()
     }
 
