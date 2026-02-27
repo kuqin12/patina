@@ -1,0 +1,470 @@
+//! MM User Core
+//!
+//! A pure Rust implementation of the MM User Core for standalone MM mode environments.
+//!
+//! This crate provides the core functionality for a user-mode (Ring 3) MM module that is
+//! invoked by the MM Supervisor Core via privilege demotion. It implements the equivalent
+//! functionality of the C `StandaloneMmCore` — discovering drivers from HOBs, evaluating
+//! dependency expressions, dispatching drivers, and managing MMI handlers.
+//!
+//! ## Architecture
+//!
+//! The user core is invoked by the supervisor with three command types:
+//! - **StartUserCore**: One-time initialization. Walk HOBs to discover drivers and dispatch them.
+//! - **UserRequest**: Runtime MMI dispatch. Parse the communication buffer and invoke registered handlers.
+//! - **UserApProcedure**: Execute a procedure on behalf of an AP.
+//!
+//! ## Entry Protocol
+//!
+//! The supervisor calls the user core entry point with three arguments:
+//! - `arg1` (`u64`): Command type (0 = StartUserCore, 1 = UserRequest, 2 = UserApProcedure)
+//! - `arg2` (`u64`): Command-specific data pointer
+//! - `arg3` (`u64`): Command-specific size or auxiliary data
+//!
+//! ## Memory Model
+//!
+//! This crate runs in Ring 3 (user mode). It does not have direct access to supervisor
+//! resources. All supervisor services are accessed through syscalls.
+//!
+//! ## Example
+//!
+//! ```rust,ignore
+//! use patina_mm_user_core::*;
+//!
+//! struct MyPlatform;
+//!
+//! impl PlatformInfo for MyPlatform {
+//!     const MAX_HANDLERS: usize = 64;
+//! }
+//!
+//! static USER_CORE: MmUserCore<MyPlatform> = MmUserCore::new();
+//! ```
+//!
+//! ## License
+//!
+//! Copyright (c) Microsoft Corporation.
+//!
+//! SPDX-License-Identifier: Apache-2.0
+//!
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![cfg(target_arch = "x86_64")]
+
+extern crate alloc;
+
+pub mod config_table;
+pub mod core_handlers;
+pub mod mm_dispatcher;
+pub mod mm_mem;
+pub mod mm_services;
+pub mod mmi;
+pub mod protocol_db;
+
+use core::{
+    ffi::c_void,
+    mem,
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
+use r_efi::efi;
+use spin::Once;
+
+use crate::{
+    mm_dispatcher::MmDispatcher,
+    mmi::MmiDatabase,
+    protocol_db::ProtocolDatabase,
+};
+
+use core::arch::global_asm;
+
+global_asm!(include_str!("entry_point.asm"));
+
+// =============================================================================
+// GUIDs
+// =============================================================================
+
+/// GUID used in `MemoryAllocationModule` HOBs to identify MM Supervisor module allocations.
+///
+/// `gMmSupervisorHobMemoryAllocModuleGuid`
+pub const MM_SUPERVISOR_HOB_MEMORY_ALLOC_MODULE_GUID: efi::Guid = efi::Guid::from_fields(
+    0x3efafe72,
+    0x3dbf,
+    0x4341,
+    0xad,
+    0x04,
+    &[0x1c, 0xb6, 0xe8, 0xb6, 0x8e, 0x5e],
+);
+
+/// GUID identifying the MM User Core module itself.
+///
+/// `gMmSupervisorUserGuid`
+pub const MM_SUPERVISOR_USER_GUID: efi::Guid = efi::Guid::from_fields(
+    0x30d1cc3f,
+    0xc1db,
+    0x41ed,
+    0xb1,
+    0x13,
+    &[0xab, 0xce, 0x21, 0xb0, 0x2b, 0xce],
+);
+
+/// GUID identifying the MM Supervisor Core module (to be skipped during driver discovery).
+///
+/// `gMmSupervisorCoreGuid`
+pub const MM_SUPERVISOR_CORE_GUID: efi::Guid = efi::Guid::from_fields(
+    0x4e4c89dc,
+    0xa452,
+    0x4b6b,
+    0xb1,
+    0x83,
+    &[0xf1, 0x6a, 0x2a, 0x22, 0x37, 0x33],
+);
+
+/// GUID for depex data HOBs paired with driver `MemoryAllocationModule` HOBs.
+///
+/// `gMmSupervisorDepexHobGuid`
+pub const MM_SUPERVISOR_DEPEX_HOB_GUID: efi::Guid = efi::Guid::from_fields(
+    0xb17f0049,
+    0xaffd,
+    0x4530,
+    0xac,
+    0xd6,
+    &[0xe2, 0x45, 0xe1, 0x9d, 0xea, 0xf1],
+);
+
+/// Mirrors the MM_SUPV_DEPEX_HOB_DATA structure defined in the supervisor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DepexHobData {
+    pub name: efi::Guid, // Protocol GUID
+    pub depex_expression_size: u64,
+    pub depex_expression: [u8; 0],
+}
+
+/// GUID for the MM communication buffer HOB.
+///
+/// `gMmCommBufferHobGuid`
+pub use patina_internal_mm_common::MM_COMM_BUFFER_HOB_GUID;
+
+
+
+// Re-export shared MM types from the common crate.
+pub use patina_internal_mm_common::{
+    EfiMmEntryContext, MmCommBufferStatus, EfiMmCommunicateHeader,
+    MmCommonBufferHobData, UserCommandType,
+};
+
+// =============================================================================
+// PlatformInfo Trait
+// =============================================================================
+
+/// Platform configuration trait for the MM User Core.
+///
+/// Platforms implement this trait to provide compile-time constants that
+/// configure the user core's internal data structures.
+pub trait PlatformInfo: 'static {
+    /// Maximum number of MMI handlers that can be registered.
+    const MAX_HANDLERS: usize;
+}
+
+// =============================================================================
+// MmUserCore
+// =============================================================================
+
+/// Static reference to the user core instance.
+static __USER_CORE: Once<NonZeroUsize> = Once::new();
+
+/// Useful for offline inspection (like debugging) to determine core version.
+#[used]
+static MM_USER_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The MM User Core responsible for driver dispatch and MMI handling in user mode.
+///
+/// This struct is generic over [`PlatformInfo`], which provides platform-specific
+/// compile-time constants. Create a static instance and call [`rust_main`](MmUserCore::rust_main)
+/// from the binary entry point.
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// static USER_CORE: MmUserCore<MyPlatform> = MmUserCore::new();
+///
+/// #[unsafe(export_name = "efi_main")]
+/// pub extern "efiapi" fn _start(arg1: u64, arg2: u64, arg3: u64) -> u64 {
+///     USER_CORE.rust_main(arg1, arg2, arg3)
+/// }
+/// ```
+pub struct MmUserCore<P: PlatformInfo> {
+    /// The MMI handler database.
+    pub mmi_db: MmiDatabase,
+    /// The protocol/handle database (for depex evaluation and driver services).
+    pub protocol_db: ProtocolDatabase,
+    /// The driver dispatcher.
+    pub dispatcher: MmDispatcher,
+    /// Whether the core has completed initialization.
+    initialized: AtomicBool,
+    /// Phantom data for the platform type.
+    _phantom: core::marker::PhantomData<P>,
+}
+
+// SAFETY: MmUserCore is designed to be shared across threads with proper synchronization.
+unsafe impl<P: PlatformInfo> Send for MmUserCore<P> {}
+unsafe impl<P: PlatformInfo> Sync for MmUserCore<P> {}
+
+impl<P: PlatformInfo> MmUserCore<P> {
+    /// Creates a new instance of the MM User Core.
+    pub const fn new() -> Self {
+        Self {
+            mmi_db: MmiDatabase::new(),
+            protocol_db: ProtocolDatabase::new(),
+            dispatcher: MmDispatcher::new(),
+            initialized: AtomicBool::new(false),
+            _phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Sets the static user core instance for global access.
+    ///
+    /// Returns true if the address was successfully stored, false if already set.
+    #[must_use]
+    fn set_instance(&'static self) -> bool {
+        let physical_address = NonNull::from_ref(self).expose_provenance();
+        &physical_address == __USER_CORE.call_once(|| physical_address)
+    }
+
+    /// Gets the static MM User Core instance for global access.
+    #[allow(unused)]
+    pub fn instance<'a>() -> &'a Self {
+        // SAFETY: The pointer is guaranteed to be valid as set_instance ensures single initialization.
+        unsafe {
+            NonNull::<Self>::with_exposed_provenance(
+                *__USER_CORE.get().expect("MM User Core is not initialized."),
+            )
+            .as_ref()
+        }
+    }
+
+    /// Main entry point for the MM User Core.
+    ///
+    /// This is called by the supervisor via `invoke_demoted_routine`. The arguments
+    /// correspond to the three parameters passed by the supervisor:
+    ///
+    /// - `arg1`: Command type ([`UserCommandType`])
+    /// - `arg2`: Command-specific data pointer
+    /// - `arg3`: Command-specific size or auxiliary data
+    ///
+    /// Returns 0 on success, or a non-zero status on failure.
+    pub fn entry_point_worker(&'static self, op_code: u64, arg1: u64, arg2: u64) -> u64 {
+        let command = match UserCommandType::try_from(op_code) {
+            Ok(cmd) => cmd,
+            Err(unknown) => {
+                log::error!("Unknown command type: {}", unknown);
+                return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+            }
+        };
+
+        match command {
+            UserCommandType::StartUserCore => {
+                self.handle_start_user_core(arg1 as *const c_void)
+            }
+            UserCommandType::UserRequest => {
+                self.handle_user_request(arg1, arg2)
+            }
+            UserCommandType::UserApProcedure => {
+                self.handle_user_ap_procedure(arg1, arg2)
+            }
+        }
+    }
+
+    /// Handle the `StartUserCore` command.
+    ///
+    /// This is called once during initialization. The supervisor passes the HOB list
+    /// pointer as `arg2`. We:
+    /// 1. Set the static instance
+    /// 2. Walk HOBs to discover the communication buffer
+    /// 3. Walk HOBs to discover MM drivers (MemoryAllocationModule HOBs)
+    /// 4. Read paired depex GuidHobs for each driver
+    /// 5. Evaluate dependency expressions and dispatch drivers in order
+    fn handle_start_user_core(&'static self, hob_list: *const c_void) -> u64 {
+        if !self.set_instance() {
+            log::warn!("MM User Core instance was already set, skipping re-initialization.");
+            return efi::Status::ALREADY_STARTED.as_usize() as u64;
+        }
+
+        if hob_list.is_null() {
+            log::error!("HOB list pointer is null.");
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        log::info!("MM User Core v{} starting initialization...", env!("CARGO_PKG_VERSION"));
+
+        // Enable the heap (syscall page allocator) before doing anything that
+        // requires dynamic allocation (driver discovery, depex parsing, etc.).
+        mm_mem::SYSCALL_PAGE_ALLOCATOR.set_initialized();
+
+        // Parse the HOB list
+        let hob_list_info = unsafe {
+            match (hob_list as *const PhaseHandoffInformationTable).as_ref() {
+                Some(info) => info,
+                None => {
+                    log::error!("Failed to read HOB list header.");
+                    return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+                }
+            }
+        };
+
+        let hob = Hob::Handoff(hob_list_info);
+
+        // Discover communication buffer from HOBs
+        self.discover_comm_buffer(&hob);
+
+        // Initialize the MM System Table (heap-allocated, function pointers
+        // route to the global protocol DB and MMI DB in mm_services).
+        let mm_system_table = mm_services::init_mm_system_table();
+        log::info!("MM System Table initialized at {:p}", mm_system_table);
+
+        // Publish the HOB list as a configuration table entry so dispatched
+        // drivers can locate it via the system table (mirrors the C
+        // `MmInstallConfigurationTable(&gMmCoreMmst, &gEfiHobListGuid, ...)`
+        // call in `InitializeMmHobList`).
+        let status = config_table::GLOBAL_CONFIG_TABLE_DB.install_configuration_table(
+            &patina::guids::HOB_LIST,
+            hob_list as *mut c_void,
+        );
+        if status != efi::Status::SUCCESS {
+            log::error!("Failed to install HOB list configuration table: {:?}", status);
+        }
+
+        // Discover and dispatch MM drivers from HOBs
+        let dispatch_result = self.dispatcher.discover_and_dispatch_drivers(
+            &hob,
+            &self.mmi_db,
+            &self.protocol_db,
+            mm_system_table as *const _ as *const core::ffi::c_void,
+        );
+
+        match dispatch_result {
+            Ok(count) => {
+                log::info!("Successfully dispatched {} MM driver(s).", count);
+            }
+            Err(status) => {
+                log::error!("Driver dispatch failed: {:?}", status);
+                return status.as_usize() as u64;
+            }
+        }
+
+        // Register core MMI handlers (lifecycle events like ready-to-lock,
+        // end-of-DXE, exit-boot-services, etc.).  Matches the C ordering
+        // where handlers are registered after `MmDispatchFvs()`.
+        core_handlers::register_core_mmi_handlers();
+
+        self.initialized.store(true, Ordering::Release);
+        log::info!("MM User Core initialization complete.");
+
+        efi::Status::SUCCESS.as_usize() as u64
+    }
+
+    /// Handle the `UserRequest` command (runtime MMI dispatch).
+    ///
+    /// The supervisor passes a pointer to a buffer containing:
+    /// - `EfiMmEntryContext` (at offset 0)
+    /// - `MmCommBufferStatus` (at offset `arg3`)
+    ///
+    /// For synchronous MMIs, the user communication buffer has been copied to an
+    /// internal buffer by the supervisor. We parse the `EfiMmCommunicateHeader` from
+    /// the internal buffer and dispatch to the appropriate MMI handler.
+    fn handle_user_request(&self, supv_to_user_buffer: u64, context_size: u64) -> u64 {
+        if supv_to_user_buffer == 0 {
+            log::error!("Supervisor-to-user buffer is null.");
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        // Read the EfiMmEntryContext
+        let _entry_context = unsafe {
+            core::ptr::read(supv_to_user_buffer as *const EfiMmEntryContext)
+        };
+
+        // Read MmCommBufferStatus (immediately after the context)
+        let status = unsafe {
+            core::ptr::read(
+                (supv_to_user_buffer as *const u8).add(context_size as usize)
+                    as *const MmCommBufferStatus,
+            )
+        };
+
+        let dispatch_status = if status.is_comm_buffer_valid != 0 {
+            // Synchronous MMI: the supervisor has copied the user communication buffer
+            // to an internal buffer. Dispatch root handlers via the global MMI DB.
+            mm_services::GLOBAL_MMI_DB.mmi_manage(None, core::ptr::null(), core::ptr::null_mut(), core::ptr::null_mut())
+        } else {
+            // Asynchronous MMI (e.g., periodic timer): dispatch root handlers only.
+            mm_services::GLOBAL_MMI_DB.mmi_manage(None, core::ptr::null(), core::ptr::null_mut(), core::ptr::null_mut())
+        };
+
+        // Write back the updated status to the supervisor-to-user buffer
+        let updated_status = MmCommBufferStatus {
+            is_comm_buffer_valid: 0,
+            talk_to_supervisor: 0,
+            return_status: dispatch_status.as_usize() as u64,
+            return_buffer_size: 0,
+        };
+
+        unsafe {
+            core::ptr::write(
+                (supv_to_user_buffer as *mut u8).add(context_size as usize)
+                    as *mut MmCommBufferStatus,
+                updated_status,
+            );
+        }
+
+        efi::Status::SUCCESS.as_usize() as u64
+    }
+
+    /// Handle the `UserApProcedure` command.
+    ///
+    /// The supervisor passes the procedure pointer and argument. We call the procedure
+    /// directly since we're already in user mode.
+    fn handle_user_ap_procedure(&self, procedure: u64, argument: u64) -> u64 {
+        if procedure == 0 {
+            log::error!("AP procedure pointer is null.");
+            return efi::Status::INVALID_PARAMETER.as_usize() as u64;
+        }
+
+        log::trace!("Executing AP procedure at 0x{:016x} with arg 0x{:016x}", procedure, argument);
+
+        // SAFETY: The supervisor has validated the procedure pointer before dispatching.
+        // The procedure follows the EFI AP_PROCEDURE calling convention.
+        type EfiApProcedure = unsafe extern "efiapi" fn(*mut c_void);
+        let proc_fn: EfiApProcedure = unsafe { core::mem::transmute(procedure) };
+        unsafe { proc_fn(argument as *mut c_void) };
+
+        efi::Status::SUCCESS.as_usize() as u64
+    }
+
+    /// Discover the communication buffer address from HOBs.
+    ///
+    /// Looks for a GuidHob with `MM_COMM_BUFFER_HOB_GUID` and extracts the
+    /// `MmCommonBufferHobData` to determine the user communication buffer address.
+    fn discover_comm_buffer(&self, hob: &Hob<'_>) {
+        for current_hob in hob {
+            if let Hob::GuidHob(guid_hob, data) = current_hob {
+                if guid_hob.name == MM_COMM_BUFFER_HOB_GUID {
+                    if data.len() >= mem::size_of::<MmCommonBufferHobData>() {
+                        let buffer_data =
+                            unsafe { &*(data.as_ptr() as *const MmCommonBufferHobData) };
+                        let physical_start =
+                            unsafe { core::ptr::addr_of!(buffer_data.physical_start).read_unaligned() };
+                        let number_of_pages =
+                            unsafe { core::ptr::addr_of!(buffer_data.number_of_pages).read_unaligned() };
+                        log::info!(
+                            "Found MM communication buffer: base=0x{:016x}, pages={}",
+                            physical_start,
+                            number_of_pages,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

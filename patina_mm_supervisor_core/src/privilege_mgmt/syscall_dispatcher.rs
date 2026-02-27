@@ -692,7 +692,7 @@ impl SyscallDispatcher {
             crate::mm_mem::AllocationType::User,
         ) {
             Ok(addr) => {
-                log::info!("ALLOC_PAGE: Allocated {} page(s) at 0x{:x}", page_count, addr);
+                log::trace!("ALLOC_PAGE: Allocated {} page(s) at 0x{:x}", page_count, addr);
                 SyscallResult::success(addr)
             }
             Err(e) => {

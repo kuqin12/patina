@@ -23,6 +23,8 @@ log = { workspace = true }
 patina = { workspace = true }
 patina_adv_logger = { workspace = true }
 patina_internal_cpu = { workspace = true }
+patina_internal_mm_alloc = { workspace = true }
+patina_internal_mm_common = { workspace = true }
 patina_mm_policy = { workspace = true }
 patina_mm = { workspace = true }
 patina_paging = { workspace = true, features = [

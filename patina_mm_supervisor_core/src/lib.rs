@@ -82,6 +82,12 @@ pub use supervisor_handlers::{
     SupervisorMmiHandler, SUPERVISOR_MMI_HANDLERS,
 };
 
+// Re-export shared MM types from the common crate.
+pub use patina_internal_mm_common::{
+    EfiMmEntryContext, MmCommBufferStatus, EfiMmCommunicateHeader,
+    MmCommonBufferHobData, UserCommandType, MM_COMM_BUFFER_HOB_GUID,
+};
+
 use core::{
     arch::{asm, global_asm}, ffi::c_void, num::NonZeroUsize, panic, ptr::NonNull, sync::atomic::{AtomicBool, AtomicU32, Ordering}
 };
@@ -139,31 +145,6 @@ pub struct MmCommonRegionHobData {
     pub addr: u64,
     /// Number of pages in the supervisor communication buffer region
     pub number_of_pages: u64,
-}
-
-// GUID for gMmCommBufferHobGuid
-// { 0x6c2a2520, 0x0131, 0x4aee, { 0xa7, 0x50, 0xcc, 0x38, 0x4a, 0xac, 0xe8, 0xc6 }}
-pub const MM_COMM_BUFFER_HOB_GUID: efi::Guid = efi::Guid::from_fields(
-    0x6c2a2520,
-    0x0131,
-    0x4aee,
-    0xa7,
-    0x50,
-    &[0xcc, 0x38, 0x4a, 0xac, 0xe8, 0xc6],
-);
-
-/// MM Common Buffer HOB Data Structure
-///
-/// This structure contains information about the common memory buffer used by the MM Supervisor.
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct MmCommonBufferHobData {
-    /// Physical start address of the common region
-    pub physical_start: u64,
-    /// Number of pages in the supervisor communication buffer region
-    pub number_of_pages: u64,
-    /// Point to MM_COMM_BUFFER_STATUS structure.
-    pub status_buffer: u64,
 }
 
 // GUID for gMmSupervisorPassDownHobGuid
@@ -390,21 +371,6 @@ static SMM_CPU_PRIVATE: Once<u64> = Once::new();
 /// Returns 0 on success, or an EFI status code on failure.
 pub(crate) static AP_STARTUP_FN: Once<fn(u64, u64, u64) -> u64> = Once::new();
 
-/// MM Communication Buffer Status Structure.
-/// Matches the C structure MM_COMM_BUFFER_STATUS from MmCommBuffer.h
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MmCommBufferStatus {
-    /// Whether the data in the fixed MM communication buffer is valid when entering from non-MM to MM.
-    pub is_comm_buffer_valid: u8, // BOOLEAN in C is u8 in Rust
-    /// The channel used to communicate with MM (true = Supervisor, false = User).
-    pub talk_to_supervisor: u8, // BOOLEAN in C is u8 in Rust
-    /// The return status when returning from MM to non-MM.
-    pub return_status: u64,
-    /// The size in bytes of the output buffer when returning from MM to non-MM.
-    pub return_buffer_size: u64,
-}
-
 /// EFI_SMM_RESERVED_SMRAM_REGION structure.
 ///
 /// Describes a reserved SMRAM region that cannot be used for the SMRAM heap.
@@ -416,32 +382,6 @@ pub struct EfiSmmReservedSmramRegion {
     pub smram_reserved_start: u64,
     /// Number of bytes occupied by the reserved SMRAM area.
     pub smram_reserved_size: u64,
-}
-
-/// EFI_MM_ENTRY_CONTEXT structure.
-///
-/// Processor information and functionality needed by MM Foundation.
-/// Matches the C `EFI_MM_ENTRY_CONTEXT` / `EFI_SMM_ENTRY_CONTEXT` from PI specification.
-///
-/// Layout (x86_64, all fields 8 bytes):
-/// - `mm_startup_this_ap`: Function pointer for `EFI_MM_STARTUP_THIS_AP`
-/// - `currently_executing_cpu`: Index of the processor executing the MM Foundation
-/// - `number_of_cpus`: Total number of possible processors in the platform (1-based)
-/// - `cpu_save_state_size`: Pointer to array of save state sizes per CPU
-/// - `cpu_save_state`: Pointer to array of CPU save state pointers
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct EfiMmEntryContext {
-    /// Function pointer for EFI_MM_STARTUP_THIS_AP.
-    pub mm_startup_this_ap: u64,
-    /// Index of the currently executing CPU.
-    pub currently_executing_cpu: u64,
-    /// Total number of CPUs (1-based).
-    pub number_of_cpus: u64,
-    /// Pointer to array of per-CPU save state sizes.
-    pub cpu_save_state_size: u64,
-    /// Pointer to array of per-CPU save state pointers.
-    pub cpu_save_state: u64,
 }
 
 /// SMM_CPU_PRIVATE_DATA structure.
@@ -495,32 +435,6 @@ pub struct SmmCpuPrivateData {
     pub first_free_token: u64,
 }
 
-/// EFI_MM_COMMUNICATE_HEADER structure.
-///
-/// Communication buffer header used by the MM Communicate protocol.
-/// The data payload immediately follows this header.
-///
-/// Layout:
-/// - `header_guid`: 16 bytes - GUID identifying the handler
-/// - `message_length`: 8 bytes - size of `Data` in bytes (does not include header size)
-///
-/// Note: Although the C definition uses `#pragma pack(1)`, the fields are naturally aligned
-/// (16-byte GUID + 8-byte u64), so `#[repr(C)]` produces an identical layout of 24 bytes.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct EfiMmCommunicateHeader {
-    /// GUID identifying the target handler for this communication.
-    pub header_guid: efi::Guid,
-    /// Size of the data payload in bytes (does not include this header).
-    pub message_length: u64,
-    // Variable-length data follows at offset 24 (0x18)
-}
-
-impl EfiMmCommunicateHeader {
-    /// Size of the header (offset to the start of the data payload).
-    pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
-}
-
 /// Request target derived from MM_COMM_BUFFER_STATUS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestTarget {
@@ -542,16 +456,6 @@ impl From<&MmCommBufferStatus> for RequestTarget {
             RequestTarget::User
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserCommandType {
-    /// Command to initiate the user level core
-    StartUserCore,
-    /// Command to execute a user level request from the supervisor
-    UserRequest,
-    /// Command to implement a user AP procedure
-    UserApProcedure,
 }
 
 
@@ -1705,12 +1609,6 @@ where
             cpu_save_state_size: 0,
             cpu_save_state: 0,
         };
-
-        log::info!(
-            "Built EfiMmEntryContext: currently_executing_cpu={}, number_of_cpus={}",
-            entry_context.currently_executing_cpu,
-            entry_context.number_of_cpus
-        );
 
         // Copy the EfiMmEntryContext + MmCommBufferStatus into the supervisor-to-user
         // data buffer so the user can read processor information after demotion.

@@ -49,6 +49,8 @@ pub mod error;
 pub mod guids;
 pub mod log;
 #[cfg(any(test, feature = "alloc"))]
+pub mod mm_services;
+#[cfg(any(test, feature = "alloc"))]
 pub mod performance;
 pub mod pi;
 #[cfg(any(test, feature = "alloc"))]

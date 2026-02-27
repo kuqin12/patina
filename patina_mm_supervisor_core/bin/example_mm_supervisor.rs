@@ -75,12 +75,12 @@ impl PlatformInfo for ExamplePlatform {
     const MAX_HANDLERS: usize = 32;
 }
 
-/// Flag indicating that advanced logger initialization is complete.
-static ADV_LOGGER_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
-
 // =============================================================================
 // Static Supervisor Instance
 // =============================================================================
+
+/// Flag indicating that advanced logger initialization is complete.
+static ADV_LOGGER_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 /// The static MM Supervisor Core instance.
 ///
