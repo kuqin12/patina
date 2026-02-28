@@ -31,16 +31,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use patina_internal_mm_alloc::{PageAllocError, PageAllocatorBackend, PoolAllocator};
-
-// ============================================================================
-// Syscall Indices (matching SyscallIndex in supervisor)
-// ============================================================================
-
-/// Syscall index for AllocPage.
-const SYSCALL_ALLOC_PAGE: u64 = 0x10004;
-
-/// Syscall index for FreePage.
-const SYSCALL_FREE_PAGE: u64 = 0x10005;
+use patina_internal_mm_common::SyscallIndex;
 
 // ============================================================================
 // AllocateType constants (matching EFI_ALLOCATE_TYPE)
@@ -120,6 +111,20 @@ unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> RawSy
 }
 
 // ============================================================================
+// Communication buffer validation
+// ============================================================================
+
+/// Validate that a given memory range is a valid MM communication buffer by
+/// issuing the `MmIsCommBuffer` syscall to the supervisor.
+///
+/// Returns `true` if the supervisor confirms the range falls entirely within
+/// the user communication buffer region.
+pub fn is_comm_buffer(address: u64, size: u64) -> bool {
+    let result = unsafe { raw_syscall(SyscallIndex::MmIsCommBuffer.as_u64(), address, size, 0) };
+    result.value != 0
+}
+
+// ============================================================================
 // SyscallPageAllocator
 // ============================================================================
 
@@ -173,7 +178,7 @@ impl PageAllocatorBackend for SyscallPageAllocator {
 
         let result = unsafe {
             raw_syscall(
-                SYSCALL_ALLOC_PAGE,
+                SyscallIndex::AllocPage.as_u64(),
                 ALLOCATE_ANY_PAGES,
                 RUNTIME_SERVICES_DATA,
                 num_pages as u64,
@@ -205,7 +210,7 @@ impl PageAllocatorBackend for SyscallPageAllocator {
 
         unsafe {
             raw_syscall(
-                SYSCALL_FREE_PAGE,
+                SyscallIndex::FreePage.as_u64(),
                 addr,
                 num_pages as u64,
                 0,

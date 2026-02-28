@@ -64,7 +64,7 @@ use core::{
     mem,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use patina::pi::hob::{Hob, PhaseHandoffInformationTable};
@@ -167,6 +167,20 @@ pub trait PlatformInfo: 'static {
     /// Maximum number of MMI handlers that can be registered.
     const MAX_HANDLERS: usize;
 }
+
+// =============================================================================
+// Communication Buffer Tracking
+// =============================================================================
+
+/// Base address of the user communication buffer (discovered from HOBs).
+///
+/// The supervisor rewrites the HOB's `physical_start` to point to the internal
+/// (MMRAM-resident, user-accessible) copy of the communication buffer before
+/// invoking `StartUserCore`.
+static COMM_BUFFER_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Size in bytes of the user communication buffer.
+static COMM_BUFFER_SIZE: AtomicU64 = AtomicU64::new(0);
 
 // =============================================================================
 // MmUserCore
@@ -369,11 +383,18 @@ impl<P: PlatformInfo> MmUserCore<P> {
     ///
     /// The supervisor passes a pointer to a buffer containing:
     /// - `EfiMmEntryContext` (at offset 0)
-    /// - `MmCommBufferStatus` (at offset `arg3`)
+    /// - `MmCommBufferStatus` (at offset `context_size`)
     ///
-    /// For synchronous MMIs, the user communication buffer has been copied to an
-    /// internal buffer by the supervisor. We parse the `EfiMmCommunicateHeader` from
-    /// the internal buffer and dispatch to the appropriate MMI handler.
+    /// For synchronous MMIs the supervisor has already copied the external
+    /// communication buffer into an internal (user-accessible) region.  We:
+    /// 1. Validate the buffer via the `MmIsCommBuffer` syscall
+    /// 2. Parse the `EfiMmCommunicateHeader` to extract the handler GUID and data
+    /// 3. Dispatch via `mmi_manage` with the GUID and data pointer
+    ///
+    /// Asynchronous MMIs (timer, etc.) are always dispatched as root-only
+    /// (`mmi_manage(None, …)`).
+    ///
+    /// Mirrors the C `MmEntryPoint` flow in `StandaloneMmCore.c`.
     fn handle_user_request(&self, supv_to_user_buffer: u64, context_size: u64) -> u64 {
         if supv_to_user_buffer == 0 {
             log::error!("Supervisor-to-user buffer is null.");
@@ -386,28 +407,55 @@ impl<P: PlatformInfo> MmUserCore<P> {
         };
 
         // Read MmCommBufferStatus (immediately after the context)
-        let status = unsafe {
+        let comm_status = unsafe {
             core::ptr::read(
                 (supv_to_user_buffer as *const u8).add(context_size as usize)
                     as *const MmCommBufferStatus,
             )
         };
 
-        let dispatch_status = if status.is_comm_buffer_valid != 0 {
-            // Synchronous MMI: the supervisor has copied the user communication buffer
-            // to an internal buffer. Dispatch root handlers via the global MMI DB.
-            mm_services::GLOBAL_MMI_DB.mmi_manage(None, core::ptr::null(), core::ptr::null_mut(), core::ptr::null_mut())
-        } else {
-            // Asynchronous MMI (e.g., periodic timer): dispatch root handlers only.
-            mm_services::GLOBAL_MMI_DB.mmi_manage(None, core::ptr::null(), core::ptr::null_mut(), core::ptr::null_mut())
-        };
+        // ---- Synchronous MMI dispatch ----
+        let mut sync_status = efi::Status::NOT_FOUND;
+        let mut return_buffer_size: u64 = 0;
+
+        let comm_buffer_base = COMM_BUFFER_BASE.load(Ordering::Acquire);
+        let comm_buffer_size = COMM_BUFFER_SIZE.load(Ordering::Acquire);
+
+        if comm_buffer_base != 0 && comm_status.is_comm_buffer_valid != 0 {
+            // Validate the communication buffer via a supervisor syscall.
+            if !mm_mem::is_comm_buffer(comm_buffer_base, comm_buffer_size) {
+                log::error!(
+                    "MmIsCommBuffer rejected buffer at 0x{:x} size 0x{:x}",
+                    comm_buffer_base,
+                    comm_buffer_size
+                );
+            } else {
+                sync_status = self.dispatch_synchronous_mmi(
+                    comm_buffer_base,
+                    comm_buffer_size,
+                    &mut return_buffer_size,
+                );
+            }
+        }
+
+        // ---- Asynchronous MMI dispatch (always runs) ----
+        mm_services::GLOBAL_MMI_DB.mmi_manage(
+            None,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
 
         // Write back the updated status to the supervisor-to-user buffer
         let updated_status = MmCommBufferStatus {
             is_comm_buffer_valid: 0,
             talk_to_supervisor: 0,
-            return_status: dispatch_status.as_usize() as u64,
-            return_buffer_size: 0,
+            return_status: if sync_status == efi::Status::SUCCESS {
+                efi::Status::SUCCESS.as_usize() as u64
+            } else {
+                efi::Status::NOT_FOUND.as_usize() as u64
+            },
+            return_buffer_size,
         };
 
         unsafe {
@@ -419,6 +467,106 @@ impl<P: PlatformInfo> MmUserCore<P> {
         }
 
         efi::Status::SUCCESS.as_usize() as u64
+    }
+
+    /// Parse the `EfiMmCommunicateHeader` from the communication buffer and
+    /// dispatch the appropriate GUID-specific MMI handler.
+    ///
+    /// Returns the dispatch status and updates `return_buffer_size` with the
+    /// total response size (header + data).
+    fn dispatch_synchronous_mmi(
+        &self,
+        comm_buffer_base: u64,
+        comm_buffer_size: u64,
+        return_buffer_size: &mut u64,
+    ) -> efi::Status {
+        let buffer_size = comm_buffer_size as usize;
+
+        // The buffer must be large enough for at least the communicate header.
+        if buffer_size < EfiMmCommunicateHeader::HEADER_SIZE {
+            log::error!(
+                "Communication buffer too small for header: {} < {}",
+                buffer_size,
+                EfiMmCommunicateHeader::HEADER_SIZE
+            );
+            return efi::Status::BAD_BUFFER_SIZE;
+        }
+
+        // SAFETY: We verified the buffer is large enough for the header.
+        let header = unsafe {
+            core::ptr::read_unaligned(comm_buffer_base as *const EfiMmCommunicateHeader)
+        };
+
+        // Determine header layout: check for V3 signature first, then fall
+        // back to the legacy `EfiMmCommunicateHeader`.
+        let (comm_guid_ptr, comm_header_size, mut data_size) =
+            if header.header_guid == patina::pi::protocols::communication3::COMMUNICATE_HEADER_V3_GUID {
+                // V3 header
+                let v3 = unsafe {
+                    core::ptr::read_unaligned(
+                        comm_buffer_base as *const patina::pi::protocols::communication3::EfiMmCommunicateHeader,
+                    )
+                };
+                let header_size = mem::size_of::<patina::pi::protocols::communication3::EfiMmCommunicateHeader>();
+                let total = v3.buffer_size as usize;
+                if total > buffer_size {
+                    log::error!(
+                        "V3 buffer_size 0x{:x} exceeds available 0x{:x}",
+                        total,
+                        buffer_size
+                    );
+                    return efi::Status::BAD_BUFFER_SIZE;
+                }
+                // GUID to dispatch is `message_guid` in V3
+                let guid_offset = core::mem::offset_of!(
+                    patina::pi::protocols::communication3::EfiMmCommunicateHeader,
+                    message_guid
+                );
+                let guid_ptr = (comm_buffer_base as *const u8).wrapping_add(guid_offset) as *const efi::Guid;
+                (guid_ptr, header_size, total.saturating_sub(header_size))
+            } else {
+                // Legacy header
+                let message_length = header.message_length as usize;
+                let total = EfiMmCommunicateHeader::HEADER_SIZE + message_length;
+                if total > buffer_size {
+                    log::error!(
+                        "Legacy message_length 0x{:x} exceeds available 0x{:x}",
+                        message_length,
+                        buffer_size.saturating_sub(EfiMmCommunicateHeader::HEADER_SIZE)
+                    );
+                    return efi::Status::BAD_BUFFER_SIZE;
+                }
+                // GUID to dispatch is `header_guid` in legacy
+                let guid_ptr = comm_buffer_base as *const efi::Guid;
+                (guid_ptr, EfiMmCommunicateHeader::HEADER_SIZE, message_length)
+            };
+
+        // Zero the remainder of the buffer past the message (matches C behaviour).
+        let used = comm_header_size + data_size;
+        if used < buffer_size {
+            unsafe {
+                core::ptr::write_bytes(
+                    (comm_buffer_base as *mut u8).add(used),
+                    0,
+                    buffer_size - used,
+                );
+            }
+        }
+
+        // Dispatch the GUID-specific handler.
+        let comm_data_ptr = unsafe {
+            (comm_buffer_base as *mut u8).add(comm_header_size) as *mut c_void
+        };
+
+        let status = mm_services::GLOBAL_MMI_DB.mmi_manage(
+            Some(unsafe { &*comm_guid_ptr }),
+            core::ptr::null(),
+            comm_data_ptr,
+            &mut data_size as *mut usize,
+        );
+
+        *return_buffer_size = (data_size + comm_header_size) as u64;
+        status
     }
 
     /// Handle the `UserApProcedure` command.
@@ -442,10 +590,13 @@ impl<P: PlatformInfo> MmUserCore<P> {
         efi::Status::SUCCESS.as_usize() as u64
     }
 
-    /// Discover the communication buffer address from HOBs.
+    /// Discover the communication buffer address from HOBs and store it for
+    /// later use in `handle_user_request`.
     ///
-    /// Looks for a GuidHob with `MM_COMM_BUFFER_HOB_GUID` and extracts the
-    /// `MmCommonBufferHobData` to determine the user communication buffer address.
+    /// The supervisor rewrites the HOB's `physical_start` field to point to
+    /// the internal (user-accessible) copy of the buffer before invoking
+    /// `StartUserCore`, so the address we read here is the one we should
+    /// read from at runtime.
     fn discover_comm_buffer(&self, hob: &Hob<'_>) {
         for current_hob in hob {
             if let Hob::GuidHob(guid_hob, data) = current_hob {
@@ -457,14 +608,24 @@ impl<P: PlatformInfo> MmUserCore<P> {
                             unsafe { core::ptr::addr_of!(buffer_data.physical_start).read_unaligned() };
                         let number_of_pages =
                             unsafe { core::ptr::addr_of!(buffer_data.number_of_pages).read_unaligned() };
+
+                        let buffer_size = number_of_pages.saturating_mul(4096);
+
+                        COMM_BUFFER_BASE.store(physical_start, Ordering::Release);
+                        COMM_BUFFER_SIZE.store(buffer_size, Ordering::Release);
+
                         log::info!(
-                            "Found MM communication buffer: base=0x{:016x}, pages={}",
+                            "Found MM communication buffer: base=0x{:016x}, pages={}, size=0x{:x}",
                             physical_start,
                             number_of_pages,
+                            buffer_size,
                         );
+                        return;
                     }
                 }
             }
         }
+
+        log::warn!("No MM communication buffer HOB found — only root MMI handlers will be supported.");
     }
 }

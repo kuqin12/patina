@@ -4,9 +4,9 @@
 //! lifecycle events forwarded from the DXE phase. They mirror the C
 //! `mMmCoreMmiHandlers[]` table in `StandaloneMmCore.c`.
 //!
-//! Each handler is registered with [`MmiHandlerRegister`] during startup
-//! and dispatched when the supervisor forwards the corresponding GUID-tagged
-//! MMI through the communication buffer.
+//! Each handler is registered with [`MmiDatabase::register_internal_handler`]
+//! during startup and dispatched when the supervisor forwards the corresponding
+//! GUID-tagged MMI through the communication buffer.
 //!
 //! ## Lifecycle Events
 //!
@@ -31,8 +31,8 @@ use core::ffi::c_void;
 use r_efi::efi;
 use spin::Mutex;
 
+use crate::mmi::InternalMmiHandler;
 use patina::guids;
-use patina::mm_services::MmiHandlerEntryPoint;
 
 // =============================================================================
 // Handler table definition
@@ -40,8 +40,8 @@ use patina::mm_services::MmiHandlerEntryPoint;
 
 /// Description of a core MMI handler to be registered at startup.
 struct CoreMmiHandler {
-    /// The handler function.
-    handler: MmiHandlerEntryPoint,
+    /// The handler function (native Rust signature).
+    handler: InternalMmiHandler,
     /// The GUID that triggers this handler.
     handler_type: &'static efi::Guid,
     /// Whether this handler should be unregistered during ready-to-lock.
@@ -100,7 +100,7 @@ impl SendHandle {
     const NULL: Self = Self(core::ptr::null_mut());
 }
 
-/// Dispatch handles returned from `MmiHandlerRegister` for each core handler.
+/// Dispatch handles returned from `register_internal_handler` for each core handler.
 ///
 /// Index matches the `CORE_MMI_HANDLERS` table. Populated by [`register_core_mmi_handlers`].
 static DISPATCH_HANDLES: Mutex<[SendHandle; 6]> = Mutex::new([SendHandle::NULL; 6]);
@@ -117,7 +117,7 @@ pub fn register_core_mmi_handlers() {
     let mut handles = DISPATCH_HANDLES.lock();
 
     for (i, entry) in CORE_MMI_HANDLERS.iter().enumerate() {
-        match crate::mm_services::GLOBAL_MMI_DB.mmi_handler_register(
+        match crate::mm_services::GLOBAL_MMI_DB.register_internal_handler(
             entry.handler,
             Some(entry.handler_type),
         ) {
@@ -194,9 +194,8 @@ fn install_lifecycle_protocol(guid: &efi::Guid) -> efi::Status {
 /// one-shot handler).
 ///
 /// Corresponds to the C `MmDriverDispatchHandler`.
-unsafe extern "efiapi" fn mm_driver_dispatch_handler(
-    dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_driver_dispatch_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
@@ -206,7 +205,15 @@ unsafe extern "efiapi" fn mm_driver_dispatch_handler(
     // Currently all drivers are dispatched during StartUserCore, so this is a no-op.
 
     // Self-unregister (one-shot).
-    let _ = crate::mm_services::GLOBAL_MMI_DB.mmi_handler_unregister(dispatch_handle);
+    let handles = DISPATCH_HANDLES.lock();
+    let dispatch_handle = handles[0].0;
+    drop(handles);
+
+    if !dispatch_handle.is_null() {
+        let _ = crate::mm_services::GLOBAL_MMI_DB.mmi_handler_unregister(dispatch_handle);
+    }
+
+    log::info!("MmDriverDispatchHandler done");
 
     efi::Status::SUCCESS
 }
@@ -218,9 +225,8 @@ unsafe extern "efiapi" fn mm_driver_dispatch_handler(
 /// 2. Installs the `gEfiMmReadyToLockProtocolGuid` protocol to notify MM drivers.
 ///
 /// Corresponds to the C `MmReadyToLockHandler`.
-unsafe extern "efiapi" fn mm_ready_to_lock_handler(
-    _dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_ready_to_lock_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
@@ -249,9 +255,8 @@ unsafe extern "efiapi" fn mm_ready_to_lock_handler(
 /// Installs the `gEfiMmEndOfPeiProtocol` protocol.
 ///
 /// Corresponds to the C `MmEndOfPeiHandler`.
-unsafe extern "efiapi" fn mm_end_of_pei_handler(
-    _dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_end_of_pei_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
@@ -265,9 +270,8 @@ unsafe extern "efiapi" fn mm_end_of_pei_handler(
 /// Installs the `gEfiMmEndOfDxeProtocolGuid` protocol.
 ///
 /// Corresponds to the C `MmEndOfDxeHandler`.
-unsafe extern "efiapi" fn mm_end_of_dxe_handler(
-    _dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_end_of_dxe_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
@@ -281,9 +285,8 @@ unsafe extern "efiapi" fn mm_end_of_dxe_handler(
 /// Installs the `gEfiEventExitBootServicesGuid` protocol (once).
 ///
 /// Corresponds to the C `MmExitBootServiceHandler`.
-unsafe extern "efiapi" fn mm_exit_boot_service_handler(
-    _dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_exit_boot_service_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
@@ -302,9 +305,8 @@ unsafe extern "efiapi" fn mm_exit_boot_service_handler(
 /// Installs the `gEfiEventReadyToBootGuid` protocol (once).
 ///
 /// Corresponds to the C `MmReadyToBootHandler`.
-unsafe extern "efiapi" fn mm_ready_to_boot_handler(
-    _dispatch_handle: efi::Handle,
-    _context: *const c_void,
+fn mm_ready_to_boot_handler(
+    _handler_type: &efi::Guid,
     _comm_buffer: *mut c_void,
     _comm_buffer_size: *mut usize,
 ) -> efi::Status {
