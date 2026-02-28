@@ -143,3 +143,86 @@ impl TryFrom<u64> for UserCommandType {
         }
     }
 }
+
+// =============================================================================
+// Syscall Indices
+// =============================================================================
+
+/// Syscall indices for the MM Supervisor ↔ User Core syscall interface.
+///
+/// These match the definitions in SysCallLib.h and define the ABI used when
+/// Ring 3 code issues a `syscall` instruction to the Ring 0 supervisor.
+///
+/// ## ABI
+///
+/// - RAX = call index ([`SyscallIndex`])
+/// - RDX = arg1
+/// - R8  = arg2
+/// - R9  = arg3
+///
+/// On return:
+/// - RAX = result value
+/// - RDX = status (EFI_STATUS)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum SyscallIndex {
+    /// Read MSR - Arg1: MSR index, Returns: MSR value
+    RdMsr = 0x0000,
+    /// Write MSR - Arg1: MSR index, Arg2: value
+    WrMsr = 0x0001,
+    /// CLI - Clear interrupts
+    Cli = 0x0002,
+    /// IO Read - Arg1: port, Arg2: width
+    IoRead = 0x0003,
+    /// IO Write - Arg1: port, Arg2: width, Arg3: value
+    IoWrite = 0x0004,
+    /// WBINVD - Write back and invalidate cache
+    Wbinvd = 0x0005,
+    /// HLT - Halt processor
+    Hlt = 0x0006,
+    /// Save State Read - Arg1: register, Arg2: CPU index
+    SaveStateRead = 0x0007,
+    /// Maximum value for legacy syscall indices
+    LegacyMax = 0xFFFF,
+    /// Allocate Pages - Arg1: alloc_type, Arg2: mem_type, Arg3: page_count
+    AllocPage = 0x10004,
+    /// Free Pages - Arg1: address, Arg2: page_count
+    FreePage = 0x10005,
+    /// Start AP Procedure - Arg1: procedure, Arg2: CPU index, Arg3: argument
+    StartApProc = 0x10006,
+    /// Save state read with extended support - Arg1: width, Arg2: buffer pointer
+    SaveStateRead2 = 0x10021,
+    /// MM memory unblocked - Arg1: address, Arg2: size
+    MmMemoryUnblocked = 0x10022,
+    /// MM is communication buffer - Arg1: address, Arg2: size
+    MmIsCommBuffer = 0x10023,
+}
+
+impl SyscallIndex {
+    /// Creates a `SyscallIndex` from a raw `u64` value.
+    pub fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            0x0000 => Some(Self::RdMsr),
+            0x0001 => Some(Self::WrMsr),
+            0x0002 => Some(Self::Cli),
+            0x0003 => Some(Self::IoRead),
+            0x0004 => Some(Self::IoWrite),
+            0x0005 => Some(Self::Wbinvd),
+            0x0006 => Some(Self::Hlt),
+            0x0007 => Some(Self::SaveStateRead),
+            0xFFFF => Some(Self::LegacyMax),
+            0x10004 => Some(Self::AllocPage),
+            0x10005 => Some(Self::FreePage),
+            0x10006 => Some(Self::StartApProc),
+            0x10021 => Some(Self::SaveStateRead2),
+            0x10022 => Some(Self::MmMemoryUnblocked),
+            0x10023 => Some(Self::MmIsCommBuffer),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw `u64` value of this syscall index.
+    pub fn as_u64(self) -> u64 {
+        self as u64
+    }
+}

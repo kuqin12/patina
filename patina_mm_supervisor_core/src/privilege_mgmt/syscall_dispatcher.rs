@@ -143,100 +143,11 @@ unsafe fn io_write_u32(port: u16, value: u32) {
 // Syscall Indices
 // ============================================================================
 
-/// Syscall indices for the MM Supervisor syscall interface.
-///
-/// These match the definitions in SysCallLib.h.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum SyscallIndex {
-    /// Read MSR - Arg1: MSR index, Returns: MSR value
-    RdMsr = 0x0000,
-    /// Write MSR - Arg1: MSR index, Arg2: value
-    WrMsr = 0x0001,
-    /// CLI - Clear interrupts
-    Cli = 0x0002,
-    /// IO Read - Arg1: port, Arg2: width
-    IoRead = 0x0003,
-    /// IO Write - Arg1: port, Arg2: width, Arg3: value
-    IoWrite = 0x0004,
-    /// WBINVD - Write back and invalidate cache
-    Wbinvd = 0x0005,
-    /// HLT - Halt processor
-    Hlt = 0x0006,
-    /// Save State Read - Arg1: register, Arg2: CPU index
-    SaveStateRead = 0x0007,
-    /// Maximum value for legacy syscall indices
-    LegacyMax = 0xFFFF,
-    /// Register Handler Jump Pointer - Unsupported
-    // RegHandlerJump = 0x10000,
-    /// Install configuration table - Unsupported
-    // InstallConfigTable = 0x10001,
-    /// Allocate pool: unsupported
-    // AllocPool = 0x10002,
-    /// Free pool: unsupported
-    // FreePool = 0x10003,
-    /// Allocate Pages - Arg1: memory type, Arg2: page count, Arg3: address ptr
-    AllocPage = 0x10004,
-    /// Free Pages - Arg1: address, Arg2: page count
-    FreePage = 0x10005,
-    /// Start AP Procedure - Arg1: procedure, Arg2: CPU index, Arg3: argument
-    StartApProc = 0x10006,
-    /// Register MMI handler jump pointer - Unsupported
-    // RegMmiHandlerJump = 0x10007,
-    /// Unregister MMI handler - Unsupported
-    // UnregMmiHandlerJump = 0x10018,
-    /// Set CPL3 Page Table - Unsupported
-    // SetCpl3Table = 0x10019,
-    /// Install protocol - Unsupported
-    // InstallProtocol = 0x1001A,
-    /// Query hobs - Unsupported
-    // QueryHobs = 0x1001B,
-    /// Error Report Jump - Unsupported, this is moved to be handled by the user core
-    // ErrReportJump = 0x1001C,
-    /// MMI handler profile register - Unsupported
-    // RegMmiProfile1 = 0x1001D,
-    /// MMI handler profile register - Unsupported
-    // RegMmiProfile2 = 0x1001E,
-    /// MMI handler profile unregister - Unsupported
-    // UnregMmiProfile1 = 0x1001F,
-    /// MMI handler profile unregister - Unsupported
-    // UnregMmiProfile2 = 0x10020,
-    /// Save state read with extended support - Arg1: width, Arg2: buffer pointer
-    SaveStateRead2 = 0x10021,
-    /// MM memory unblocked - Arg1: address, Arg2: size
-    MmMemoryUnblocked = 0x10022,
-    /// MM memory is communication buffer - Arg1: address, Arg2: size
-    MmIsCommBuffer = 0x10023,
-}
+// ============================================================================
+// Syscall Indices (re-exported from the shared common crate)
+// ============================================================================
 
-impl SyscallIndex {
-    /// Creates a SyscallIndex from a raw u64 value.
-    pub fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0x0000 => Some(Self::RdMsr),
-            0x0001 => Some(Self::WrMsr),
-            0x0002 => Some(Self::Cli),
-            0x0003 => Some(Self::IoRead),
-            0x0004 => Some(Self::IoWrite),
-            0x0005 => Some(Self::Wbinvd),
-            0x0006 => Some(Self::Hlt),
-            0x0007 => Some(Self::SaveStateRead),
-            0xFFFF => Some(Self::LegacyMax),
-            0x10004 => Some(Self::AllocPage),
-            0x10005 => Some(Self::FreePage),
-            0x10006 => Some(Self::StartApProc),
-            0x10021 => Some(Self::SaveStateRead2),
-            0x10022 => Some(Self::MmMemoryUnblocked),
-            0x10023 => Some(Self::MmIsCommBuffer),
-            _ => None,
-        }
-    }
-
-    /// Returns the raw u64 value of this syscall index.
-    pub fn as_u64(self) -> u64 {
-        self as u64
-    }
-}
+pub use patina_internal_mm_common::SyscallIndex;
 
 // ============================================================================
 // Syscall Result
