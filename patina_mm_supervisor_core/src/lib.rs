@@ -1685,7 +1685,7 @@ where
                 context_size as u64,
             )
         };
-        log::info!("Returned from user request with value: 0x{}", ret);
+        log::trace!("Returned from user request with value: 0x{}", ret);
 
         // Copy the response from the internal buffer back to the user buffer
         // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
