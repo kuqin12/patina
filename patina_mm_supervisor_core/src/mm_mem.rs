@@ -703,7 +703,7 @@ impl PageAllocator {
             
             if _alloc_type == AllocationType::Supervisor {
                 // For Supervisor allocations, we additionally want the U/S bit cleared (Supervisor-only).
-                attributes = attributes | MemoryAttributes::SpecialPurpose; // Ensure not writable by user code
+                attributes = attributes | MemoryAttributes::Supervisor; // Ensure not writable by user code
             }
 
             if let Err(e) = pt.map_memory_region(addr, size, attributes) {

@@ -734,13 +734,13 @@ fn handle_unblock_mem(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi
     //   - Present (clear ReadProtect)
     //   - Read/Write (clear ReadOnly)
     //   - Non-executable (set ExecuteProtect) - data pages must be W^X
-    //   - Optionally Supervisor-only (set Special) if EFI_MEMORY_SP requested
+    //   - Optionally Supervisor-only (set Supervisor) if EFI_MEMORY_SP requested
     {
         let mut pt_guard = crate::PAGE_TABLE.lock();
         if let Some(ref mut pt) = *pt_guard {
             let mut new_attrs = MemoryAttributes::ExecuteProtect; // NX - data pages are non-executable
             if is_supervisor_page {
-                new_attrs = new_attrs | MemoryAttributes::SpecialPurpose; // Supervisor-only (U/S=0)
+                new_attrs = new_attrs | MemoryAttributes::Supervisor; // Supervisor-only (U/S=0)
             }
 
             if let Err(e) = pt.map_memory_region(physical_start, region_size, new_attrs) {

@@ -306,9 +306,9 @@ fn page_align_range(address: u64, size: u64) -> (u64, u64) {
 ///
 /// The address and size are page-aligned before querying (rounded down / up respectively).
 ///
-/// Checks the `SpecialPurpose` attribute which maps to the U/S bit on X64:
-///   - `SpecialPurpose` set  => `PageOwnership::Supervisor` (U/S = 0)
-///   - `SpecialPurpose` clear => `PageOwnership::User` (U/S = 1)
+/// Checks the `Supervisor` attribute which maps to the U/S bit on X64:
+///   - `Supervisor` set  => `PageOwnership::Supervisor` (U/S = 0)
+///   - `Supervisor` clear => `PageOwnership::User` (U/S = 1)
 ///
 /// Returns `None` if the page table is not initialized or the address is unmapped.
 pub(crate) fn query_address_ownership(address: u64, size: u64) -> Option<PageOwnership> {
@@ -316,7 +316,13 @@ pub(crate) fn query_address_ownership(address: u64, size: u64) -> Option<PageOwn
     let page_table = PAGE_TABLE.lock();
     let pt = page_table.as_ref()?;
     let attrs = pt.query_memory_region(aligned_addr, aligned_size).ok()?;
-    if attrs.contains(MemoryAttributes::SpecialPurpose) {
+    log::info!(
+        "Queried page ownership for address range 0x{:016x}-0x{:016x}: attributes={:?}",
+        aligned_addr,
+        aligned_addr + aligned_size,
+        attrs
+    );
+    if attrs.contains(MemoryAttributes::Supervisor) {
         Some(PageOwnership::Supervisor)
     } else {
         Some(PageOwnership::User)
@@ -1426,7 +1432,7 @@ where
                         match query_address_ownership(status_buffer, core::mem::size_of::<MmCommBufferStatus>() as u64) {
                             Some(PageOwnership::User) => {
                                 panic!(
-                                    "User common buffer at 0x{:016x}-0x{:016x} is not marked as user-exposed",
+                                    "User common buffer at 0x{:016x}-0x{:016x} is not marked as supervisor-exposed",
                                     user_comm_buffer,
                                     user_comm_buffer + user_comm_buffer_size
                                 );
