@@ -59,9 +59,9 @@ struct DriverEntry {
     /// The entry point address of the driver.
     entry_point: u64,
     /// The base address of the driver image in memory.
-    image_base: u64,
+    _image_base: u64,
     /// The size of the driver image in memory.
-    image_size: u64,
+    _image_size: u64,
     /// The parsed dependency expression, if any.
     depex: Option<Depex>,
 }
@@ -227,8 +227,8 @@ impl MmDispatcher {
                 drivers.push(DriverEntry {
                     file_name: module_name,
                     entry_point: mem_alloc_mod.entry_point,
-                    image_base: mem_alloc_mod.alloc_descriptor.memory_base_address,
-                    image_size: mem_alloc_mod.alloc_descriptor.memory_length,
+                    _image_base: mem_alloc_mod.alloc_descriptor.memory_base_address,
+                    _image_size: mem_alloc_mod.alloc_descriptor.memory_length,
                     depex,
                 });
             }
