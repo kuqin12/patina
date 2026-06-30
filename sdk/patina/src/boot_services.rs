@@ -41,6 +41,9 @@ use event::{EventNotifyCallback, EventTimerType, EventType};
 use protocol_handler::{HandleSearchType, Registration};
 use tpl::{Tpl, TplGuard};
 
+#[doc(inline)]
+pub use crate::service_table::{ProtocolPrimitives, ProtocolServices};
+
 /// This is the boot services used in the UEFI.
 pub struct StandardBootServices {
     efi_boot_services: Once<*mut efi::BootServices>,
@@ -348,49 +351,9 @@ pub trait BootServices {
     /// Installs a protocol interface on a device handle.
     /// If the handle does not exist, it is created and added to the list of handles in the system.
     ///
+    /// Use [`ProtocolServices::install_protocol_interface`] when possible.
+    ///
     /// [UEFI Spec Documentation: 7.3.2. EFI_BOOT_SERVICES.InstallProtocolInterface()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-installprotocolinterface)
-    ///
-    /// ## Example
-    /// ```rust ignore
-    /// let key = match static_boot_services().install_protocol_interface(
-    ///     Some(handle),
-    ///     Box::new(protocol_interface),
-    /// ) {
-    ///     Ok((_handle, key)) => key,
-    ///     Err((protocol_interface_box, status)) => return Err(status),
-    /// };
-    /// Ok(key)
-    /// ```
-    ///
-    fn install_protocol_interface<T, R>(
-        &self,
-        handle: Option<efi::Handle>,
-        protocol_interface: R,
-    ) -> Result<(efi::Handle, PtrMetadata<'static, R>), efi::Status>
-    where
-        R: CMutRef<'static, Type = T> + 'static,
-        T: ProtocolInterface + 'static,
-    {
-        let key = protocol_interface.metadata();
-
-        let protocol_interface_ptr = match mem::size_of::<T>() {
-            0 => ptr::null_mut(),
-            _ => protocol_interface.into_mut_ptr() as *mut c_void,
-        };
-
-        // SAFETY: This is safe because ProtocolInterface provide the right guid for the interface.
-        unsafe {
-            match self.install_protocol_interface_unchecked(handle, &T::PROTOCOL_GUID, protocol_interface_ptr) {
-                Ok(handle) => Ok((handle, key)),
-                Err(status) => {
-                    _ = key.try_into_original_ptr();
-                    Err(status)
-                }
-            }
-        }
-    }
-
-    /// Use [`BootServices::install_protocol_interface`] when possible.
     ///
     /// # Safety
     ///
@@ -406,30 +369,9 @@ pub trait BootServices {
 
     /// Removes a protocol interface from a device handle.
     ///
+    /// Use [`ProtocolServices::uninstall_protocol_interface`] when possible.
+    ///
     /// [UEFI Spec Documentation: 7.3.3. EFI_BOOT_SERVICES.UninstallProtocolInterface()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-uninstallprotocolinterface)
-    #[allow(clippy::not_unsafe_ptr_arg_deref)] //this is triggered by the fact that efi::Handle aliases to c_void, but they are opaque to the caller.
-    fn uninstall_protocol_interface<T, R>(
-        &self,
-        handle: efi::Handle,
-        key: PtrMetadata<'static, R>,
-    ) -> Result<R, efi::Status>
-    where
-        R: CMutRef<'static, Type = T> + 'static,
-        T: ProtocolInterface + 'static,
-    {
-        let interface_ptr = match mem::size_of::<T>() {
-            0 => ptr::null_mut(),
-            _ => key.ptr_value as *mut c_void,
-        };
-
-        // SAFETY: This is safe because ProtocolInterface provide the right guid for the interface.
-        unsafe { self.uninstall_protocol_interface_unchecked(handle, &T::PROTOCOL_GUID, interface_ptr) }?;
-
-        // SAFETY: Pointer is leak when installed and kept unchanged.
-        unsafe { key.try_into_original_ptr() }.ok_or(efi::Status::INVALID_PARAMETER)
-    }
-
-    /// Use [`BootServices::uninstall_protocol_interface`] when possible.
     ///
     /// # Safety
     ///
@@ -513,56 +455,9 @@ pub trait BootServices {
 
     /// Queries a handle to determine if it supports a specified protocol and return a mutable reference to the interface.
     ///
-    /// [UEFI Spec Documentation: 7.3.7. EFI_BOOT_SERVICES.HandleProtocol()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-handleprotocol)
-    ///
-    /// # Safety
-    /// Make sure to not create multiple mutable reference of interface.
-    unsafe fn handle_protocol<T>(&self, handle: efi::Handle) -> Result<&'static mut T, efi::Status>
-    where
-        T: Sized + ProtocolInterface + 'static,
-    {
-        // SAFETY: Caller guarantees handle is valid. handle_protocol_maybe_empty performs the FFI call
-        // and returns a properly typed pointer or None based on the protocol interface.
-        match unsafe { self.handle_protocol_maybe_empty(handle)? } {
-            Some(_) if mem::size_of::<T>() == 0 => {
-                debug_assert!(false, "Expect null interface. Type {} need to have a size of 0.", any::type_name::<T>());
-                Err(efi::Status::INVALID_PARAMETER)
-            }
-            None if mem::size_of::<T>() > 0 => {
-                debug_assert!(
-                    false,
-                    "Expect non null interface. Type {} need to have a size greater than 0.",
-                    any::type_name::<T>()
-                );
-                Err(efi::Status::INVALID_PARAMETER)
-            }
-            Some(i) => Ok(i),
-            None => {
-                // SAFETY: T is a ZST (size == 0). NonNull::dangling() returns a well-aligned,
-                // non-null pointer. For ZSTs, reads/writes are zero-sized accesses. Each call
-                // produces its own reference, avoiding aliasing violations.
-                Ok(unsafe { NonNull::<T>::dangling().as_mut() })
-            }
-        }
-    }
-
-    /// Queries a handle to determine if it supports a specified protocol and return a mutable reference to the interface or None if the interface was null.
+    /// Use [`ProtocolServices::handle_protocol`] when possible.
     ///
     /// [UEFI Spec Documentation: 7.3.7. EFI_BOOT_SERVICES.HandleProtocol()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-handleprotocol)
-    ///
-    /// # Safety
-    /// Make sure to not create multiple mutable reference of interface.
-    unsafe fn handle_protocol_maybe_empty<T>(&self, handle: efi::Handle) -> Result<Option<&'static mut T>, efi::Status>
-    where
-        T: Sized + ProtocolInterface + 'static,
-    {
-        // SAFETY: handle_protocol_unchecked returns a raw pointer. Converting to *mut T is considered
-        // safe based on T::PROTOCOL_GUID ensuring type correctness. as_mut() may return None if the
-        // firmware returns null for zero-sized protocols.
-        Ok(unsafe { (self.handle_protocol_unchecked(handle, &T::PROTOCOL_GUID)? as *mut T).as_mut() })
-    }
-
-    /// Use [`BootServices::handle_protocol`] when possible.
     ///
     /// # Safety
     ///
@@ -739,64 +634,6 @@ pub trait BootServices {
         search_type: HandleSearchType,
     ) -> Result<BootServicesBox<'a, [efi::Handle], Self>, efi::Status>;
 
-    /// Returns the first protocol instance that matches the given protocol.
-    ///
-    /// [UEFI Spec Documentation: 7.3.16. EFI_BOOT_SERVICES.LocateProtocol()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-locateprotocol)
-    ///
-    /// # Safety
-    ///
-    /// Make sure to not create multiple mutable reference when using this api.
-    unsafe fn locate_protocol<T>(&self, registration: Option<Registration>) -> Result<&'static mut T, efi::Status>
-    where
-        T: Sized + ProtocolInterface + 'static,
-    {
-        // SAFETY: Caller guarantees no aliasing. locate_protocol_maybe_empty performs the FFI call
-        // and returns a properly typed pointer or None based on the protocol interface.
-        match unsafe { self.locate_protocol_maybe_empty(registration)? } {
-            Some(_) if mem::size_of::<T>() == 0 => {
-                debug_assert!(false, "Expect null interface. Type {} need to have a size of 0.", any::type_name::<T>());
-                Err(efi::Status::INVALID_PARAMETER)
-            }
-            None if mem::size_of::<T>() > 0 => {
-                debug_assert!(
-                    false,
-                    "Expect non null interface. Type {} need to have a size greater than 0.",
-                    any::type_name::<T>()
-                );
-                Err(efi::Status::INVALID_PARAMETER)
-            }
-            Some(i) => Ok(i),
-            None => {
-                // SAFETY: T is a ZST (size == 0). NonNull::dangling() returns a well-aligned,
-                // non-null pointer. For ZSTs, reads/writes are zero-sized accesses. Each call
-                // produces its own reference, avoiding aliasing violations.
-                Ok(unsafe { NonNull::<T>::dangling().as_mut() })
-            }
-        }
-    }
-
-    /// Returns the first protocol instance that matches the given protocol or None if the found interface is null.
-    ///
-    /// [UEFI Spec Documentation: 7.3.16. EFI_BOOT_SERVICES.LocateProtocol()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-locateprotocol)
-    ///
-    /// # Safety
-    ///
-    /// Make sure to not create multiple mutable reference when using this api.
-    unsafe fn locate_protocol_maybe_empty<T>(
-        &self,
-        registration: Option<Registration>,
-    ) -> Result<Option<&'static mut T>, efi::Status>
-    where
-        T: Sized + ProtocolInterface + 'static,
-    {
-        //SAFETY: The generic ProtocolInterface ensure that the interfaces is the right type for the specified protocol.
-        Ok(unsafe {
-            (self.locate_protocol_unchecked(&T::PROTOCOL_GUID, registration.map_or(ptr::null_mut(), NonNull::as_ptr))?
-                as *mut T)
-                .as_mut()
-        })
-    }
-
     /// Returns the first protocol instance that matches the given marker protocol.
     ///
     /// [UEFI Spec Documentation: 7.3.16. EFI_BOOT_SERVICES.LocateProtocol()](https://uefi.org/specs/UEFI/2.10/07_Services_Boot_Services.html#efi-boot-services-locateprotocol)
@@ -817,7 +654,7 @@ pub trait BootServices {
         }
     }
 
-    /// Use [`BootServices::locate_protocol`] when possible.
+    /// Use [`ProtocolServices::locate_protocol`] when possible.
     ///
     /// # Safety
     ///
@@ -1015,12 +852,9 @@ impl Clone for MockBootServices {
 }
 
 macro_rules! efi_boot_services_fn {
-    ($efi_boot_services:expr, $fn_name:ident) => {{
-        match $efi_boot_services.$fn_name {
-            f if f as usize == 0 => panic!("Boot services function {} is not initialized.", stringify!($fn_name)),
-            f => f,
-        }
-    }};
+    ($efi_boot_services:expr, $fn_name:ident) => {
+        $crate::service_table::service_table_fn!($efi_boot_services, $fn_name, "Boot services")
+    };
 }
 
 impl BootServices for StandardBootServices {
@@ -2057,6 +1891,152 @@ impl BootServices for StandardBootServices {
             // SAFETY: If the call succeeded, crc32 has been initialized.
             _ => Ok(unsafe { crc32.assume_init() }),
         }
+    }
+}
+
+// The typed protocol surface ([`ProtocolServices`]) is shared with `MmServices` and is provided via
+// the blanket impl over [`ProtocolPrimitives`]. `StandardBootServices` already implements the raw
+// `*_unchecked` primitives as part of [`BootServices`] (which must keep them so they can be mocked
+// and reused by boot-only methods such as `locate_protocol_marker`), so this impl simply forwards.
+impl ProtocolPrimitives for StandardBootServices {
+    unsafe fn install_protocol_interface_unchecked(
+        &self,
+        handle: Option<efi::Handle>,
+        protocol: &'static efi::Guid,
+        interface: *mut c_void,
+    ) -> Result<efi::Handle, efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::install_protocol_interface_unchecked(self, handle, protocol, interface) }
+    }
+
+    unsafe fn uninstall_protocol_interface_unchecked(
+        &self,
+        handle: efi::Handle,
+        protocol: &'static efi::Guid,
+        interface: *mut c_void,
+    ) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::uninstall_protocol_interface_unchecked(self, handle, protocol, interface) }
+    }
+
+    unsafe fn handle_protocol_unchecked(
+        &self,
+        handle: efi::Handle,
+        protocol: &efi::Guid,
+    ) -> Result<*mut c_void, efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::handle_protocol_unchecked(self, handle, protocol) }
+    }
+
+    unsafe fn locate_protocol_unchecked(
+        &self,
+        protocol: &'static efi::Guid,
+        registration: *mut c_void,
+    ) -> Result<*mut c_void, efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::locate_protocol_unchecked(self, protocol, registration) }
+    }
+}
+
+// Bridges the mocked `BootServices` primitives into [`ProtocolPrimitives`] so that `MockBootServices`
+// gains the shared typed [`ProtocolServices`] surface for free. Tests set expectations on the
+// `*_unchecked` methods and the real typed wrappers run on top of them.
+#[cfg(any(test, feature = "mockall"))]
+impl ProtocolPrimitives for MockBootServices {
+    unsafe fn install_protocol_interface_unchecked(
+        &self,
+        handle: Option<efi::Handle>,
+        protocol: &'static efi::Guid,
+        interface: *mut c_void,
+    ) -> Result<efi::Handle, efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::install_protocol_interface_unchecked(self, handle, protocol, interface) }
+    }
+
+    unsafe fn uninstall_protocol_interface_unchecked(
+        &self,
+        handle: efi::Handle,
+        protocol: &'static efi::Guid,
+        interface: *mut c_void,
+    ) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::uninstall_protocol_interface_unchecked(self, handle, protocol, interface) }
+    }
+
+    unsafe fn handle_protocol_unchecked(
+        &self,
+        handle: efi::Handle,
+        protocol: &efi::Guid,
+    ) -> Result<*mut c_void, efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::handle_protocol_unchecked(self, handle, protocol) }
+    }
+
+    unsafe fn locate_protocol_unchecked(
+        &self,
+        protocol: &'static efi::Guid,
+        registration: *mut c_void,
+    ) -> Result<*mut c_void, efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::locate_protocol_unchecked(self, protocol, registration) }
+    }
+}
+
+// The shared [`MemoryServices`] surface is the same on both service tables. `StandardBootServices`
+// already exposes these operations as inherent `BootServices` methods (kept there so existing
+// consumers and `MockBootServices` are undisturbed), so this impl simply forwards. Referencing the
+// trait by full path avoids bringing it into method-call scope, which would make `BootServices`'
+// own `self.allocate_pool(...)` calls ambiguous.
+impl crate::service_table::MemoryServices for StandardBootServices {
+    fn allocate_pool(&self, memory_type: EfiMemoryType, size: usize) -> Result<*mut u8, efi::Status> {
+        <Self as BootServices>::allocate_pool(self, memory_type, size)
+    }
+
+    unsafe fn free_pool(&self, buffer: *mut u8) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::free_pool(self, buffer) }
+    }
+
+    fn allocate_pages(
+        &self,
+        alloc_type: AllocType,
+        memory_type: EfiMemoryType,
+        nb_pages: usize,
+    ) -> Result<usize, efi::Status> {
+        <Self as BootServices>::allocate_pages(self, alloc_type, memory_type, nb_pages)
+    }
+
+    unsafe fn free_pages(&self, address: usize, nb_pages: usize) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the `BootServices` primitive; the caller upholds the same contract.
+        unsafe { <Self as BootServices>::free_pages(self, address, nb_pages) }
+    }
+}
+
+// Bridges the mocked `BootServices` memory methods into [`MemoryServices`] so generic code written
+// against the shared trait can be exercised with `MockBootServices`.
+#[cfg(any(test, feature = "mockall"))]
+impl crate::service_table::MemoryServices for MockBootServices {
+    fn allocate_pool(&self, memory_type: EfiMemoryType, size: usize) -> Result<*mut u8, efi::Status> {
+        <Self as BootServices>::allocate_pool(self, memory_type, size)
+    }
+
+    unsafe fn free_pool(&self, buffer: *mut u8) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::free_pool(self, buffer) }
+    }
+
+    fn allocate_pages(
+        &self,
+        alloc_type: AllocType,
+        memory_type: EfiMemoryType,
+        nb_pages: usize,
+    ) -> Result<usize, efi::Status> {
+        <Self as BootServices>::allocate_pages(self, alloc_type, memory_type, nb_pages)
+    }
+
+    unsafe fn free_pages(&self, address: usize, nb_pages: usize) -> Result<(), efi::Status> {
+        // SAFETY: Forwards to the mocked `BootServices` primitive.
+        unsafe { <Self as BootServices>::free_pages(self, address, nb_pages) }
     }
 }
 

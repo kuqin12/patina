@@ -10,7 +10,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use patina::{
-    boot_services::BootServices,
+    boot_services::ProtocolServices,
     component::{Storage, component},
     error::EfiError,
     uefi_protocol::decompress,

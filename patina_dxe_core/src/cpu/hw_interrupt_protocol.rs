@@ -9,7 +9,7 @@ use spin::rwlock::RwLock;
 use arm_gic::{InterruptGroup, Trigger, gicv3::GicCpuInterface};
 use patina::{
     BinaryGuid,
-    boot_services::{BootServices, StandardBootServices},
+    boot_services::{ProtocolServices, StandardBootServices},
     component::{component, service::Service},
     guids::{HARDWARE_INTERRUPT_PROTOCOL, HARDWARE_INTERRUPT_PROTOCOL_V2},
     uefi_protocol::ProtocolInterface,

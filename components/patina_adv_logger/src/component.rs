@@ -11,7 +11,7 @@
 //!
 use alloc::boxed::Box;
 use patina::{
-    boot_services::{BootServices, StandardBootServices},
+    boot_services::{ProtocolServices, StandardBootServices},
     component::{
         component,
         service::{Service, perf_timer::ArchTimerFunctionality},

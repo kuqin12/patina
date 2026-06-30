@@ -12,7 +12,7 @@ use crate::{dxe_services, protocols::PROTOCOL_DB};
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use patina::{
-    boot_services::{BootServices, StandardBootServices},
+    boot_services::{ProtocolServices, StandardBootServices},
     component::{
         Storage, component,
         service::{IntoService, Service},

@@ -17,7 +17,7 @@ use core::{
 };
 
 use crate::{
-    boot_services::BootServices,
+    boot_services::{BootServices, ProtocolServices},
     component::service::{Service, perf_timer::ArchTimerFunctionality},
     error::EfiError,
     guids::EDKII_FPDT_EXTENDED_FIRMWARE_PERFORMANCE,
@@ -54,7 +54,7 @@ pub mod event_callback {
     /// Reports the Firmware Basic Boot Performance Table (FBPT) record buffer.
     pub extern "efiapi" fn report_fbpt_record_buffer<B, R, F>(event: efi::Event, ctx: Box<(B, R, &TplMutex<F, B>)>)
     where
-        B: BootServices + Clone + 'static,
+        B: BootServices + ProtocolServices + Clone + 'static,
         R: RuntimeServices + Clone + 'static,
         F: FirmwareBasicBootPerfTable,
     {
@@ -226,7 +226,7 @@ fn _create_performance_measurement<B, F>(
     timer: &Service<dyn ArchTimerFunctionality>,
 ) -> Result<(), Error>
 where
-    B: BootServices,
+    B: BootServices + ProtocolServices,
     F: FirmwareBasicBootPerfTable,
 {
     let cpu_count = timer.cpu_count();
@@ -426,7 +426,7 @@ impl PerformanceProperty {
 }
 
 fn get_module_guid_from_handle(
-    boot_services: &impl BootServices,
+    boot_services: &(impl BootServices + ProtocolServices),
     handle: efi::Handle,
 ) -> Result<crate::BinaryGuid, efi::Status> {
     let mut guid = crate::guids::ZERO;
@@ -560,10 +560,10 @@ mod tests {
             .return_const(Ok(()));
 
         boot_services
-            .expect_locate_protocol()
+            .expect_locate_protocol_unchecked()
             .once()
-            // SAFETY: Test code - creating a mutable reference to test protocol pointer for mocking.
-            .returning_st(move |_| Ok(unsafe { &mut *status_code_runtime_protocol_ptr }));
+            // SAFETY: Test code - returning the raw test protocol pointer for the typed wrapper to reconcile.
+            .returning_st(move |_, _| Ok(status_code_runtime_protocol_ptr as *mut core::ffi::c_void));
 
         let mut runtime_services = MockRuntimeServices::new();
         runtime_services
@@ -606,10 +606,10 @@ mod tests {
         }
         let loaded_image_protocol_address = loaded_image_protocol.as_mut_ptr() as usize;
 
-        // SAFETY: Test code - creating mock protocol reference from test address.
-        boot_services.expect_handle_protocol::<efi::protocols::loaded_image::Protocol>().returning(move |_| unsafe {
-            Ok((loaded_image_protocol_address as *mut efi::protocols::loaded_image::Protocol).as_mut().unwrap())
-        });
+        // SAFETY: Test code - returning the raw test protocol pointer for the typed wrapper to reconcile.
+        boot_services
+            .expect_handle_protocol_unchecked()
+            .returning(move |_, _| Ok(loaded_image_protocol_address as *mut core::ffi::c_void));
         boot_services.expect_raise_tpl().returning(|tpl| tpl);
         boot_services.expect_restore_tpl().return_const(());
 

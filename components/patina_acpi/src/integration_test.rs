@@ -11,7 +11,7 @@
 use core::{ffi::c_void, mem};
 
 use patina::{
-    boot_services::{BootServices, StandardBootServices},
+    boot_services::{ProtocolServices, StandardBootServices},
     component::service::Service,
 };
 use patina_test::{patina_test, u_assert, u_assert_eq};

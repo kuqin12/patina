@@ -11,7 +11,7 @@
 use crate::{component::protocol::create_performance_measurement_efiapi, mm};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use patina::{
-    boot_services::{BootServices, StandardBootServices, event::EventType, tpl::Tpl},
+    boot_services::{BootServices, ProtocolServices, StandardBootServices, event::EventType, tpl::Tpl},
     component::{
         component,
         hob::Hob,
@@ -162,7 +162,7 @@ impl Performance {
         timer: Service<dyn ArchTimerFunctionality>,
     ) -> Result<(), EfiError>
     where
-        B: BootServices + Clone + 'static,
+        B: BootServices + ProtocolServices + Clone + 'static,
         R: RuntimeServices + Clone + 'static,
         P: HobPerformanceDataExtractor,
         F: FirmwareBasicBootPerfTable,
@@ -512,7 +512,7 @@ mod tests {
     use r_efi::efi;
 
     use patina::{
-        boot_services::{MockBootServices, c_ptr::CPtr},
+        boot_services::MockBootServices,
         component::service::{IntoService, Service},
         performance::{
             Measurement,
@@ -601,9 +601,9 @@ mod tests {
 
         // Test that the protocol in installed.
         boot_services
-            .expect_install_protocol_interface::<EdkiiPerformanceMeasurement, Box<_>>()
+            .expect_install_protocol_interface_unchecked()
             .once()
-            .withf_st(|handle, _protocol_interface| {
+            .withf_st(|handle, _protocol, _interface| {
                 assert_eq!(&None, handle);
                 assert_eq!(
                     EDKII_PERFORMANCE_MEASUREMENT_PROTOCOL_GUID.into_inner(),
@@ -611,7 +611,7 @@ mod tests {
                 );
                 true
             })
-            .returning(|_, protocol_interface| Ok((TEST_EFI_HANDLE, protocol_interface.metadata())));
+            .returning_st(|_, _, _| Ok(TEST_EFI_HANDLE));
 
         // Test that an event to report the fbpt at the end of dxe is created.
         boot_services
@@ -702,9 +702,9 @@ mod tests {
             })
             .return_const_st(Ok(TEST_EVENT_HANDLE_2));
         entry_point_mock
-            .expect_install_protocol_interface::<EdkiiPerformanceMeasurement, Box<_>>()
+            .expect_install_protocol_interface_unchecked()
             .once()
-            .returning(|_, protocol_interface| Ok((TEST_EFI_HANDLE, protocol_interface.metadata())));
+            .returning_st(|_, _, _| Ok(TEST_EFI_HANDLE));
         entry_point_mock.expect_install_configuration_table::<Box<PerformanceProperty>>().once().return_const(Ok(()));
 
         let runtime_services = MockRuntimeServices::new();

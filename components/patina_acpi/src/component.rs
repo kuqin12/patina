@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::mem;
 
 use patina::{
-    boot_services::{BootServices, StandardBootServices},
+    boot_services::{ProtocolServices, StandardBootServices},
     component::{Storage, component},
     uefi_size_to_pages,
 };
