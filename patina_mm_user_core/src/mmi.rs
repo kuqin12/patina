@@ -349,10 +349,8 @@ impl MmiDatabase {
                 s if s == WARN_INTERRUPT_SOURCE_QUIESCED => {
                     return_status = efi::Status::SUCCESS;
                 }
-                s if s == WARN_INTERRUPT_SOURCE_PENDING => {
-                    if return_status != efi::Status::SUCCESS {
-                        return_status = status;
-                    }
+                s if s == WARN_INTERRUPT_SOURCE_PENDING && return_status != efi::Status::SUCCESS => {
+                    return_status = status;
                 }
                 _ => {
                     // Other statuses are ignored per PI spec
