@@ -33,7 +33,7 @@ use crate::{
     CommBufferConfig,
     mem::{PageAllocator, PagingPoolAllocator, SharedPagingAllocator},
     mm_policy::gate::PolicyGate,
-    save_state::{SaveStateAccessHolder, SaveStateInfo},
+    save_state::SaveStateInfo,
     supervisor_handlers::{
         EFI_DXE_MM_READY_TO_LOCK_PROTOCOL_GUID, SupervisorMmiHandler, UnblockedMemoryTracker,
         mm_exit_boot_services_handler, mm_ready_to_lock_handler, mm_supv_request_handler,
@@ -167,8 +167,6 @@ pub(crate) struct SecurityState {
     comm_buffer_config: Once<CommBufferConfig>,
     /// Per-CPU save-state metadata for the save-state read syscall.
     save_state_info: Once<SaveStateInfo>,
-    /// In-flight two-phase save-state read hand-off.
-    save_state_access: Mutex<Option<SaveStateAccessHolder>>,
 }
 
 impl SecurityState {
@@ -182,7 +180,6 @@ impl SecurityState {
             unblocked_memory_tracker: UnblockedMemoryTracker::new(),
             comm_buffer_config: Once::new(),
             save_state_info: Once::new(),
-            save_state_access: Mutex::new(None),
         }
     }
 
@@ -234,11 +231,6 @@ impl SecurityState {
     /// Returns the per-CPU save-state metadata, if set.
     pub(crate) fn save_state_info(&self) -> Option<SaveStateInfo> {
         self.save_state_info.get().copied()
-    }
-
-    /// Locks the in-flight save-state hand-off slot.
-    pub(crate) fn lock_save_state_access(&self) -> MutexGuard<'_, Option<SaveStateAccessHolder>, Spin> {
-        self.save_state_access.lock()
     }
 }
 

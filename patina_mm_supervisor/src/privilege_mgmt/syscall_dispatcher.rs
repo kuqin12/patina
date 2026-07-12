@@ -216,15 +216,14 @@ impl SyscallDispatcher {
             SyscallIndex::AllocPage => self.handle_alloc_page(ctx),
             SyscallIndex::FreePage => self.handle_free_page(ctx),
             SyscallIndex::StartApProc => self.handle_start_ap_proc(ctx),
-            SyscallIndex::SaveStateRead2 => self.handle_save_state_read2(ctx),
             SyscallIndex::MmMemoryUnblocked => self.handle_mm_memory_unblocked(ctx),
             SyscallIndex::MmIsCommBuffer => self.handle_mm_is_comm_buffer(ctx),
         };
 
         match result {
-            Err(err) if index == SyscallIndex::SaveStateRead2 => {
+            Err(err) if index == SyscallIndex::SaveStateRead => {
                 log::trace!("Syscall: {:?} returned value=0x{:x}", index, err.as_usize());
-                Ok(err.as_usize() as u64) // Return error code to caller for SaveStateRead2
+                Ok(err.as_usize() as u64) // Return error code to caller for the save-state read syscall.
             }
             Err(err) => {
                 panic!("Syscall: {:?} failed with error: {:?}", index, err); // Panic for other syscalls
@@ -475,22 +474,14 @@ impl SyscallDispatcher {
         Ok(0)
     }
 
-    /// Handles save state read syscall (legacy).
+    /// Handles the save-state read syscall.
     ///
-    /// - Arg1: User MM CPU protocol pointer
-    /// - Arg2: Register to be read (`EFI_MM_SAVE_STATE_REGISTER`)
-    /// - Arg3: CPU index to read from
+    /// - Arg1: CPU index to read from
+    /// - Arg2: `SaveStateType` discriminant selecting the field (ProcessorId/Rax/IoTrap)
+    /// - Arg3: pointer to an 8-byte user output buffer
     fn handle_save_state_read(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ: protocol=0x{:x}, register={}, cpu={}", ctx.arg1, ctx.arg2, ctx.arg3);
-
-        // Validate parameters
-        if ctx.arg1 == 0 {
-            log::error!("SAVE_STATE_READ: Null protocol pointer");
-            return Err(Status::INVALID_PARAMETER);
-        }
-
-        // Delegate to save state module Phase 1
-        crate::save_state::save_state_read_phase1(ctx.arg1, ctx.arg2, ctx.arg3)
+        log::trace!("SAVE_STATE_READ: cpu={}, field={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+        crate::save_state::save_state_read(ctx.arg1, ctx.arg2, ctx.arg3)
     }
 
     /// Handles page allocation syscall.
@@ -655,24 +646,6 @@ impl SyscallDispatcher {
                 Err(Status::NOT_READY)
             }
         }
-    }
-
-    /// Handles extended save state read syscall.
-    ///
-    /// - Arg1: User MM CPU protocol pointer
-    /// - Arg2: Width of buffer to read in bytes
-    /// - Arg3: User buffer to hold return data
-    fn handle_save_state_read2(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
-
-        // Validate parameters
-        if ctx.arg1 == 0 {
-            log::error!("SAVE_STATE_READ2: Null protocol pointer");
-            return Err(Status::INVALID_PARAMETER);
-        }
-
-        // Delegate to save state module Phase 2
-        crate::save_state::save_state_read_phase2(ctx.arg1, ctx.arg2, ctx.arg3)
     }
 
     /// Handles MM memory unblocked check syscall.

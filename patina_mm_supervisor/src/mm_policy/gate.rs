@@ -311,7 +311,7 @@ impl PolicyGate {
     /// Checks if save state read access is allowed.
     pub fn is_save_state_read_allowed(
         &self,
-        field: Option<SaveStateField>,
+        field: SaveStateField,
         width: usize,
         current_condition: Option<SaveStateCondition>,
     ) -> Result<(), PolicyError> {
@@ -329,31 +329,27 @@ impl PolicyGate {
 
         let mut found_match = false;
 
-        // Only RAX / IO_TRAP have a policy field; every other register has
-        // `field == None` and therefore matches no descriptor.
-        if let Some(field) = field {
-            for desc in descriptors {
-                if desc.map_field == field.as_index() {
-                    // Check if this is a read-allowed policy
-                    let is_read = (desc.attributes & RESOURCE_ATTR_READ) != 0;
-                    let is_cond_read = (desc.attributes & RESOURCE_ATTR_COND_READ) != 0;
+        for desc in descriptors {
+            if desc.map_field == field.as_index() {
+                // Check if this is a read-allowed policy
+                let is_read = (desc.attributes & RESOURCE_ATTR_READ) != 0;
+                let is_cond_read = (desc.attributes & RESOURCE_ATTR_COND_READ) != 0;
 
-                    if is_read || is_cond_read {
-                        // Check condition if this is conditional read
-                        if is_cond_read {
-                            if let Some(current) = current_condition
-                                && desc.access_condition == current as u32
-                            {
-                                found_match = true;
-                                break;
-                            }
-                            // Condition doesn't match, continue looking
-                        } else {
-                            // Unconditional read
-                            if desc.access_condition == SaveStateCondition::Unconditional as u32 {
-                                found_match = true;
-                                break;
-                            }
+                if is_read || is_cond_read {
+                    // Check condition if this is conditional read
+                    if is_cond_read {
+                        if let Some(current) = current_condition
+                            && desc.access_condition == current as u32
+                        {
+                            found_match = true;
+                            break;
+                        }
+                        // Condition doesn't match, continue looking
+                    } else {
+                        // Unconditional read
+                        if desc.access_condition == SaveStateCondition::Unconditional as u32 {
+                            found_match = true;
+                            break;
                         }
                     }
                 }
