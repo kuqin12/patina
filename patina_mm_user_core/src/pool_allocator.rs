@@ -64,8 +64,6 @@ pub enum PageAllocError {
     NotAllocated,
     /// Too many regions to track.
     TooManyRegions,
-    /// A syscall to the supervisor failed.
-    SyscallFailed(u64),
 }
 
 /// Minimum allocation size for the pool allocator.

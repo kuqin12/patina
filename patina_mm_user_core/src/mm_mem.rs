@@ -16,9 +16,8 @@
 //! | AllocPage   | `0x10004` | alloc_type (0) | mem_type (6)   | page_count  |
 //! | FreePage    | `0x10005` | address        | page_count     | 0           |
 //!
-//! The supervisor returns:
-//! - RAX: result value (allocated address for AllocPage, 0 for FreePage)
-//! - RDX: EFI status (0 = success)
+//! The supervisor returns its result solely in RAX (the allocated base address
+//! for AllocPage, or 0 on failure).
 //!
 //! ## License
 //!
@@ -46,8 +45,8 @@ const RUNTIME_SERVICES_DATA: u64 = 6;
 /// Returns `true` if the supervisor confirms the range falls entirely within
 /// the user communication buffer region.
 pub fn is_comm_buffer(address: u64, size: u64) -> bool {
-    let result = unsafe { raw_syscall(SyscallIndex::MmIsCommBuffer.as_u64(), address, size, 0) };
-    result.value != 0
+    // The supervisor returns non-zero (TRUE) if the range is a valid comm buffer.
+    unsafe { raw_syscall(SyscallIndex::MmIsCommBuffer.as_u64(), address, size, 0) != 0 }
 }
 
 /// A page allocator backend that issues `syscall` instructions to the MM Supervisor.
@@ -102,18 +101,19 @@ impl PageAllocatorBackend for SyscallPageAllocator {
             return Err(PageAllocError::OutOfMemory);
         }
 
-        let result = unsafe {
+        let addr = unsafe {
             raw_syscall(SyscallIndex::AllocPage.as_u64(), ALLOCATE_ANY_PAGES, RUNTIME_SERVICES_DATA, num_pages as u64)
         };
 
-        if result.status != 0 {
-            log::warn!("SyscallPageAllocator: AllocPage({} pages) failed with status 0x{:x}", num_pages, result.status);
-            return Err(PageAllocError::SyscallFailed(result.status));
+        // The supervisor returns the allocated base address in RAX (0 on failure).
+        if addr == 0 {
+            log::warn!("SyscallPageAllocator: AllocPage({} pages) returned a null address", num_pages);
+            return Err(PageAllocError::OutOfMemory);
         }
 
-        log::trace!("SyscallPageAllocator: allocated {} page(s) at 0x{:016x}", num_pages, result.value);
+        log::trace!("SyscallPageAllocator: allocated {} page(s) at 0x{:016x}", num_pages, addr);
 
-        Ok(result.value)
+        Ok(addr)
     }
 
     fn free_pages(&self, addr: u64, num_pages: usize) -> Result<(), PageAllocError> {

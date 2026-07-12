@@ -3,9 +3,8 @@
 //! Implements the single-phase `SaveStateRead` syscall backing the
 //! `EFI_MM_CPU_PROTOCOL.ReadSaveState()` user-space API.
 //!
-//! One syscall reads exactly ONE raw save-state field for a CPU and writes its
-//! value (as a little-endian `u64`) into a caller-supplied user buffer, returning
-//! the `EFI_STATUS` in RAX. The supported fields are [`SaveStateType`]:
+//! One syscall reads exactly ONE raw save-state field for a CPU and returns its
+//! value directly in RAX. The supported fields are [`SaveStateType`]:
 //! `ProcessorId`, `Rax`, and `IoTrap`.
 //!
 //! Assembling the composite `EFI_MM_SAVE_STATE_IO_INFO` (for
@@ -17,10 +16,10 @@
 //!
 //! ## Security Model
 //!
-//! - User buffer addresses are validated via page-table ownership queries.
 //! - `Rax` and `IoTrap` are checked through
 //!   [`PolicyGate::is_save_state_read_allowed`](crate::mm_policy::PolicyGate::is_save_state_read_allowed).
-//!   `Rax` clears the policy only when the trapping instruction was an I/O write.
+//!   `Rax` clears the policy only when the trapping instruction was an I/O write;
+//!   a denied read faults rather than leaking data.
 //! - `ProcessorId` is always allowed (informational, not security-sensitive).
 //!
 //! ## Vendor Selection
@@ -41,7 +40,7 @@ use patina::management_mode::supervisor::{IO_TRAP_TYPE_SHIFT, IO_TRAP_WIDTH_SHIF
 use patina_internal_cpu::save_state::{self, IO_TYPE_INPUT, IO_TYPE_OUTPUT, PROCESSOR_INFO_ENTRY_SIZE};
 use r_efi::efi::Status;
 
-use crate::{PageOwnership, privilege_mgmt::SyscallResult, query_address_ownership, state::security_state};
+use crate::{privilege_mgmt::SyscallResult, state::security_state};
 
 /// Size in bytes of one `SMRAM_SAVE_STATE_MAP` region.
 ///
@@ -59,9 +58,6 @@ const SMRAM_SAVE_STATE_MAP_SIZE: u64 = 0x400;
 /// is `sm_base[i] + SMRAM_SAVE_STATE_MAP_OFFSET`, derived here so the loader only
 /// has to pass the raw SMBASE array.
 const SMRAM_SAVE_STATE_MAP_OFFSET: u64 = 0xfc00;
-
-/// Number of bytes written to the user buffer (one `u64` field value).
-const FIELD_VALUE_SIZE: u64 = 8;
 
 /// Per-CPU save-state metadata needed by the save-state read syscall.
 ///
@@ -84,11 +80,17 @@ pub(crate) struct SaveStateInfo {
     pub(crate) sm_base: u64,
 }
 
-/// Reads a single save-state field for a CPU and return the value or result.
+/// Reads a single save-state field for a CPU and returns its value in RAX.
 ///
-/// The supervisor reads exactly one raw field; the caller assembles any
-/// composite structure (`EFI_MM_SAVE_STATE_IO_INFO`) itself.
-pub fn save_state_read(cpu_index: u64, field_raw: u64, buffer: u64) -> SyscallResult {
+/// `field_raw` is a [`SaveStateType`] discriminant. The supervisor reads exactly
+/// one raw field; the caller assembles any composite structure
+/// (`EFI_MM_SAVE_STATE_IO_INFO`) itself.
+///
+/// An `IoTrap` read for a CPU that did not trap an I/O instruction returns
+/// `Ok(0)` (the caller maps that to `EFI_NOT_FOUND`). Every other failure —
+/// an unknown field, an invalid CPU index, or a policy denial — returns `Err`,
+/// which the dispatcher turns into a supervisor fault.
+pub fn save_state_read(cpu_index: u64, field_raw: u64) -> SyscallResult {
     let field = match SaveStateType::from_u64(field_raw) {
         Some(f) => f,
         None => {
@@ -98,19 +100,15 @@ pub fn save_state_read(cpu_index: u64, field_raw: u64, buffer: u64) -> SyscallRe
     };
 
     // Validate the CPU index against NumberOfCpus.
-    let num_cpus = match get_number_of_cpus() {
-        Ok(n) => n,
-        Err(status) => return Err(status),
-    };
-
+    let num_cpus = get_number_of_cpus()?;
     if cpu_index >= num_cpus {
         log::error!("SAVE_STATE_READ: CPU index {} >= NumberOfCpus {}", cpu_index, num_cpus);
         return Err(Status::INVALID_PARAMETER);
     }
 
-    let value = match field {
+    match field {
         // PROCESSOR_ID is informational and not policy-gated.
-        SaveStateType::ProcessorId => read_processor_id_value(cpu_index)?,
+        SaveStateType::ProcessorId => read_processor_id_value(cpu_index),
 
         // RAX and the I/O trap descriptor are read from the SMRAM save state and
         // gated by the save-state security policy.
@@ -121,14 +119,7 @@ pub fn save_state_read(cpu_index: u64, field_raw: u64, buffer: u64) -> SyscallRe
                 SaveStateType::ProcessorId => unreachable!("handled above"),
             };
 
-            let view = match get_save_state_view(cpu_index) {
-                Ok(v) => v,
-                Err(status) => {
-                    log::error!("SAVE_STATE_READ: Failed to get save-state view for CPU {}: {:?}", cpu_index, status);
-                    return Err(status);
-                }
-            };
-
+            let view = get_save_state_view(cpu_index)?;
             let condition = inspect_io_condition(&view);
 
             let gate = match security_state().policy_gate() {
@@ -138,55 +129,19 @@ pub fn save_state_read(cpu_index: u64, field_raw: u64, buffer: u64) -> SyscallRe
                     return Err(Status::NOT_READY);
                 }
             };
-            if let Err(e) = gate.is_save_state_read_allowed(policy_field, FIELD_VALUE_SIZE as usize, condition) {
+            if let Err(e) = gate.is_save_state_read_allowed(policy_field, 8, condition) {
                 log::error!("SAVE_STATE_READ: Policy denied read of {:?}: {:?}", field, e);
                 return Err(Status::ACCESS_DENIED);
             }
 
             match field {
-                SaveStateType::Rax => read_rax_value(&view),
-                SaveStateType::IoTrap => match read_io_trap_packed(&view) {
-                    Some(v) => v,
-                    None => {
-                        log::error!("SAVE_STATE_READ: No valid I/O trap in the save state");
-                        return Err(Status::NOT_FOUND);
-                    }
-                },
+                SaveStateType::Rax => Ok(read_rax_value(&view)),
+                // No valid I/O trap → 0; the caller maps that to EFI_NOT_FOUND.
+                SaveStateType::IoTrap => Ok(read_io_trap_packed(&view).unwrap_or(0)),
                 SaveStateType::ProcessorId => unreachable!("handled above"),
             }
         }
-    };
-
-    write_field_value(buffer, value)
-}
-
-/// Validates that `buffer` is an 8-byte user-owned region and writes `value`
-/// into it as little-endian bytes.
-fn write_field_value(buffer: u64, value: u64) -> SyscallResult {
-    if buffer == 0 {
-        log::error!("SAVE_STATE_READ: Null output buffer");
-        return Err(Status::INVALID_PARAMETER);
     }
-
-    // Validate the buffer is in user-owned memory.
-    match query_address_ownership(buffer, FIELD_VALUE_SIZE) {
-        Some(PageOwnership::User) => {}
-        Some(owner) => {
-            log::error!("SAVE_STATE_READ: Buffer 0x{:x} owned by {:?}, expected User", buffer, owner);
-            return Err(Status::ACCESS_DENIED);
-        }
-        None => {
-            log::error!("SAVE_STATE_READ: Buffer 0x{:x} not in mapped memory", buffer);
-            return Err(Status::ACCESS_DENIED);
-        }
-    }
-
-    // SAFETY: `buffer` was validated above as a user-owned, writable region of
-    // `FIELD_VALUE_SIZE` bytes. User code is not executing concurrently while the
-    // supervisor services this syscall, so there is no aliasing.
-    let out = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, FIELD_VALUE_SIZE as usize) };
-    out.copy_from_slice(&value.to_le_bytes());
-    Ok(0)
 }
 
 /// Returns the per-CPU save-state metadata captured at initialization.
@@ -408,6 +363,6 @@ mod tests {
     #[test]
     fn test_save_state_read_rejects_unknown_field() {
         // An unknown field type is rejected before any global state is touched.
-        assert_eq!(save_state_read(0, 999, 0), Err(Status::INVALID_PARAMETER));
+        assert_eq!(save_state_read(0, 999), Err(Status::INVALID_PARAMETER));
     }
 }

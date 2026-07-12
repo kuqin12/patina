@@ -104,10 +104,7 @@ extern "efiapi" fn mm_cpu_read_save_state(
 
 /// Reads a scalar field and writes its low `width` bytes (capped at 8) to `buffer`.
 fn write_scalar(cpu_index: usize, field: SaveStateType, width: usize, buffer: *mut c_void) -> efi::Status {
-    let value = match read_field(cpu_index, field) {
-        Ok(v) => v,
-        Err(status) => return status,
-    };
+    let value = read_field(cpu_index, field);
 
     let n = width.min(core::mem::size_of::<u64>());
     // SAFETY: `buffer` is a caller-provided output of at least `width` bytes and
@@ -125,22 +122,20 @@ fn write_io_info(cpu_index: usize, width: usize, buffer: *mut c_void) -> efi::St
         return efi::Status::INVALID_PARAMETER;
     }
 
-    // The trap descriptor is packed as {IoPort:16, IoWidth:8, IoType:8}.
-    let packed = match read_field(cpu_index, SaveStateType::IoTrap) {
-        Ok(v) => v,
-        Err(status) => return status,
-    };
+    // The trap descriptor is packed as {IoPort:16, IoWidth:8, IoType:8}. A packed
+    // value of 0 means the CPU did not trap an I/O instruction.
+    let packed = read_field(cpu_index, SaveStateType::IoTrap);
+    if packed == 0 {
+        return efi::Status::NOT_FOUND;
+    }
     let io_port = (packed & 0xFFFF) as u16;
     let io_width = ((packed >> IO_TRAP_WIDTH_SHIFT) & 0xFF) as u32;
     let io_type = ((packed >> IO_TRAP_TYPE_SHIFT) & 0xFF) as u32;
 
     // The I/O data is only meaningful for an OUT (write); for an IN it is not yet
-    // present, so report zero rather than reading (and being denied) RAX.
+    // present, so report zero rather than reading RAX.
     let io_data = if io_type == protocol::IO_TYPE_OUTPUT {
-        let rax = match read_field(cpu_index, SaveStateType::Rax) {
-            Ok(v) => v,
-            Err(status) => return status,
-        };
+        let rax = read_field(cpu_index, SaveStateType::Rax);
         let byte_count = 1usize << io_width;
         let mask =
             if byte_count >= core::mem::size_of::<u64>() { u64::MAX } else { (1u64 << (byte_count * 8)) - 1 };
@@ -210,20 +205,30 @@ mod tests {
     }
 
     #[test]
-    fn test_mm_cpu_read_save_state_supported_register_forwards_to_syscall() {
+    fn test_mm_cpu_read_save_state_supported_scalar_forwards_to_syscall() {
         let mut buf = [0u8; protocol::IO_INFO_SIZE];
-        // A supported scalar register passes the whitelist and forwards to the
-        // syscall wrapper, which on the host (non-UEFI) target is a stub reporting
-        // the operation as unsupported. Reaching UNSUPPORTED proves the forward path.
+        // A supported scalar register forwards to the syscall wrapper, which on the
+        // host (non-UEFI) target is a stub returning 0. The read therefore succeeds
+        // and writes 0 — reaching SUCCESS proves the forward path.
         for register in [protocol::REGISTER_PROCESSOR_ID, protocol::REGISTER_RAX] {
             let status = mm_cpu_read_save_state(dummy_this(), 8, register, 0, buf.as_mut_ptr().cast());
-            assert_eq!(status, efi::Status::UNSUPPORTED);
+            assert_eq!(status, efi::Status::SUCCESS);
         }
+    }
 
-        // IO needs a full IO_INFO buffer; it forwards on the initial IoTrap read.
-        let status =
-            mm_cpu_read_save_state(dummy_this(), protocol::IO_INFO_SIZE, protocol::REGISTER_IO, 0, buf.as_mut_ptr().cast());
-        assert_eq!(status, efi::Status::UNSUPPORTED);
+    #[test]
+    fn test_mm_cpu_read_save_state_io_no_trap_is_not_found() {
+        let mut buf = [0u8; protocol::IO_INFO_SIZE];
+        // On the host the IoTrap read returns 0 (stub), which means "no I/O trap"
+        // and maps to EFI_NOT_FOUND.
+        let status = mm_cpu_read_save_state(
+            dummy_this(),
+            protocol::IO_INFO_SIZE,
+            protocol::REGISTER_IO,
+            0,
+            buf.as_mut_ptr().cast(),
+        );
+        assert_eq!(status, efi::Status::NOT_FOUND);
     }
 
     #[test]

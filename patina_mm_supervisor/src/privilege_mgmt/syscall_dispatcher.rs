@@ -221,10 +221,6 @@ impl SyscallDispatcher {
         };
 
         match result {
-            Err(err) if index == SyscallIndex::SaveStateRead => {
-                log::trace!("Syscall: {:?} returned value=0x{:x}", index, err.as_usize());
-                Ok(err.as_usize() as u64) // Return error code to caller for the save-state read syscall.
-            }
             Err(err) => {
                 panic!("Syscall: {:?} failed with error: {:?}", index, err); // Panic for other syscalls
             }
