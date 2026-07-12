@@ -27,15 +27,11 @@
 extern crate alloc;
 
 use alloc::{borrow::Cow, boxed::Box, vec::Vec};
-use core::ops::Deref;
 
 use patina::{
-    component::{IntoComponent, MetaData, Storage, UnsafeStorageCell, params::Param, service::IntoService},
-    mm_services::MmServices,
+    component::{IntoComponent, Storage, service::IntoService},
     pi::hob::Hob,
 };
-
-use crate::MmUserCore;
 
 /// A trait implemented by the platform to register components, configurations,
 /// and services with the MM User Core.
@@ -253,79 +249,5 @@ impl MmComponentDispatcher {
             let metadata = component.metadata();
             log::warn!("  {} — {}", metadata.name(), metadata.error_message().unwrap_or(Cow::from("")));
         }
-    }
-}
-
-/// A component parameter granting access to the MM System Table services
-/// ([`MmServices`]).
-///
-/// This is the MM analogue of `StandardBootServices` in the DXE component model:
-/// it lets a component running in the MM User Core install and locate MM
-/// protocols, register MMI handlers, and allocate MM pool/pages. It dereferences
-/// to [`dyn MmServices`](MmServices), so a component can call service methods
-/// directly on the parameter.
-///
-/// ## Example
-///
-/// ```rust,ignore
-/// use patina::{component::component, error::Result};
-/// use patina_mm_user_core::component_dispatcher::MmServiceProvider;
-///
-/// #[component]
-/// impl MyComponent {
-///     fn entry_point(self, mm: MmServiceProvider) -> Result<()> {
-///         // SAFETY: `interface` outlives the installation.
-///         unsafe {
-///             mm.install_protocol_interface(/* ... */)?;
-///         }
-///         Ok(())
-///     }
-/// }
-/// ```
-#[derive(Clone, Copy)]
-pub struct MmServiceProvider {
-    /// The MM services implementation (the MM User Core instance).
-    services: &'static dyn MmServices,
-}
-
-impl MmServiceProvider {
-    /// Returns the underlying [`MmServices`] implementation.
-    #[inline(always)]
-    pub fn get(&self) -> &'static dyn MmServices {
-        self.services
-    }
-}
-
-impl Deref for MmServiceProvider {
-    type Target = dyn MmServices + 'static;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.services
-    }
-}
-
-// SAFETY: `MmServiceProvider` reads only the process-global MM User Core instance
-// (a `&'static dyn MmServices`) and never accesses component `Storage`. It
-// therefore registers no storage access in `init_state` and cannot conflict with
-// any other parameter.
-unsafe impl Param for MmServiceProvider {
-    type State = ();
-    type Item<'storage, 'state> = Self;
-
-    unsafe fn get_param<'storage, 'state>(
-        _state: &'state Self::State,
-        _storage: UnsafeStorageCell<'storage>,
-    ) -> Self::Item<'storage, 'state> {
-        // `validate` guarantees the instance is set before this is called.
-        MmServiceProvider { services: MmUserCore::instance() }
-    }
-
-    fn validate(_state: &Self::State, _storage: UnsafeStorageCell) -> bool {
-        MmUserCore::try_instance().is_some()
-    }
-
-    fn init_state(_storage: &mut Storage, _meta: &mut MetaData) -> Result<Self::State, Cow<'static, str>> {
-        Ok(())
     }
 }

@@ -392,6 +392,10 @@ impl MmUserCore {
     /// via dependency injection. Configs are dispatched in two rounds: unlocked
     /// (for `ConfigMut<T>` components), then locked (for `Config<T>` consumers).
     fn dispatch_components<C: MmComponentInfo>(&self, hob: &Hob<'_>) {
+        // Expose the MM services (protocol install/locate, MMI handler registration,
+        // pool/page allocation) to components via the `MmServiceProvider` parameter.
+        patina::mm_services::register_component_mm_services(MmUserCore::instance());
+
         let mut cd = self.component_dispatcher.lock();
         cd.apply_component_info::<C>();
         cd.insert_hobs(hob);
