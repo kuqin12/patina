@@ -30,6 +30,15 @@ pub const REGISTER_IO: u32 = 512;
 /// `EFI_MM_SAVE_STATE_REGISTER_PROCESSOR_ID` — pseudo-register for the CPU's ID.
 pub const REGISTER_PROCESSOR_ID: u32 = 514;
 
+/// `EFI_MM_SAVE_STATE_IO_TYPE_INPUT` (1) — the trapping instruction was an `IN`.
+pub const IO_TYPE_INPUT: u32 = 1;
+
+/// `EFI_MM_SAVE_STATE_IO_TYPE_OUTPUT` (2) — the trapping instruction was an `OUT`.
+pub const IO_TYPE_OUTPUT: u32 = 2;
+
+/// Size in bytes of `EFI_MM_SAVE_STATE_IO_INFO` (the `IO` pseudo-register buffer).
+pub const IO_INFO_SIZE: usize = 24;
+
 /// `EFI_MM_READ_SAVE_STATE` — read a register from a CPU's MM save state.
 pub type MmReadSaveState = extern "efiapi" fn(
     this: *const MmCpuProtocol,
