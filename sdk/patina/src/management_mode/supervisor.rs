@@ -74,7 +74,9 @@ pub enum SyscallIndex {
     Wbinvd = 0x0005,
     /// HLT - Halt processor
     Hlt = 0x0006,
-    /// Save State Read - Arg1: register, Arg2: CPU index
+    /// Read a CPU save-state field. Arg1: CPU index, Arg2: [`SaveStateType`],
+    /// Arg3: pointer to an 8-byte user output buffer. Returns `EFI_STATUS` in
+    /// RAX and writes the field value to the buffer on success.
     SaveStateRead = 0x0007,
     /// Maximum value for legacy syscall indices
     LegacyMax = 0xFFFF,
@@ -84,8 +86,6 @@ pub enum SyscallIndex {
     FreePage = 0x10005,
     /// Start AP Procedure - Arg1: procedure, Arg2: CPU index, Arg3: argument
     StartApProc = 0x10006,
-    /// Save state read with extended support - Arg1: width, Arg2: buffer pointer
-    SaveStateRead2 = 0x10021,
     /// MM memory unblocked - Arg1: address, Arg2: size
     MmMemoryUnblocked = 0x10022,
     /// MM is communication buffer - Arg1: address, Arg2: size
@@ -108,7 +108,6 @@ impl SyscallIndex {
             0x10004 => Some(Self::AllocPage),
             0x10005 => Some(Self::FreePage),
             0x10006 => Some(Self::StartApProc),
-            0x10021 => Some(Self::SaveStateRead2),
             0x10022 => Some(Self::MmMemoryUnblocked),
             0x10023 => Some(Self::MmIsCommBuffer),
             _ => None,
@@ -116,6 +115,51 @@ impl SyscallIndex {
     }
 
     /// Returns the raw `u64` value of this syscall index.
+    pub fn as_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+/// The save-state field a [`SyscallIndex::SaveStateRead`] request selects.
+///
+/// This is the `arg2` of the save-state read syscall. The supervisor reads only
+/// these individual fields; assembling the composite
+/// `EFI_MM_SAVE_STATE_IO_INFO` (for `EFI_MM_SAVE_STATE_REGISTER_IO`) is the
+/// caller's responsibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum SaveStateType {
+    /// The trapping CPU's ID (APIC ID). Informational; not policy-gated.
+    ProcessorId = 0,
+    /// The `RAX` register. Policy-gated; readable only when the trap was an I/O write.
+    Rax = 1,
+    /// The I/O trap descriptor (port, width, direction) of the trapping
+    /// instruction, packed as described by [`IO_TRAP_PORT_SHIFT`] and friends.
+    /// Does **not** include the I/O data (read `Rax` separately for that).
+    IoTrap = 2,
+}
+
+/// Bit position of the I/O port (`u16`) in a packed [`SaveStateType::IoTrap`] value.
+pub const IO_TRAP_PORT_SHIFT: u32 = 0;
+/// Bit position of the I/O width (EFI `EFI_MM_SAVE_STATE_IO_WIDTH`, one byte) in
+/// a packed [`SaveStateType::IoTrap`] value.
+pub const IO_TRAP_WIDTH_SHIFT: u32 = 16;
+/// Bit position of the I/O type (EFI `EFI_MM_SAVE_STATE_IO_TYPE`, one byte) in a
+/// packed [`SaveStateType::IoTrap`] value.
+pub const IO_TRAP_TYPE_SHIFT: u32 = 24;
+
+impl SaveStateType {
+    /// Creates a `SaveStateType` from a raw `u64` value.
+    pub fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(Self::ProcessorId),
+            1 => Some(Self::Rax),
+            2 => Some(Self::IoTrap),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw `u64` value of this save-state type.
     pub fn as_u64(self) -> u64 {
         self as u64
     }
