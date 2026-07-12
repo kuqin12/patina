@@ -70,6 +70,11 @@ impl StandardMmServices {
         self.provider.is_completed()
     }
 
+    /// Returns the registered provider, or `None` if one has not been registered.
+    pub fn get(&self) -> Option<&'static dyn MmServices> {
+        self.provider.get().copied()
+    }
+
     /// Returns the registered provider.
     ///
     /// # Panics
@@ -353,5 +358,85 @@ impl MmServices for StandardMmServices {
         protocol: Option<&efi::Guid>,
     ) -> Result<Vec<efi::Handle>, efi::Status> {
         self.provider().locate_handle(search_type, protocol)
+    }
+}
+
+/// Global bridge exposing the MM services to Patina components.
+///
+/// The MM User Core registers its [`MmServices`] provider here during startup
+/// via [`register_component_mm_services`]; the [`MmServiceProvider`] component
+/// parameter then resolves to it. This is kept separate from the
+/// `EfiMmSystemTable` thunk bridge so component access does not depend on the C
+/// system-table plumbing.
+static COMPONENT_MM_SERVICES: StandardMmServices = StandardMmServices::new_uninit();
+
+/// Register the [`MmServices`] provider that [`MmServiceProvider`] resolves to.
+///
+/// Called once by the MM User Core during startup. The first registration wins.
+pub fn register_component_mm_services(provider: &'static dyn MmServices) {
+    COMPONENT_MM_SERVICES.init(provider);
+}
+
+/// Returns the component [`MmServices`] provider, if one has been registered.
+pub fn component_mm_services() -> Option<&'static dyn MmServices> {
+    COMPONENT_MM_SERVICES.get()
+}
+
+/// A component parameter granting access to the MM System Table services
+/// ([`MmServices`]).
+///
+/// This is the MM analogue of
+/// [`StandardBootServices`](crate::boot_services::StandardBootServices) in the
+/// component model. The provider must be registered via [`register_component_mm_services`]
+/// (done by the MM User Core) before a component requesting this parameter is
+/// dispatched; until then the parameter is unavailable and the component is not
+/// scheduled.
+#[derive(Clone, Copy)]
+pub struct MmServiceProvider {
+    /// The registered MM services implementation.
+    services: &'static dyn MmServices,
+}
+
+impl MmServiceProvider {
+    /// Returns the underlying [`MmServices`] implementation.
+    #[inline(always)]
+    pub fn get(&self) -> &'static dyn MmServices {
+        self.services
+    }
+}
+
+impl core::ops::Deref for MmServiceProvider {
+    type Target = dyn MmServices + 'static;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.services
+    }
+}
+
+// SAFETY: `MmServiceProvider` reads only the process-global component MM services
+// provider (a `&'static dyn MmServices`) and never accesses component `Storage`,
+// so it registers no storage access and cannot conflict with any other parameter.
+unsafe impl crate::component::params::Param for MmServiceProvider {
+    type State = ();
+    type Item<'storage, 'state> = Self;
+
+    unsafe fn get_param<'storage, 'state>(
+        _state: &'state Self::State,
+        _storage: crate::component::UnsafeStorageCell<'storage>,
+    ) -> Self::Item<'storage, 'state> {
+        // `validate` guarantees the provider is registered before this is called.
+        MmServiceProvider { services: component_mm_services().expect("component MM services not registered") }
+    }
+
+    fn validate(_state: &Self::State, _storage: crate::component::UnsafeStorageCell) -> bool {
+        component_mm_services().is_some()
+    }
+
+    fn init_state(
+        _storage: &mut crate::component::Storage,
+        _meta: &mut crate::component::MetaData,
+    ) -> Result<Self::State, alloc::borrow::Cow<'static, str>> {
+        Ok(())
     }
 }
