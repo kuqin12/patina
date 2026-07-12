@@ -474,10 +474,11 @@ impl SyscallDispatcher {
     ///
     /// - Arg1: CPU index to read from
     /// - Arg2: `SaveStateType` discriminant selecting the field (ProcessorId/Rax/IoTrap)
-    /// - Arg3: pointer to an 8-byte user output buffer
+    ///
+    /// Returns the raw field value in RAX.
     fn handle_save_state_read(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ: cpu={}, field={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
-        crate::save_state::save_state_read(ctx.arg1, ctx.arg2, ctx.arg3)
+        log::trace!("SAVE_STATE_READ: cpu={}, field={}", ctx.arg1, ctx.arg2);
+        crate::save_state::save_state_read(ctx.arg1, ctx.arg2)
     }
 
     /// Handles page allocation syscall.
