@@ -428,8 +428,7 @@ fn inspect_io_condition(view: &SaveStateView) -> Option<SaveStateCondition> {
     // Verify the save state revision supports IO info before reading the field.
     let smm_rev_id = view.read_u32(vc.smmrevid_offset as usize);
     if !save_state::io_info_supported(smm_rev_id) {
-        log::error!("inspect_io_condition: SMMRevId 0x{:x} does not expose IO info", smm_rev_id);
-        // return None;
+        panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
     }
 
     // Read the vendor-specific IO information field.
@@ -503,8 +502,7 @@ fn read_io_register(view: &SaveStateView, out: &mut [u8]) -> SyscallResult {
     // 1. Read SMMRevId to verify IO info is available.
     let smm_rev_id = view.read_u32(vc.smmrevid_offset as usize);
     if !save_state::io_info_supported(smm_rev_id) {
-        log::error!("IO_READ: SMMRevId 0x{:x} does not expose IO info", smm_rev_id);
-        // return Err(Status::NOT_FOUND);
+        panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
     }
 
     // 2. Read the vendor-specific IO information field and parse it.
