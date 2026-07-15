@@ -89,15 +89,13 @@ pub(crate) struct SaveStateAccessHolder {
     pub(crate) cpu_index: u64,
 }
 
-/// Maps a save state register to a policy-gated [`SaveStateField`], if any.
+/// Returns the ordered sequence of policy checks a read of `reg` must clear.
 ///
-/// Only RAX and IO are subject to policy gating.  All other registers are
-/// either always allowed or have special handling (PROCESSOR_ID).
-fn to_policy_field(reg: MmSaveStateRegister) -> Option<SaveStateField> {
+fn policy_checks_for_register(reg: MmSaveStateRegister) -> &'static [SaveStateField] {
     match reg {
-        MmSaveStateRegister::Rax => Some(SaveStateField::Rax),
-        MmSaveStateRegister::Io => Some(SaveStateField::IoTrap),
-        _ => None,
+        MmSaveStateRegister::Io => &[SaveStateField::IoTrap, SaveStateField::Rax],
+        MmSaveStateRegister::Rax => &[SaveStateField::Rax],
+        _ => &[],
     }
 }
 
@@ -208,15 +206,8 @@ pub fn save_state_read_phase2(protocol: u64, width: u64, buffer: u64) -> Syscall
         Err(status) => return Err(status),
     };
 
-    // Every register except PROCESSOR_ID (returned above) must clear the
-    // save-state policy — not just RAX and IO. RAX and IO map to explicit policy
-    // fields (evaluated against the current I/O trap condition); every other
-    // register has no field and can only clear the policy as "not in the list":
-    // allowed under a deny-list root, denied under an allow-list root. This
-    // mirrors the C `IsIhvSmmSaveStateReadAllowed` switch (RAX/IO -> field,
-    // `default` -> allow/deny with no match).
-    let policy_field = to_policy_field(register);
-    let condition = if policy_field.is_some() { inspect_io_condition(&view) } else { None };
+    let policy_checks = policy_checks_for_register(register);
+    let condition = if !policy_checks.is_empty() { inspect_io_condition(&view) } else { None };
 
     // An IO read needs the trap condition; if it can't be determined the CPU did
     // not trap an I/O instruction, which is NOT_FOUND rather than a policy denial.
@@ -233,9 +224,13 @@ pub fn save_state_read_phase2(protocol: u64, width: u64, buffer: u64) -> Syscall
         }
     };
 
-    if let Err(e) = gate.is_save_state_read_allowed(policy_field, width as usize, condition) {
-        log::error!("SAVE_STATE_READ2: Policy denied read of {:?}: {:?}", register, e);
-        return Err(Status::ACCESS_DENIED);
+    // Each required field must independently clear the policy under the same trap
+    // condition.
+    for &field in policy_checks {
+        if let Err(e) = gate.is_save_state_read_allowed(field, width as usize, condition) {
+            log::error!("SAVE_STATE_READ2: Policy denied read of {:?} (field {:?}): {:?}", register, field, e);
+            return Err(Status::ACCESS_DENIED);
+        }
     }
 
     // Dispatch to the appropriate read handler.  Each handler reads from the
@@ -586,11 +581,17 @@ mod tests {
     }
 
     #[test]
-    fn test_to_policy_field() {
-        assert_eq!(to_policy_field(MmSaveStateRegister::Rax), Some(SaveStateField::Rax));
-        assert_eq!(to_policy_field(MmSaveStateRegister::Io), Some(SaveStateField::IoTrap));
-        assert_eq!(to_policy_field(MmSaveStateRegister::Rbx), None);
-        assert_eq!(to_policy_field(MmSaveStateRegister::ProcessorId), None);
+    fn test_policy_checks_for_register() {
+        // RAX maps to a single RAX field check.
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rax), &[SaveStateField::Rax]);
+        // IO is composite: it discloses the IO trap field and RAX, so both are checked.
+        assert_eq!(
+            policy_checks_for_register(MmSaveStateRegister::Io),
+            &[SaveStateField::IoTrap, SaveStateField::Rax]
+        );
+        // Non-gated registers still run a single `None` check (root allow/deny default).
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rbx), &[]);
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::ProcessorId), &[]);
     }
 
     #[test]

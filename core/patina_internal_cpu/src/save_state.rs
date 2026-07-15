@@ -392,8 +392,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<MmSaveStateIoInfo>(), 24);
         assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_data), 0);
         assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_port), 8);
-        assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_width), 16);
-        assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_type), 20);
+        assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_width), 12);
+        assert_eq!(core::mem::offset_of!(MmSaveStateIoInfo, io_type), 16);
     }
 
     /// Verifies the active-vendor dispatch resolves to AMD only when
