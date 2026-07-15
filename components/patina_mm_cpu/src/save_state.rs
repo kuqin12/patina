@@ -56,7 +56,7 @@ pub(crate) unsafe fn read_save_state_register(
     // scalar arguments; no memory is dereferenced by the supervisor in this phase.
     let phase1 =
         unsafe { raw_syscall(SyscallIndex::SaveStateRead.as_u64(), this as u64, register as u64, cpu_index as u64) };
-    let phase1 = efi::Status::from_usize(phase1 as usize);
+    let phase1 = efi::Status::from_usize(phase1.status as usize);
     if phase1 != efi::Status::SUCCESS {
         return phase1;
     }
@@ -67,5 +67,5 @@ pub(crate) unsafe fn read_save_state_register(
     // bytes, and the supervisor additionally validates user ownership before writing.
     let phase2 =
         unsafe { raw_syscall(SyscallIndex::SaveStateRead2.as_u64(), this as u64, width as u64, buffer as u64) };
-    efi::Status::from_usize(phase2 as usize)
+    efi::Status::from_usize(phase2.status as usize)
 }
