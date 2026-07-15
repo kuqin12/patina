@@ -119,7 +119,7 @@ pub fn parse_io_field(io_field: u32) -> Option<ParsedIoInfo> {
 
     let length = (io_field >> 1) & 0x7;
     let io_type_raw = (io_field >> 4) & 0xF;
-    let port = (io_field >> 16) & 0xFFFF;
+    let port = ((io_field >> 16) & 0xFFFF) as u16;
 
     // Simple IN/OUT in both DX and immediate-port forms are supported.
     let io_type = match io_type_raw {

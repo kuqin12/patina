@@ -155,7 +155,7 @@ pub fn parse_io_field(io_field: u32) -> Option<ParsedIoInfo> {
     }
 
     let io_type = if io_field & IO_DIRECTION_IN != 0 { IO_TYPE_INPUT } else { IO_TYPE_OUTPUT };
-    let port = (io_field >> 16) & 0xFFFF;
+    let port = ((io_field >> 16) & 0xFFFF) as u16;
 
     let (io_width, byte_count) = if io_field & IO_SIZE_BYTE != 0 {
         (IO_WIDTH_UINT8, 1usize)
