@@ -91,11 +91,11 @@ pub(crate) struct SaveStateAccessHolder {
 
 /// Returns the ordered sequence of policy checks a read of `reg` must clear.
 ///
-fn policy_checks_for_register(reg: MmSaveStateRegister) -> &'static [Option<SaveStateField>] {
+fn policy_checks_for_register(reg: MmSaveStateRegister) -> &'static [SaveStateField] {
     match reg {
-        MmSaveStateRegister::Io => &[Some(SaveStateField::IoTrap), Some(SaveStateField::Rax)],
-        MmSaveStateRegister::Rax => &[Some(SaveStateField::Rax)],
-        _ => &[None],
+        MmSaveStateRegister::Io => &[SaveStateField::IoTrap, SaveStateField::Rax],
+        MmSaveStateRegister::Rax => &[SaveStateField::Rax],
+        _ => &[],
     }
 }
 
@@ -207,7 +207,7 @@ pub fn save_state_read_phase2(protocol: u64, width: u64, buffer: u64) -> Syscall
     };
 
     let policy_checks = policy_checks_for_register(register);
-    let condition = if policy_checks.iter().any(|f| f.is_some()) { inspect_io_condition(&view) } else { None };
+    let condition = if !policy_checks.is_empty() { inspect_io_condition(&view) } else { None };
 
     // An IO read needs the trap condition; if it can't be determined the CPU did
     // not trap an I/O instruction, which is NOT_FOUND rather than a policy denial.
@@ -583,15 +583,15 @@ mod tests {
     #[test]
     fn test_policy_checks_for_register() {
         // RAX maps to a single RAX field check.
-        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rax), &[Some(SaveStateField::Rax)][..]);
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rax), &[SaveStateField::Rax]);
         // IO is composite: it discloses the IO trap field and RAX, so both are checked.
         assert_eq!(
             policy_checks_for_register(MmSaveStateRegister::Io),
-            &[Some(SaveStateField::IoTrap), Some(SaveStateField::Rax)][..]
+            &[SaveStateField::IoTrap, SaveStateField::Rax]
         );
         // Non-gated registers still run a single `None` check (root allow/deny default).
-        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rbx), &[None][..]);
-        assert_eq!(policy_checks_for_register(MmSaveStateRegister::ProcessorId), &[None][..]);
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::Rbx), &[]);
+        assert_eq!(policy_checks_for_register(MmSaveStateRegister::ProcessorId), &[]);
     }
 
     #[test]
