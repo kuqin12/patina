@@ -17,8 +17,7 @@
 //! | FreePage    | `0x10005` | address        | page_count     | 0           |
 //!
 //! The supervisor returns:
-//! - RAX: result value (allocated address for AllocPage, 0 for FreePage)
-//! - RDX: EFI status (0 = success)
+//! - RAX: result value
 //!
 //! ## License
 //!
@@ -32,72 +31,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "uefi")]
 use crate::pool_allocator::PoolAllocator;
 use crate::pool_allocator::{PageAllocError, PageAllocatorBackend};
-use patina::management_mode::supervisor::SyscallIndex;
+use patina::management_mode::supervisor::{SyscallIndex, raw_syscall};
 
 /// `AllocateAnyPages` — allocate any available pages.
 const ALLOCATE_ANY_PAGES: u64 = 0;
 
 /// `EfiRuntimeServicesData` — the memory type used for MM pool allocations.
 const RUNTIME_SERVICES_DATA: u64 = 6;
-
-/// Result of a raw syscall to the supervisor.
-#[derive(Debug, Clone, Copy)]
-struct RawSyscallResult {
-    /// Value returned in RAX (e.g., allocated address).
-    value: u64,
-    /// Status returned in RDX (EFI_STATUS).
-    status: u64,
-}
-
-/// Issue a `syscall` instruction to the MM Supervisor.
-///
-/// ## ABI
-///
-/// - RAX = call_index
-/// - RDX = arg1
-/// - R8  = arg2
-/// - R9  = arg3
-///
-/// On return:
-/// - RAX = result value
-/// - RDX = status
-///
-/// ## Safety
-///
-/// This is inherently unsafe — it transfers control to the supervisor and
-/// the arguments must be valid for the specific syscall index.
-#[cfg(target_arch = "x86_64")]
-unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> RawSyscallResult {
-    let value: u64;
-    let status: u64;
-
-    // The `syscall` instruction uses:
-    //   RAX = syscall number
-    //   RCX = return address (set by CPU on syscall entry, clobbered)
-    //   R11 = RFLAGS (set by CPU on syscall entry, clobbered)
-    //   RDX = arg1 (also used for status return)
-    //   R8  = arg2
-    //   R9  = arg3
-    //
-    // On return from the supervisor:
-    //   RAX = result value
-    //   RDX = status
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") call_index => value,
-            inlateout("rdx") arg1 => status,
-            in("r8") arg2,
-            in("r9") arg3,
-            // RCX and R11 are clobbered by the `syscall` instruction.
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-
-    RawSyscallResult { value, status }
-}
 
 /// Validate that a given memory range is a valid MM communication buffer by
 /// issuing the `MmIsCommBuffer` syscall to the supervisor.
@@ -106,7 +46,7 @@ unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> RawSy
 /// the user communication buffer region.
 pub fn is_comm_buffer(address: u64, size: u64) -> bool {
     let result = unsafe { raw_syscall(SyscallIndex::MmIsCommBuffer.as_u64(), address, size, 0) };
-    result.value != 0
+    result != 0
 }
 
 /// A page allocator backend that issues `syscall` instructions to the MM Supervisor.
@@ -161,18 +101,18 @@ impl PageAllocatorBackend for SyscallPageAllocator {
             return Err(PageAllocError::OutOfMemory);
         }
 
-        let result = unsafe {
+        let addr = unsafe {
             raw_syscall(SyscallIndex::AllocPage.as_u64(), ALLOCATE_ANY_PAGES, RUNTIME_SERVICES_DATA, num_pages as u64)
         };
 
-        if result.status != 0 {
-            log::warn!("SyscallPageAllocator: AllocPage({} pages) failed with status 0x{:x}", num_pages, result.status);
-            return Err(PageAllocError::SyscallFailed(result.status));
+        if addr == 0 {
+            log::warn!("SyscallPageAllocator: AllocPage({} pages) returned a null address", num_pages);
+            return Err(PageAllocError::OutOfMemory);
         }
 
-        log::trace!("SyscallPageAllocator: allocated {} page(s) at 0x{:016x}", num_pages, result.value);
+        log::trace!("SyscallPageAllocator: allocated {} page(s) at 0x{:016x}", num_pages, addr);
 
-        Ok(result.value)
+        Ok(addr)
     }
 
     fn free_pages(&self, addr: u64, num_pages: usize) -> Result<(), PageAllocError> {

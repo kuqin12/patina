@@ -111,6 +111,8 @@ pub fn register_info(reg: MmSaveStateRegister) -> Option<RegisterInfo> {
 /// Returns `None` if `SmiFlag` is 0 (SMI was not caused by I/O) or the I/O
 /// type is not a simple IN or OUT (e.g. string / REP I/O).
 pub fn parse_io_field(io_field: u32) -> Option<ParsedIoInfo> {
+    log::info!("Parsing IOMisc field: 0x{:08x}", io_field);
+
     // Check SmiFlag.
     let smi_flag = io_field & 1;
     if smi_flag == 0 {
@@ -136,6 +138,7 @@ pub fn parse_io_field(io_field: u32) -> Option<ParsedIoInfo> {
         _ => return None,
     };
 
+    log::info!("Parsed IO field: io_type = {}, io_width = {}, byte_count = {}, io_port = 0x{:x}", io_type, io_width, byte_count, port);
     Some(ParsedIoInfo { io_type, io_width, byte_count, io_port: port })
 }
 

@@ -14,7 +14,7 @@ features = ["doc"]
 [dependencies]
 goblin = { workspace = true, features = ["pe32", "pe64"] }
 log = { workspace = true }
-patina = { workspace = true }
+patina = { workspace = true, features = ["core"] }
 patina_internal_depex = { workspace = true }
 r-efi = { workspace = true }
 spin = { workspace = true }

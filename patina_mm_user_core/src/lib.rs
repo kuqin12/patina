@@ -45,6 +45,7 @@
 
 extern crate alloc;
 
+pub mod component_dispatcher;
 pub mod config_table;
 pub mod core_handlers;
 pub mod mm_dispatcher;
@@ -68,10 +69,14 @@ use patina::{
     pi::hob::{Hob, PhaseHandoffInformationTable},
 };
 use r_efi::efi;
-use spin::Once;
+use spin::{Mutex, Once};
 
 use crate::{
-    config_table::MmConfigurationTableDb, mm_dispatcher::MmDispatcher, mmi::MmiDatabase, protocol_db::ProtocolDatabase,
+    component_dispatcher::{MmComponentDispatcher, MmComponentInfo},
+    config_table::MmConfigurationTableDb,
+    mm_dispatcher::MmDispatcher,
+    mmi::MmiDatabase,
+    protocol_db::ProtocolDatabase,
 };
 
 use patina::{
@@ -142,11 +147,21 @@ static MM_USER_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// ## Examples
 ///
 /// ```rust,ignore
+/// use patina_mm_user_core::component_dispatcher::{Add, Component, MmComponentInfo};
+///
 /// static USER_CORE: MmUserCore = MmUserCore::new();
 ///
-/// #[unsafe(export_name = "efi_main")]
-/// pub extern "efiapi" fn _start(arg1: u64, arg2: u64, arg3: u64) -> u64 {
-///     USER_CORE.entry_point_worker(arg1, arg2, arg3)
+/// // The platform provides its components via an `MmComponentInfo` type.
+/// struct MyMmPlatform;
+/// impl MmComponentInfo for MyMmPlatform {
+///     fn components(mut add: Add<Component>) {
+///         // add.component(...);
+///     }
+/// }
+///
+/// #[unsafe(export_name = "user_core_main")]
+/// pub extern "efiapi" fn _start(op_code: u64, arg1: u64, arg2: u64) -> u64 {
+///     USER_CORE.entry_point_worker::<MyMmPlatform>(op_code, arg1, arg2)
 /// }
 /// ```
 pub struct MmUserCore {
@@ -158,6 +173,8 @@ pub struct MmUserCore {
     pub config_table_db: MmConfigurationTableDb,
     /// The driver dispatcher.
     pub dispatcher: MmDispatcher,
+    /// The Patina component dispatcher (dependency-injected `#[component]` entry points).
+    pub component_dispatcher: Mutex<MmComponentDispatcher>,
     /// Address of the heap-allocated MM System Table, set once it is built.
     mm_system_table: Once<usize>,
     /// Whether the core has completed initialization.
@@ -178,6 +195,7 @@ impl MmUserCore {
             protocol_db: ProtocolDatabase::new(),
             config_table_db: MmConfigurationTableDb::new(),
             dispatcher: MmDispatcher::new(),
+            component_dispatcher: Mutex::new(MmComponentDispatcher::new()),
             mm_system_table: Once::new(),
             initialized: AtomicBool::new(false),
         }
@@ -199,6 +217,16 @@ impl MmUserCore {
             NonNull::<Self>::with_exposed_provenance(*__USER_CORE.get().expect("MM User Core is not initialized."))
                 .as_ref()
         }
+    }
+
+    /// Gets the static MM User Core instance if it has been initialized.
+    ///
+    /// Unlike [`instance`](Self::instance), this returns `None` instead of
+    /// panicking when the instance has not yet been set via `set_instance`.
+    pub fn try_instance<'a>() -> Option<&'a Self> {
+        // SAFETY: The pointer, if present, was stored by `set_instance` from a
+        // `&'static Self` and remains valid for the lifetime of the program.
+        __USER_CORE.get().map(|&addr| unsafe { NonNull::<Self>::with_exposed_provenance(addr).as_ref() })
     }
 
     /// Build (once) and return the heap-allocated MM System Table.
@@ -247,7 +275,7 @@ impl MmUserCore {
     /// - `arg3`: Command-specific size or auxiliary data
     ///
     /// Returns 0 on success, or a non-zero status on failure.
-    pub fn entry_point_worker(&'static self, op_code: u64, arg1: u64, arg2: u64) -> u64 {
+    pub fn entry_point_worker<C: MmComponentInfo>(&'static self, op_code: u64, arg1: u64, arg2: u64) -> u64 {
         let command = match UserCommandType::try_from(op_code) {
             Ok(cmd) => cmd,
             Err(unknown) => {
@@ -257,7 +285,7 @@ impl MmUserCore {
         };
 
         match command {
-            UserCommandType::StartUserCore => self.handle_start_user_core(arg1 as *const c_void),
+            UserCommandType::StartUserCore => self.handle_start_user_core::<C>(arg1 as *const c_void),
             UserCommandType::UserRequest => self.handle_user_request(arg1, arg2),
             UserCommandType::UserApProcedure => self.handle_user_ap_procedure(arg1, arg2),
         }
@@ -272,7 +300,7 @@ impl MmUserCore {
     /// 3. Build the MM System Table and publish the HOB list configuration table
     /// 4. Register the core MMI handlers (driver dispatch is deferred to the
     ///    `MM_DISPATCH_EVENT` handler, see [`dispatch_drivers`](Self::dispatch_drivers))
-    fn handle_start_user_core(&'static self, hob_list: *const c_void) -> u64 {
+    fn handle_start_user_core<C: MmComponentInfo>(&'static self, hob_list: *const c_void) -> u64 {
         if !self.set_instance() {
             log::warn!("MM User Core instance was already set, skipping re-initialization.");
             return efi::Status::ALREADY_STARTED.as_usize() as u64;
@@ -336,6 +364,9 @@ impl MmUserCore {
         // MM foundation is ready.
         core_handlers::register_core_mmi_handlers();
 
+        // Register and dispatch platform-provided Patina components.
+        self.dispatch_components::<C>(&hob);
+
         self.initialized.store(true, Ordering::Release);
         log::info!("MM User Core initialization complete.");
 
@@ -351,6 +382,29 @@ impl MmUserCore {
     /// [`mm_driver_dispatch_handler`]: crate::core_handlers
     pub(crate) fn dispatch_drivers(&self) -> Result<usize, efi::Status> {
         self.dispatcher.dispatch(&self.protocol_db, self.mm_system_table_ptr() as *const c_void)
+    }
+
+    /// Register platform-provided Patina components, parse guided HOBs into
+    /// component storage, and dispatch all components to completion.
+    ///
+    /// Runs once during `StartUserCore` on the BSP. Components may install MM
+    /// protocols, register MMI handlers, and consume configs, services, and HOBs
+    /// via dependency injection. Configs are dispatched in two rounds: unlocked
+    /// (for `ConfigMut<T>` components), then locked (for `Config<T>` consumers).
+    fn dispatch_components<C: MmComponentInfo>(&self, hob: &Hob<'_>) {
+        // Expose the MM services (protocol install/locate, MMI handler registration,
+        // pool/page allocation) to components via the `MmServiceProvider` parameter.
+        patina::mm_services::register_component_mm_services(MmUserCore::instance());
+
+        let mut cd = self.component_dispatcher.lock();
+        cd.apply_component_info::<C>();
+        cd.insert_hobs(hob);
+
+        cd.dispatch_to_completion();
+        cd.lock_configs();
+        cd.dispatch_to_completion();
+
+        cd.display_not_dispatched();
     }
 
     /// Handle the `UserRequest` command (runtime MMI dispatch).

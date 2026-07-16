@@ -78,6 +78,17 @@ enum HandlerKind {
     Internal(InternalMmiHandler),
 }
 
+impl core::fmt::Debug for HandlerKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Print only the variant; the wrapped function pointers are not meaningfully
+        // formattable and their ABI does not guarantee a `Debug` impl.
+        match self {
+            HandlerKind::External(_) => f.write_str("External"),
+            HandlerKind::Internal(_) => f.write_str("Internal"),
+        }
+    }
+}
+
 /// An MMI entry groups all handlers registered for a specific GUID.
 #[derive(Clone)]
 struct MmiEntry {
@@ -158,7 +169,7 @@ impl MmiDatabase {
         Self::insert_handler(&mut inner, handler_type, mmi_handler);
 
         let handle = id as efi::Handle;
-        log::debug!("Registered external MMI handler id={} for {:?}", id, handler_type,);
+        log::info!("Registered external MMI handler id={} for {:?}", id, handler_type,);
         Ok(handle)
     }
 
@@ -281,6 +292,7 @@ impl MmiDatabase {
             // lock released here
         };
 
+        log::info!("Dispatching MMI with handler_type = {:?}", handler_type);
         // ----- Phase 2: dispatch without the lock held -----
         let return_status = Self::dispatch_handler_snapshot(
             &handlers_snapshot,
@@ -322,6 +334,7 @@ impl MmiDatabase {
         let guid_ref = handler_type.unwrap_or(&null_guid);
 
         for handler in handlers {
+            log::info!("Dispatching handler with id = {}, kind = {:?}", handler.id, handler.kind);
             let status = match handler.kind {
                 HandlerKind::External(entry_point) => {
                     // SAFETY: External handler follows the PI spec efiapi calling convention.
@@ -335,11 +348,13 @@ impl MmiDatabase {
                 efi::Status::SUCCESS => {
                     return_status = efi::Status::SUCCESS;
                     if short_circuit {
+                        log::info!("Short-circuiting after successful handler dispatch.");
                         break;
                     }
                 }
                 s if s == INTERRUPT_PENDING => {
                     if short_circuit {
+                        log::info!("Short-circuiting due to pending interrupt.");
                         return INTERRUPT_PENDING;
                     }
                     if return_status != efi::Status::SUCCESS {
@@ -349,17 +364,15 @@ impl MmiDatabase {
                 s if s == WARN_INTERRUPT_SOURCE_QUIESCED => {
                     return_status = efi::Status::SUCCESS;
                 }
-                s if s == WARN_INTERRUPT_SOURCE_PENDING => {
-                    if return_status != efi::Status::SUCCESS {
-                        return_status = status;
-                    }
+                s if s == WARN_INTERRUPT_SOURCE_PENDING && return_status != efi::Status::SUCCESS => {
+                    return_status = status;
                 }
                 _ => {
                     // Other statuses are ignored per PI spec
                 }
             }
         }
-
+        log::info!("Finished dispatching handlers with final status = {:?}", return_status);
         return_status
     }
 
