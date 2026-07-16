@@ -55,8 +55,7 @@ impl TryFrom<u64> for UserCommandType {
 /// - R9  = arg3
 ///
 /// On return:
-/// - RAX = result value
-/// - RDX = status (EFI_STATUS)
+/// - RAX = result value (the supervisor communicates only through RAX)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum SyscallIndex {
@@ -121,15 +120,6 @@ impl SyscallIndex {
     }
 }
 
-/// The register values a supervisor syscall returns to Ring 3.
-#[derive(Debug, Clone, Copy)]
-pub struct RawSyscallResult {
-    /// Value returned in `RAX` (e.g. an allocated address, or an `EFI_STATUS`).
-    pub value: u64,
-    /// Value returned in `RDX` (`EFI_STATUS` for callers using the legacy convention).
-    pub status: u64,
-}
-
 /// Issue a raw `syscall` to the MM Supervisor from Ring 3 (user) MM.
 ///
 /// This is the low-level primitive behind every userâ†’supervisor syscall (page
@@ -140,8 +130,7 @@ pub struct RawSyscallResult {
 ///
 /// - `RAX` = `call_index` ([`SyscallIndex`]), `RDX` = `arg1`, `R8` = `arg2`,
 ///   `R9` = `arg3`.
-/// - On return, `RAX` holds the result value and `RDX` the status; `RCX` and
-///   `R11` are clobbered by the `syscall` instruction.
+/// - On return, `RAX` holds the result value.
 ///
 /// ## Safety
 ///
@@ -149,18 +138,16 @@ pub struct RawSyscallResult {
 /// given syscall index. Only meaningful in Ring 3 user MM on x86-64 â€” on any
 /// other target this is a stub reporting `EFI_UNSUPPORTED`.
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> RawSyscallResult {
+pub unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let value: u64;
-    let status: u64;
 
     // SAFETY: A `syscall` into the MM Supervisor with the documented register ABI.
-    // The listed clobbers (RCX, R11) match the `syscall` instruction and no memory
-    // operands are used here, so the operation cannot violate Rust's memory model.
+    // The listed clobbers (RCX, R11) match the `syscall` instruction.
     unsafe {
         core::arch::asm!(
             "syscall",
             inlateout("rax") call_index => value,
-            inlateout("rdx") arg1 => status,
+            inlateout("rdx") arg1,
             in("r8") arg2,
             in("r9") arg3,
             lateout("rcx") _,
@@ -169,7 +156,7 @@ pub unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> R
         );
     }
 
-    RawSyscallResult { value, status }
+    value
 }
 
 /// Host/non-UEFI stub so the SDK links for tests and non-x86 UEFI targets.
@@ -182,7 +169,6 @@ pub unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> R
 /// This stub performs no operation and is always safe to call; the `unsafe`
 /// marker only keeps the signature identical to the real implementation.
 #[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
-pub unsafe fn raw_syscall(_call_index: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> RawSyscallResult {
-    let unsupported = r_efi::efi::Status::UNSUPPORTED.as_usize() as u64;
-    RawSyscallResult { value: unsupported, status: unsupported }
+pub unsafe fn raw_syscall(_call_index: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> u64 {
+    r_efi::efi::Status::UNSUPPORTED.as_usize() as u64
 }
