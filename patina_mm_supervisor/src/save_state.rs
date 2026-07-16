@@ -117,7 +117,10 @@ pub fn save_state_read_phase1(protocol: u64, register_raw: u64, cpu_index: u64) 
     // Validate CPU index against NumberOfCpus
     let num_cpus = match get_number_of_cpus() {
         Ok(n) => n,
-        Err(status) => return Err(status),
+        Err(status) => {
+            log::error!("SAVE_STATE_READ: Unable to get number of CPUs: {:?}", status);
+            return Err(status);
+        }
     };
 
     if cpu_index >= num_cpus {
@@ -129,7 +132,7 @@ pub fn save_state_read_phase1(protocol: u64, register_raw: u64, cpu_index: u64) 
     let mut access = security_state().lock_save_state_access();
     *access = Some(SaveStateAccessHolder { user_protocol: protocol, register, cpu_index });
 
-    log::debug!("SAVE_STATE_READ: Stored register={:?}, cpu_index={} for Phase 2", register, cpu_index);
+    log::info!("SAVE_STATE_READ: Stored register={:?}, cpu_index={} for Phase 2", register, cpu_index);
     Ok(0)
 }
 
@@ -197,13 +200,17 @@ pub fn save_state_read_phase2(protocol: u64, width: u64, buffer: u64) -> Syscall
 
     // Special case: PROCESSOR_ID — always allowed, no policy check
     if register == MmSaveStateRegister::ProcessorId {
+        log::info!("SAVE_STATE_READ2: Reading PROCESSOR_ID for CPU {}", cpu_index);
         return read_processor_id(cpu_index, out);
     }
 
     // Build a safe view over this CPU's save state region.
     let view = match get_save_state_view(cpu_index) {
         Ok(v) => v,
-        Err(status) => return Err(status),
+        Err(status) => {
+            log::error!("SAVE_STATE_READ2: Unable to get save state view for CPU {}: {:?}", cpu_index, status);
+            return Err(status);
+        }
     };
 
     let policy_checks = policy_checks_for_register(register);
@@ -516,7 +523,10 @@ fn read_io_register(view: &SaveStateView, out: &mut [u8]) -> SyscallResult {
         1 => view.read_u8(rax) as u64,
         2 => view.read_u16(rax) as u64,
         4 => view.read_u32(rax) as u64,
-        _ => 0,
+        _ => {
+            log::error!("IO_READ: Unsupported byte count: {}", parsed.byte_count);
+            0
+        }
     };
 
     // 4. Serialize the EFI_MM_SAVE_STATE_IO_INFO structure into the output

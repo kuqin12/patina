@@ -54,6 +54,7 @@ pub(crate) unsafe fn read_save_state_register(
     // Phase 1: record the register and CPU index.
     // SAFETY: `SaveStateRead` takes the `this` token, register, and CPU index as
     // scalar arguments; no memory is dereferenced by the supervisor in this phase.
+    log::info!("SAVE_STATE_READ: protocol=0x{:x}, register=0x{:x}, cpu_index={}", this, register, cpu_index);
     let phase1 =
         unsafe { raw_syscall(SyscallIndex::SaveStateRead.as_u64(), this as u64, register as u64, cpu_index as u64) };
     let phase1 = efi::Status::from_usize(phase1 as usize);
@@ -65,6 +66,7 @@ pub(crate) unsafe fn read_save_state_register(
     // SAFETY: `SaveStateRead2` writes up to `width` bytes into `buffer`; the caller
     // guarantees (per this function's contract) that `buffer` is valid for `width`
     // bytes, and the supervisor additionally validates user ownership before writing.
+    log::info!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", this, width, buffer as usize);
     let phase2 =
         unsafe { raw_syscall(SyscallIndex::SaveStateRead2.as_u64(), this as u64, width as u64, buffer as u64) };
     efi::Status::from_usize(phase2 as usize)

@@ -270,7 +270,7 @@ impl PolicyGate {
         let policy_root = match self.find_policy_root(TYPE_INSTRUCTION) {
             Some(root) => root,
             None => {
-                log::warn!("Could not find Instruction policy root, denying access to be safe.");
+                log::error!("Could not find Instruction policy root, denying access to be safe.");
                 return Err(PolicyError::PolicyRootNotFound);
             }
         };
@@ -301,7 +301,7 @@ impl PolicyGate {
         };
 
         if !allowed {
-            log::debug!("Rejecting instruction execution: {:?}", instruction);
+            log::error!("Rejecting instruction execution: {:?}", instruction);
             return Err(PolicyError::AccessDenied);
         }
 
@@ -319,7 +319,7 @@ impl PolicyGate {
             Some(root) => root,
             None => {
                 // No save state policy = level 20, allow all reads
-                log::warn!("No save state policy root found, allowing read (level 20 policy).");
+                log::error!("No save state policy root found, allowing read (level 20 policy).");
                 return Ok(());
             }
         };
@@ -374,7 +374,7 @@ impl PolicyGate {
         };
 
         if !allowed {
-            log::debug!("Rejecting save state read: field={:?}, width={}", field, width);
+            log::error!("Rejecting save state read: field={:?}, width={}", field, width);
             return Err(PolicyError::AccessDenied);
         }
 

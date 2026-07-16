@@ -191,7 +191,7 @@ impl SyscallDispatcher {
             }
         };
 
-        log::trace!(
+        log::info!(
             "Syscall: {:?} (0x{:x}), args: 0x{:x}, 0x{:x}, 0x{:x}, caller: 0x{:x}, stack: 0x{:x}",
             index,
             ctx.call_index,
@@ -223,7 +223,7 @@ impl SyscallDispatcher {
 
         match result {
             Err(err) if index == SyscallIndex::SaveStateRead2 => {
-                log::trace!("Syscall: {:?} returned value=0x{:x}", index, err.as_usize());
+                log::error!("Syscall SaveStateRead2: {:?} returned value=0x{:x}", index, err.as_usize());
                 Ok(err.as_usize() as u64) // Return error code to caller for SaveStateRead2
             }
             Err(err) => {
@@ -369,7 +369,7 @@ impl SyscallDispatcher {
             }
         };
 
-        log::debug!("IO_READ: port=0x{:x} => 0x{:x}", port, value);
+        log::trace!("IO_READ: port=0x{:x} => 0x{:x}", port, value);
         Ok(value)
     }
 
@@ -383,7 +383,7 @@ impl SyscallDispatcher {
         let port = ctx.arg1;
         let efi_width = ctx.arg2;
         let value = ctx.arg3;
-        log::trace!("IO_WRITE: port=0x{:x}, width={}, value=0x{:x}", port, efi_width, value);
+        log::info!("IO_WRITE: port=0x{:x}, width={}, value=0x{:x}", port, efi_width, value);
 
         // Convert EFI_MM_IO_WIDTH to IoWidth
         let io_width = match efi_io_width_to_io_width(efi_width) {
@@ -419,7 +419,7 @@ impl SyscallDispatcher {
             }
         }
 
-        log::debug!("IO_WRITE: port=0x{:x} <= 0x{:x}", port, value);
+        log::info!("IO_WRITE: port=0x{:x} <= 0x{:x}", port, value);
         Ok(0)
     }
 
@@ -663,7 +663,7 @@ impl SyscallDispatcher {
     /// - Arg2: Width of buffer to read in bytes
     /// - Arg3: User buffer to hold return data
     fn handle_save_state_read2(&self, ctx: &SyscallContext) -> SyscallResult {
-        log::trace!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
+        log::info!("SAVE_STATE_READ2: protocol=0x{:x}, width={}, buffer=0x{:x}", ctx.arg1, ctx.arg2, ctx.arg3);
 
         // Validate parameters
         if ctx.arg1 == 0 {

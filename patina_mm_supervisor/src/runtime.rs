@@ -237,7 +237,7 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
     /// 5. Demotes to the user entry point via `invoke_demoted_routine`
     /// 6. On return, copies back the user comm buffer and reads the updated status
     fn process_user_request(&self, config: &CommBufferConfig, status: &MmCommBufferStatus, cpu_index: usize) {
-        log::trace!("Processing User request...");
+        log::info!("Processing User request...");
 
         // Validate buffers
         if config.user_comm_buffer == 0 || config.user_comm_buffer_internal == 0 {
@@ -335,6 +335,8 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
             );
         }
 
+        log::info!("User request is synchronous: {}", sync_mmi != 0);
+
         // Invoke the demoted user entry point with:
         //   arg1: UserCommandType::UserRequest (command type)
         //   arg2: supv_to_user_buffer (pointer to EfiMmEntryContext + MmCommBufferStatus)
@@ -353,7 +355,7 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
                 context_size as u64,
             )
         };
-        log::trace!("Returned from user request with value: 0x{}", ret);
+        log::info!("Returned from user request with value: 0x{}", ret);
 
         // Copy the response from the internal buffer back to the user buffer
         // SAFETY: Buffers are provided by MM IPL and are guaranteed valid
