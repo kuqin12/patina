@@ -147,7 +147,7 @@ pub unsafe fn raw_syscall(call_index: u64, arg1: u64, arg2: u64, arg3: u64) -> u
         core::arch::asm!(
             "syscall",
             inlateout("rax") call_index => value,
-            inlateout("rdx") arg1,
+            in("rdx") arg1,
             in("r8") arg2,
             in("r9") arg3,
             lateout("rcx") _,
