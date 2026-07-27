@@ -161,7 +161,6 @@ pub struct TaskStateSegment {
 /// Gets the current GDT base address by reading the GDTR register.
 /// ## Safety
 /// This function is safe to call as it only reads the GDTR register.
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn get_current_gdt_base() -> u64 {
     // Get current GDT base
     let mut gdtr = GdtRegister::default();
@@ -185,7 +184,6 @@ pub unsafe fn get_current_gdt_base() -> u64 {
 ///
 /// This modifies the GDT.
 #[unsafe(no_mangle)]
-#[cfg(target_arch = "x86_64")]
 pub unsafe extern "efiapi" fn setup_call_gate(return_pointer: u64, cpl0_stack_ptr: u64) {
     // Get current GDT base
     // SAFETY: Reads the current GDTR register; see `get_current_gdt_base`.

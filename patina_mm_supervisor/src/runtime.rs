@@ -39,7 +39,7 @@ unsafe fn disable_smap() {
     // SAFETY: `stac` only sets the AC flag in EFLAGS; it touches no memory and clobbers
     // no registers (hence `nostack, preserves_flags`). It is a privileged instruction that
     // is valid in the Ring 0 supervisor context this code always runs in.
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(not(test))]
     unsafe {
         core::arch::asm!(
             "stac", // Set AC flag to enable access to user memory
@@ -60,7 +60,7 @@ unsafe fn enable_smap() {
     // SAFETY: `clac` only clears the AC flag in EFLAGS; it touches no memory and clobbers
     // no registers (hence `nostack, preserves_flags`). It is a privileged instruction that
     // is valid in the Ring 0 supervisor context this code always runs in.
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(not(test))]
     unsafe {
         core::arch::asm!(
             "clac", // Clear AC flag to re-enable SMAP protections

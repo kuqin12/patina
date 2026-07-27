@@ -187,7 +187,7 @@ fn read_idtr() -> DescriptorTablePointer {
     // On the real firmware target, populate it via `SIDT`. The asm-free builds
     // (tests / non-x86_64) keep the zero-initialized value, so no mutable binding
     // is introduced where it would go unused.
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(not(test))]
     let rt_descriptor = {
         let mut descriptor = rt_descriptor;
         // SAFETY: SIDT stores the 10-byte IDTR pseudo-descriptor to the specified

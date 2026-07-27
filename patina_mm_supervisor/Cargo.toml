@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 log = { workspace = true }
-patina = { version = "22.0.1", path = "../sdk/patina", default-features = false }
+patina = { workspace = true }
 patina_internal_cpu = { workspace = true }
 patina_paging = { workspace = true, features = [
     "supervisor"

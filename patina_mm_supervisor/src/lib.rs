@@ -327,7 +327,7 @@ pub(crate) fn is_buffer_inside_mmram(base: u64, size: u64) -> bool {
 pub(crate) fn read_cr3() -> u64 {
     let mut _value = 0u64;
 
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(not(test))]
     {
         // SAFETY: inline asm is inherently unsafe because Rust can't reason about it.
         // In this case we are reading the CR3 register, which is a safe operation.

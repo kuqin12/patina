@@ -277,10 +277,7 @@ impl SyscallDispatcher {
         // Policy allows - execute the MSR read
         // SAFETY: the policy gate authorized reading this MSR above; `read_msr` only issues
         // `rdmsr` for `msr_index` and returns its value.
-        let value = unsafe { crate::cpu::read_msr(msr_index) }.unwrap_or_else(|e| {
-            log::error!("RDMSR: rdmsr failed: {}", e);
-            0
-        });
+        let value = unsafe { crate::cpu::read_msr(msr_index) };
         log::debug!("RDMSR: MSR 0x{:x} = 0x{:x}", msr_index, value);
         Ok(value)
     }
@@ -312,10 +309,7 @@ impl SyscallDispatcher {
         // Policy allows - execute the MSR write
         // SAFETY: the policy gate authorized writing this MSR above; `write_msr` only issues
         // `wrmsr` for `msr_index` with the requested value.
-        if let Err(e) = unsafe { crate::cpu::write_msr(msr_index, value) } {
-            log::error!("WRMSR: wrmsr failed: {}", e);
-            return Err(Status::UNSUPPORTED);
-        }
+        unsafe { crate::cpu::write_msr(msr_index, value) };
         log::debug!("WRMSR: MSR 0x{:x} written with 0x{:x}", msr_index, value);
         Ok(0)
     }
