@@ -20,7 +20,8 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
-const CPUID_VERSION_INFO: u32 = 0x01;
+/// CPUID leaf 0x1: Version Information (Type, Family, Model, and Stepping ID).
+pub(crate) const CPUID_VERSION_INFO: u32 = 0x01;
 
 /// MSR index for IA32_APIC_BASE.
 const IA32_APIC_BASE_MSR_INDEX: u32 = 0x1B;

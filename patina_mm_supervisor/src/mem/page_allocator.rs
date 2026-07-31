@@ -42,12 +42,14 @@ use core::{
 
 use patina::standard::efi;
 use patina::{
-    base::UEFI_PAGE_SIZE,
+    SIZE_256KB, UEFI_PAGE_SIZE,
     pi::hob::{Hob, PhaseHandoffInformationTable},
     uefi_pages_to_size, uefi_size_to_pages,
 };
 use patina_paging::{MemoryAttributes, PageTable};
 use spin::{Mutex, MutexGuard, relax::Spin};
+
+use crate::smrr::{SmramRegion, verify_smrr_base_size};
 
 /// Bits per byte.
 const BITS_PER_BYTE: usize = 8;
@@ -94,7 +96,7 @@ pub enum AllocationType {
 
 /// SMRAM descriptor structure matching EFI_SMRAM_DESCRIPTOR.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmramDescriptor {
     /// Physical start address of the SMRAM region.
     pub physical_start: efi::PhysicalAddress,
@@ -461,33 +463,30 @@ impl LockedState<'_> {
     ///
     /// The `AllocatorState` header (including `region_count`) must already be
     /// written so that [`regions_mut`](Self::regions_mut) exposes the full array.
-    fn initialize(&mut self, scanned: &ScannedRegions, bookkeeping_base: u64, bookkeeping_pages: usize) {
+    fn initialize(&mut self, scanned: &[SmramRegion], bookkeeping_base: u64, bookkeeping_pages: usize) {
         // Fill in per-region metadata and assign each region its bitmap range.
         let mut bitmap_start_bit = 0usize;
-        for (region, &(base, size, _)) in self.regions_mut().iter_mut().zip(scanned.regions.iter()) {
-            let pages = uefi_size_to_pages!(size as usize);
-            region.base = base;
+        for (region, scanned_region) in self.regions_mut().iter_mut().zip(scanned.iter()) {
+            let pages = uefi_size_to_pages!(scanned_region.size as usize);
+            region.base = scanned_region.base;
             region.total_pages = pages;
             region.bitmap_start_bit = bitmap_start_bit;
             bitmap_start_bit += pages;
         }
 
         // Mark pre-allocated regions and the bookkeeping pages as allocated (supervisor).
-        for i in 0..scanned.count {
-            let Some(&(base, size, pre_allocated)) = scanned.regions.get(i) else {
-                continue;
-            };
-            let pages = uefi_size_to_pages!(size as usize);
+        for (i, scanned_region) in scanned.iter().enumerate() {
+            let pages = uefi_size_to_pages!(scanned_region.size as usize);
             let Some(start_bit) = self.regions().get(i).map(|region| region.bitmap_start_bit) else {
                 continue;
             };
 
-            if pre_allocated {
+            if scanned_region.pre_allocated {
                 // Mark the entire region as allocated.
                 for p in 0..pages {
                     self.set_bit_allocated(start_bit + p, AllocationType::Supervisor);
                 }
-            } else if base == bookkeeping_base {
+            } else if scanned_region.base == bookkeeping_base {
                 // Mark just the bookkeeping pages at the start of this region.
                 for p in 0..bookkeeping_pages {
                     self.set_bit_allocated(start_bit + p, AllocationType::Supervisor);
@@ -501,50 +500,80 @@ impl LockedState<'_> {
 /// HOB list. The authoritative region metadata is stored in SMRAM afterwards.
 const MAX_TEMP_REGIONS: usize = 256;
 
-/// SMRAM regions discovered while scanning the HOB list, before they are copied
-/// into the SMRAM bookkeeping structures.
-struct ScannedRegions {
-    /// Discovered regions as `(base, size, pre_allocated)`.
-    regions: [(u64, u64, bool); MAX_TEMP_REGIONS],
-    /// Number of valid entries in `regions`.
-    count: usize,
-    /// Total pages across all discovered regions.
-    total_pages: usize,
-    /// Base of the first non-pre-allocated region (used to host bookkeeping).
-    first_free_base: Option<u64>,
-    /// Size in bytes of the first non-pre-allocated region.
-    first_free_size: u64,
-}
+/// Selects the primary SMRR range from the scanned SMRAM regions and coalesces
+/// any physically adjacent regions into it.
+///
+/// It picks the largest non pre-allocated region in `[1 MiB, 4 GiB]` that is at
+/// least `256 KiB - 4 KiB`, then extends it downward and upward across every
+/// region that is physically contiguous with it (regardless of allocation
+/// state), scanning repeatedly until no further adjacent region is found.
+///
+/// Returns the coalesced [`SmramRegion`] on success (with `pre_allocated` set to
+/// `false`, as it describes the SMRR programming range rather than a discovered
+/// region), or `None` if no scanned region meets the SMRR base/size
+/// requirements.
+pub(crate) fn coalesced_smrr_range(regions: &[SmramRegion]) -> Option<SmramRegion> {
+    /// Lowest CPU start address a candidate SMRR range may have.
+    const BASE_1MB: u64 = 0x0010_0000;
+    /// Highest address the primary SMRR can cover (4 GiB).
+    const SMRR_MAX_ADDRESS: u64 = 0x1_0000_0000;
 
-impl ScannedRegions {
-    /// Creates an empty scan result.
-    fn new() -> Self {
-        Self {
-            regions: [(0, 0, false); MAX_TEMP_REGIONS],
-            count: 0,
-            total_pages: 0,
-            first_free_base: None,
-            first_free_size: 0,
+    // Find the largest usable (non-pre-allocated) range in [1 MiB, 4 GiB] that is at least
+    // 256 KiB - 4 KiB.
+    let mut max_size = SIZE_256KB as u64 - UEFI_PAGE_SIZE as u64;
+    let mut current: Option<(u64, u64)> = None;
+    for region in regions {
+        if region.pre_allocated {
+            continue;
+        }
+        if region.base >= BASE_1MB && region.base + region.size <= SMRR_MAX_ADDRESS && region.size >= max_size {
+            max_size = region.size;
+            current = Some((region.base, region.size));
         }
     }
 
-    /// Whether the temporary storage is full.
-    fn is_full(&self) -> bool {
-        self.count >= MAX_TEMP_REGIONS
+    let (mut smrr_base, mut smrr_size) = current?;
+
+    // Coalesce any physically adjacent ranges into the selected range. This
+    // scans the (unsorted) region array repeatedly until no further
+    // adjacent range is found, so ordering does not matter. Adjacency is
+    // considered regardless of allocation state, because the SMRR must
+    // cover a single contiguous physical range.
+    loop {
+        let mut found = false;
+        for region in regions {
+            let region_base = region.base;
+            let region_size = region.size;
+            if region_base < smrr_base && smrr_base == region_base + region_size {
+                // Region sits immediately before the current range: extend downward.
+                smrr_base = region_base;
+                smrr_size = smrr_size.checked_add(region_size)?;
+                found = true;
+            } else if smrr_base + smrr_size == region_base && region_size > 0 {
+                // Region sits immediately after the current range: extend upward.
+                smrr_size = smrr_size.checked_add(region_size)?;
+                found = true;
+            }
+        }
+        if !found {
+            break;
+        }
     }
 
-    /// Records one region. Precondition: `!self.is_full()`.
-    fn push(&mut self, base: u64, size: u64, pre_allocated: bool) {
-        if let Some(slot) = self.regions.get_mut(self.count) {
-            *slot = (base, size, pre_allocated);
-        }
-        if self.first_free_base.is_none() && !pre_allocated {
-            self.first_free_base = Some(base);
-            self.first_free_size = size;
-        }
-        self.total_pages += uefi_size_to_pages!(size as usize);
-        self.count += 1;
+    let smrr_base = u32::try_from(smrr_base).ok()?;
+    let smrr_size = u32::try_from(smrr_size).ok()?;
+
+    if !verify_smrr_base_size(smrr_base, smrr_size) {
+        log::warn!(
+            "Coalesced SMRR range base=0x{:x} size=0x{:x} does not meet SMRR alignment/size requirements",
+            smrr_base,
+            smrr_size
+        );
+        return None;
     }
+
+    log::info!("SMRR Base: 0x{:x}, SMRR Size: 0x{:x}", smrr_base, smrr_size);
+    Some(SmramRegion { base: smrr_base as u64, size: smrr_size as u64, pre_allocated: false })
 }
 
 /// Page-granularity allocator for SMRAM memory.
@@ -564,36 +593,73 @@ impl PageAllocator {
         Self { state: Mutex::new(StatePtr(ptr::null_mut())), initialized: AtomicBool::new(false) }
     }
 
-    /// Calculates the number of pages needed for bookkeeping.
-    fn calculate_bookkeeping_pages(region_count: usize, total_pages: usize) -> usize {
+    /// Determines where the bookkeeping structures live and how large they are.
+    ///
+    /// Sums the pages across `regions`, selects the first non-pre-allocated
+    /// region to host the bookkeeping, and verifies that region is large enough
+    /// to hold it. Returns `(bookkeeping_base, bookkeeping_pages)`.
+    fn calculate_bookkeeping(regions: &[SmramRegion]) -> Result<(u64, usize), PageAllocError> {
+        let total_pages: usize = regions.iter().map(|region| uefi_size_to_pages!(region.size as usize)).sum();
+
         let header_size = size_of::<AllocatorState>();
-        let regions_size = region_count * size_of::<RegionInfo>();
+        let regions_size = regions.len() * size_of::<RegionInfo>();
         let bitmap_bytes = total_pages.div_ceil(BITS_PER_BYTE);
         let total_bytes = header_size + regions_size + bitmap_bytes * 2; // alloc + type bitmaps
-        uefi_size_to_pages!(total_bytes)
+        let bookkeeping_pages = uefi_size_to_pages!(total_bytes);
+
+        log::info!(
+            "Allocator needs {} pages for bookkeeping ({} regions, {} total pages)",
+            bookkeeping_pages,
+            regions.len(),
+            total_pages
+        );
+
+        // Reserve bookkeeping space in the first free (non-pre-allocated) region.
+        let first_free = regions.iter().find(|region| !region.pre_allocated);
+        let bookkeeping_base = first_free.map(|region| region.base).ok_or_else(|| {
+            log::error!("No free SMRAM region available for bookkeeping");
+            PageAllocError::OutOfMemory
+        })?;
+        let first_free_size = first_free.map(|region| region.size).unwrap_or(0);
+
+        if uefi_pages_to_size!(bookkeeping_pages) as u64 > first_free_size {
+            log::error!("First free region too small for bookkeeping");
+            return Err(PageAllocError::OutOfMemory);
+        }
+
+        Ok((bookkeeping_base, bookkeeping_pages))
     }
 
     /// Scans the entire HOB list and collects every SMRAM/MMRAM region reported
-    /// under the supported GUIDs into `scanned`.
-    fn scan_smram_regions(handoff: &PhaseHandoffInformationTable, scanned: &mut ScannedRegions) {
+    /// under the supported GUIDs into `regions`, updating `count`.
+    fn scan_smram_regions(
+        handoff: &PhaseHandoffInformationTable,
+        regions: &mut [SmramRegion; MAX_TEMP_REGIONS],
+        region_count: &mut usize,
+    ) -> Result<(), PageAllocError> {
         let hob = Hob::Handoff(handoff);
         for current_hob in &hob {
             if let Hob::GuidHob(guid_hob, data) = current_hob
                 && (guid_hob.name == SMM_SMRAM_MEMORY_GUID || guid_hob.name == MM_PEI_MMRAM_MEMORY_RESERVE_GUID)
             {
                 log::info!("Found SMRAM memory HOB with GUID {}", guid_hob.name.as_guid());
-                Self::collect_smram_regions(data, scanned);
+                Self::collect_smram_regions(data, regions, region_count)?;
             }
         }
+        Ok(())
     }
 
     /// Parses the `SmramReserveHobData` header and trailing `SmramDescriptor`
     /// array from a single matching GUID HOB payload, appending each region to
-    /// `scanned`.
-    fn collect_smram_regions(data: &[u8], scanned: &mut ScannedRegions) {
+    /// `regions` and updating `region_count`.
+    fn collect_smram_regions(
+        data: &[u8],
+        regions: &mut [SmramRegion; MAX_TEMP_REGIONS],
+        region_count: &mut usize,
+    ) -> Result<(), PageAllocError> {
         let header_size = size_of::<SmramReserveHobData>();
         if data.len() < header_size {
-            return;
+            return Ok(());
         }
 
         // SAFETY: `data` is at least `header_size` bytes (checked above) and, per the
@@ -614,7 +680,7 @@ impl PageAllocator {
         // out-of-range offset would be caught).
         let end = header_size + count * size_of::<SmramDescriptor>();
         let Some(descriptor_bytes) = data.get(header_size..end) else {
-            return;
+            return Ok(());
         };
 
         // SAFETY: `descriptor_bytes` is exactly `count` `SmramDescriptor`s' worth of in-bounds
@@ -623,9 +689,12 @@ impl PageAllocator {
         let descriptors = unsafe { slice::from_raw_parts(descriptor_bytes.as_ptr() as *const SmramDescriptor, count) };
 
         for descriptor in descriptors {
-            if scanned.is_full() {
-                log::warn!("Too many SMRAM regions for temp storage, increase MAX_TEMP_REGIONS");
-                break;
+            if *region_count >= MAX_TEMP_REGIONS {
+                log::error!(
+                    "Too many SMRAM regions for temp storage (MAX_TEMP_REGIONS = {}), increase MAX_TEMP_REGIONS",
+                    MAX_TEMP_REGIONS
+                );
+                return Err(PageAllocError::OutOfMemory);
             }
 
             let pre_allocated = (descriptor.region_state & EFI_ALLOCATED) != 0;
@@ -633,7 +702,7 @@ impl PageAllocator {
 
             log::info!(
                 "SMRAM Region {}: base=0x{:016x}, size=0x{:x}, pages={}, state=0x{:x}, allocated={}",
-                scanned.count,
+                *region_count,
                 descriptor.physical_start,
                 descriptor.physical_size,
                 pages,
@@ -641,8 +710,18 @@ impl PageAllocator {
                 pre_allocated
             );
 
-            scanned.push(descriptor.physical_start, descriptor.physical_size, pre_allocated);
+            let Some(slot) = regions.get_mut(*region_count) else {
+                log::error!(
+                    "Too many SMRAM regions for temp storage (MAX_TEMP_REGIONS = {}), increase MAX_TEMP_REGIONS",
+                    MAX_TEMP_REGIONS
+                );
+                return Err(PageAllocError::OutOfMemory);
+            };
+            *slot = SmramRegion { base: descriptor.physical_start, size: descriptor.physical_size, pre_allocated };
+            *region_count += 1;
         }
+
+        Ok(())
     }
 
     /// Acquires the state lock and returns a [`LockedState`] view over the SMRAM
@@ -673,7 +752,10 @@ impl PageAllocator {
     /// ## Safety
     ///
     /// The caller must ensure that `hob_list` points to a valid HOB list. Only null pointer will be rejected.
-    pub unsafe fn init_from_hob_list(&self, hob_list: *const c_void) -> Result<(), PageAllocError> {
+    pub unsafe fn init_from_hob_list(
+        &self,
+        hob_list: *const c_void,
+    ) -> Result<([SmramRegion; MAX_TEMP_REGIONS], usize), PageAllocError> {
         if hob_list.is_null() {
             return Err(PageAllocError::NotInitialized);
         }
@@ -687,33 +769,20 @@ impl PageAllocator {
         };
 
         // First pass: scan the HOB list for every SMRAM region.
-        let mut scanned = ScannedRegions::new();
-        Self::scan_smram_regions(hob_list_info, &mut scanned);
+        let mut regions = [SmramRegion::default(); MAX_TEMP_REGIONS];
+        let mut count = 0usize;
+        Self::scan_smram_regions(hob_list_info, &mut regions, &mut count)?;
 
-        if scanned.count == 0 {
+        if count == 0 {
             log::error!("No SMRAM regions found in HOB list");
             return Err(PageAllocError::NotInitialized);
         }
 
-        // Reserve bookkeeping space in the first free region.
-        let bookkeeping_pages = Self::calculate_bookkeeping_pages(scanned.count, scanned.total_pages);
+        let scanned = regions.get(..count).ok_or(PageAllocError::NotInitialized)?;
+        let total_pages: usize = scanned.iter().map(|region| uefi_size_to_pages!(region.size as usize)).sum();
 
-        log::info!(
-            "Allocator needs {} pages for bookkeeping ({} regions, {} total pages)",
-            bookkeeping_pages,
-            scanned.count,
-            scanned.total_pages
-        );
-
-        let bookkeeping_base = scanned.first_free_base.ok_or_else(|| {
-            log::error!("No free SMRAM region available for bookkeeping");
-            PageAllocError::OutOfMemory
-        })?;
-
-        if uefi_pages_to_size!(bookkeeping_pages) as u64 > scanned.first_free_size {
-            log::error!("First free region too small for bookkeeping");
-            return Err(PageAllocError::OutOfMemory);
-        }
+        // Determine where the bookkeeping structures live and how large they are.
+        let (bookkeeping_base, bookkeeping_pages) = Self::calculate_bookkeeping(scanned)?;
 
         log::info!("Using 0x{:016x} for bookkeeping ({} pages)", bookkeeping_base, bookkeeping_pages);
 
@@ -728,24 +797,14 @@ impl PageAllocator {
             ptr::write_bytes(bookkeeping_base as *mut u8, 0, uefi_pages_to_size!(bookkeeping_pages));
             &mut *state_ptr
         };
-        *state = AllocatorState {
-            region_count: scanned.count,
-            total_pages: scanned.total_pages,
-            bookkeeping_pages,
-            bookkeeping_base,
-        };
+        *state = AllocatorState { region_count: count, total_pages, bookkeeping_pages, bookkeeping_base };
 
         *guard = StatePtr(state_ptr);
 
         // Populate region metadata and the allocation bitmaps under the held lock, then
         // release the lock before the stats logging below re-acquires it.
-        let mut locked = LockedState {
-            state: state_ptr,
-            region_count: scanned.count,
-            total_pages: scanned.total_pages,
-            _guard: guard,
-        };
-        locked.initialize(&scanned, bookkeeping_base, bookkeeping_pages);
+        let mut locked = LockedState { state: state_ptr, region_count: count, total_pages, _guard: guard };
+        locked.initialize(scanned, bookkeeping_base, bookkeeping_pages);
         drop(locked);
 
         self.initialized.store(true, Ordering::Release);
@@ -760,7 +819,7 @@ impl PageAllocator {
             self.allocated_page_count(AllocationType::User)
         );
 
-        Ok(())
+        Ok((regions, count))
     }
 
     /// Allocates contiguous pages from SMRAM for supervisor use.
@@ -952,5 +1011,133 @@ impl PageAllocator {
             return false;
         }
         self.lock_state().is_region_inside_mmram(addr, size)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    /// Smallest region size `coalesced_smrr_range` will accept (256 KiB - 4 KiB).
+    const MIN_SMRR_SIZE: u64 = SIZE_256KB as u64 - UEFI_PAGE_SIZE as u64;
+
+    /// Builds a `SmramRegion` list from `(base, size, pre_allocated)` tuples.
+    fn regions_from(entries: &[(u64, u64, bool)]) -> Vec<SmramRegion> {
+        entries.iter().map(|&(base, size, pre_allocated)| SmramRegion { base, size, pre_allocated }).collect()
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_empty_returns_none() {
+        assert_eq!(coalesced_smrr_range(&[]), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_region_too_small_returns_none() {
+        let regions = regions_from(&[(0x0010_0000, MIN_SMRR_SIZE - UEFI_PAGE_SIZE as u64, false)]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_below_1mb_returns_none() {
+        // Base below 1 MiB is rejected even when the region is large enough.
+        let regions = regions_from(&[(0x0008_0000, SIZE_256KB as u64, false)]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_above_4gb_returns_none() {
+        // A range whose end exceeds 4 GiB is rejected.
+        let regions = regions_from(&[(0xFFFF_F000, SIZE_256KB as u64, false)]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_single_valid_region() {
+        let base = 0x8000_0000u64;
+        let size = SIZE_256KB as u64;
+        let regions = regions_from(&[(base, size, false)]);
+        assert_eq!(coalesced_smrr_range(&regions), Some(SmramRegion { base, size, pre_allocated: false }));
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_rejects_non_power_of_two_size() {
+        // A region large enough to be selected but whose size is not a power of
+        // two fails SMRR verification and is rejected.
+        let base = 0x8000_0000u64;
+        let regions = regions_from(&[(base, MIN_SMRR_SIZE, false)]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_selects_largest_region() {
+        let small = (0x8000_0000u64, SIZE_256KB as u64, false);
+        let large = (0x9000_0000u64, SIZE_256KB as u64 * 4, false);
+        let regions = regions_from(&[small, large]);
+        assert_eq!(
+            coalesced_smrr_range(&regions),
+            Some(SmramRegion { base: large.0, size: large.1, pre_allocated: false })
+        );
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_ignores_pre_allocated_for_selection() {
+        // A pre-allocated region cannot be selected as the primary range, so with
+        // no other usable region the result is None.
+        let regions = regions_from(&[(0x8000_0000, SIZE_256KB as u64, true)]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_coalesces_adjacent_upward() {
+        // Selected (larger) region extends upward into the adjacent region; the
+        // coalesced size is a power of two with a naturally aligned base.
+        let base = 0x8000_0000u64;
+        let size = SIZE_256KB as u64 * 6; // selected as the largest region
+        let above_size = SIZE_256KB as u64 * 2;
+        let above = (base + size, above_size, false);
+        let regions = regions_from(&[(base, size, false), above]);
+        assert_eq!(
+            coalesced_smrr_range(&regions),
+            Some(SmramRegion { base, size: size + above_size, pre_allocated: false })
+        );
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_coalesces_adjacent_downward() {
+        // Selected (larger) region extends downward into the adjacent region;
+        // the coalesced size is a power of two with a naturally aligned base.
+        let low_base = 0x8000_0000u64;
+        let below_size = SIZE_256KB as u64 * 2;
+        let base = low_base + below_size;
+        let size = SIZE_256KB as u64 * 6; // selected as the largest region
+        let below = (low_base, below_size, false);
+        let regions = regions_from(&[below, (base, size, false)]);
+        assert_eq!(
+            coalesced_smrr_range(&regions),
+            Some(SmramRegion { base: low_base, size: size + below_size, pre_allocated: false })
+        );
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_rejects_non_power_of_two_coalesced_size() {
+        // Coalescing yields 0xC0000 bytes, which is not a power of two, so the
+        // range is rejected rather than causing a later panic in smrr_initialize.
+        let base = 0x8000_0000u64;
+        let size = SIZE_256KB as u64 * 2; // 0x80000, selected
+        let above = (base + size, SIZE_256KB as u64, false); // + 0x40000 => 0xC0000
+        let regions = regions_from(&[(base, size, false), above]);
+        assert_eq!(coalesced_smrr_range(&regions), None);
+    }
+
+    #[test]
+    fn test_page_allocator_coalesced_smrr_range_coalesces_pre_allocated_adjacent() {
+        let base = 0x8000_0000u64;
+        let size = SIZE_256KB as u64;
+        // A physically adjacent pre-allocated region is still coalesced, since the
+        // SMRR must cover a single contiguous physical range.
+        let above = (base + size, size, true);
+        let regions = regions_from(&[(base, size, false), above]);
+        assert_eq!(coalesced_smrr_range(&regions), Some(SmramRegion { base, size: size * 2, pre_allocated: false }));
     }
 }

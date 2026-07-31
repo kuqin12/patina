@@ -24,7 +24,7 @@ use core::{
 use spin::{Mutex, MutexGuard, Once, relax::Spin};
 
 use patina::{
-    guids::EVENT_EXIT_BOOT_SERVICES,
+    guid::EVENT_EXIT_BOOT_SERVICES,
     management_mode::protocol::mm_supervisor_request::MM_SUPERVISOR_REQUEST_HANDLER_GUID,
 };
 use patina_paging::x64::X64PageTable;
@@ -34,6 +34,7 @@ use crate::{
     mem::{PageAllocator, PagingPoolAllocator, SharedPagingAllocator},
     mm_policy::gate::PolicyGate,
     save_state::{SaveStateAccessHolder, SaveStateInfo},
+    smrr::SmramRegion,
     supervisor_handlers::{
         EFI_DXE_MM_READY_TO_LOCK_PROTOCOL_GUID, SupervisorMmiHandler, UnblockedMemoryTracker,
         mm_exit_boot_services_handler, mm_ready_to_lock_handler, mm_supv_request_handler,
@@ -59,6 +60,8 @@ pub(crate) struct InitState {
     ap_startup_fn: Once<fn(u64, u64, u64) -> u64>,
     /// Set once ExitBootServices has been signaled.
     at_runtime: Once<()>,
+    /// SMRR region (base and size) derived during BSP initialization.
+    smrr_range: Once<SmramRegion>,
 }
 
 impl InitState {
@@ -72,6 +75,7 @@ impl InitState {
             user_entry_point: Once::new(),
             ap_startup_fn: Once::new(),
             at_runtime: Once::new(),
+            smrr_range: Once::new(),
         }
     }
 
@@ -148,6 +152,16 @@ impl InitState {
     /// Returns whether ExitBootServices has been signaled.
     pub(crate) fn is_at_runtime(&self) -> bool {
         self.at_runtime.is_completed()
+    }
+
+    /// Stores the SMRR region (one-time).
+    pub(crate) fn set_smrr_range(&self, range: SmramRegion) {
+        self.smrr_range.call_once(|| range);
+    }
+
+    /// Returns the SMRR region, if set.
+    pub(crate) fn smrr_range(&self) -> Option<SmramRegion> {
+        self.smrr_range.get().copied()
     }
 }
 

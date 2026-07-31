@@ -14,7 +14,7 @@
 use core::ffi::c_void;
 
 use patina::{
-    base::{UEFI_PAGE_SIZE, align_range},
+    UEFI_PAGE_SIZE, align_range,
     management_mode::{
         MmCommBufferStatus,
         comm_buffer_hob::{MM_COMM_BUFFER_HOB_GUID, MmCommonBufferHobData},
@@ -29,15 +29,18 @@ use patina_paging::{
 
 use crate::{
     AllocationType, CommBufferConfig, MmSupervisorCore, PageOwnership, PlatformInfo, SharedPagingAllocator,
-    is_buffer_inside_mmram, mem,
+    is_buffer_inside_mmram,
+    mem::{self, page_allocator::coalesced_smrr_range},
     mm_policy::{self, MemDescriptorV1_0, dump_policy, gate::PolicyGate, walk_page_table},
     query_address_ownership, read_cr3,
     save_state::SaveStateInfo,
+    smrr::{configure_smm_code_access, smrr_initialize},
     state::{init_state, security_state},
 };
 
 use patina_internal_cpu::interrupts::Interrupts;
 use zerocopy::FromBytes;
+use zerocopy_derive::Immutable;
 
 /// Errors that can occur during policy initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +82,7 @@ const FIXUP64_SMI_HANDLER_IDTR: usize = 5;
 /// `MM_SUPERVISOR_BUFFER_T` (0) in practice — the user channel uses the
 /// separate `gMmCommBufferHobGuid` HOB.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy_derive::FromBytes, zerocopy_derive::Immutable)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable)]
 pub struct MmCommonRegionHobData {
     /// Region type discriminator. Always `MM_SUPERVISOR_BUFFER_T` (0) for
     /// the HOB the supervisor consumes.
@@ -101,7 +104,7 @@ pub struct MmCommonRegionHobData {
 /// has the same byte layout the C producer emits while still allowing safe,
 /// reference-based field access once parsed via `zerocopy`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, zerocopy_derive::FromBytes, zerocopy_derive::Immutable)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable)]
 pub struct MmSupvPassDownHobData {
     /// Revision of this HOB structure
     pub revision: u32,
@@ -253,8 +256,20 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
         // Initialize the page allocator from the HOB list. This finds all SMRAM
         // regions and sets up memory tracking.
         // SAFETY: `hob_list` is a valid HOB list per this function's contract.
-        if let Err(e) = unsafe { security_state().page_allocator().init_from_hob_list(hob_list) } {
-            panic!("Failed to initialize page allocator: {:?}", e);
+        let (smram_regions, region_count) =
+            match unsafe { security_state().page_allocator().init_from_hob_list(hob_list) } {
+                Ok(scanned_regions) => scanned_regions,
+                Err(e) => panic!("Failed to initialize page allocator: {:?}", e),
+            };
+
+        // Derive the SMRR range from the scanned SMRAM regions, coalescing
+        // physically adjacent regions, and store it for later SMRR programming.
+        match coalesced_smrr_range(smram_regions.get(..region_count).unwrap_or(&smram_regions)) {
+            Some(range) => {
+                log::info!("Discovered SMRR range: base=0x{:08x}, size=0x{:08x}", range.base, range.size);
+                init_state().set_smrr_range(range);
+            }
+            None => panic!("Failed to determine SMRR range from scanned SMRAM regions"),
         }
 
         // Reserve pages from the page allocator for paging structures. This is
@@ -485,7 +500,10 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
         let core_type = if is_bsp { "BSP" } else { "AP" };
         log::trace!("{} (CPU {}) performing per-core initialization...", core_type, cpu_id);
 
-        // TODO: Initialize per-CPU data structures
+        let range =
+            init_state().smrr_range().expect("SMRR range must be determined during BSP init before per-core init");
+        smrr_initialize(range);
+        configure_smm_code_access();
 
         log::trace!("{} (CPU {}) per-core initialization complete.", core_type, cpu_id);
     }
