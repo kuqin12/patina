@@ -13,9 +13,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-use crate::cpu::CPUID_VERSION_INFO;
-use crate::cpu::read_msr;
-use crate::cpu::write_msr;
+use crate::intrinsics::CPUID_VERSION_INFO;
+use crate::intrinsics::read_msr;
+use crate::intrinsics::write_msr;
 use core::arch::x86_64::__cpuid;
 
 const SIZE_4KB: u32 = 0x0000_1000;

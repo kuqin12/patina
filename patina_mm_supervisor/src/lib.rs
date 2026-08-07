@@ -42,20 +42,26 @@
 #![cfg(target_arch = "x86_64")]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
+mod comm_buffer;
 mod cpu;
 mod init;
+mod intrinsics;
 mod mailbox;
 mod mem;
 mod mm_policy;
+mod page_ownership;
 mod perf_timer;
 mod privilege_mgmt;
+mod request_target;
 mod runtime;
 mod save_state;
+mod semaphore;
 mod smrr;
 mod state;
 mod supervisor_handlers;
 
-use cpu::{CpuManager, get_current_cpu_id, is_bsp};
+use cpu::CpuManager;
+use intrinsics::{get_current_cpu_id, is_bsp};
 use mailbox::MailboxManager;
 // Re-exported for use by descendant modules via `crate::` paths.
 use mem::{AllocationType, SharedPagingAllocator};
@@ -70,17 +76,18 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use patina::{
-    UEFI_PAGE_SIZE, align_range, management_mode::MmCommBufferStatus, management_mode::supervisor::UserCommandType,
-};
-use patina_paging::{MemoryAttributes, PageTable};
+use patina::management_mode::supervisor::UserCommandType;
 
 use state::{init_state, security_state};
 
 // Publicly re-export the handler types since platform-specific handlers will need to reference these for
 // their function signatures and return types.
+pub use comm_buffer::CommBufferConfig;
 pub use init::PolicyInitError;
+pub use request_target::RequestTarget;
 pub use supervisor_handlers::SupervisorMmiHandler;
+
+pub(crate) use page_ownership::{PageOwnership, query_address_ownership};
 
 use crate::smrr::smrr_enable;
 
@@ -146,100 +153,6 @@ pub trait PlatformInfo: 'static {
     }
 }
 
-/// Result of a page table ownership query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PageOwnership {
-    /// The page is user-accessible (U/S = 1, SpecialPurpose clear).
-    User,
-    /// The page is supervisor-only (U/S = 0, SpecialPurpose set).
-    Supervisor,
-}
-
-/// Queries the page table to determine the ownership (user vs supervisor) of an address.
-///
-/// The address and size are page-aligned before querying (rounded down / up respectively).
-///
-/// Checks the `Supervisor` attribute which maps to the U/S bit on X64:
-///   - `Supervisor` set  => `PageOwnership::Supervisor` (U/S = 0)
-///   - `Supervisor` clear => `PageOwnership::User` (U/S = 1)
-///
-/// Returns `None` if the page table is not initialized or the address is unmapped.
-pub(crate) fn query_address_ownership(address: u64, size: u64) -> Option<PageOwnership> {
-    let (aligned_addr, aligned_size) = align_range(address, size, UEFI_PAGE_SIZE as u64).ok()?;
-    let page_table = security_state().lock_page_table();
-    let pt = page_table.as_ref()?;
-    let attrs = pt.query_memory_region(aligned_addr, aligned_size).ok()?;
-    log::trace!(
-        "Queried page ownership for address range 0x{:016x}-0x{:016x}: attributes={:?}",
-        aligned_addr,
-        aligned_addr + aligned_size,
-        attrs
-    );
-    if attrs.contains(MemoryAttributes::Supervisor) {
-        Some(PageOwnership::Supervisor)
-    } else {
-        Some(PageOwnership::User)
-    }
-}
-
-/// Communication buffer configuration extracted from PassDown HOB.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CommBufferConfig {
-    /// MM Supervisor communication buffer (external interface).
-    pub supv_comm_buffer: u64,
-    /// MM Supervisor internal communication buffer.
-    pub supv_comm_buffer_internal: u64,
-    /// Size of supervisor communication buffer.
-    pub supv_comm_buffer_size: u64,
-    /// MM User communication buffer (external interface).
-    pub user_comm_buffer: u64,
-    /// MM User internal communication buffer.
-    pub user_comm_buffer_internal: u64,
-    /// Size of user communication buffer.
-    pub user_comm_buffer_size: u64,
-    /// `MmCommBufferStatus` mailbox for user-targeted requests.
-    pub user_status_buffer: u64,
-    /// `MmCommBufferStatus` mailbox for supervisor-targeted requests.
-    pub supv_status_buffer: u64,
-    /// MM Supervisor to User buffer.
-    pub supv_to_user_buffer: u64,
-    /// Size of Supervisor to User buffer.
-    pub supv_to_user_buffer_size: u64,
-}
-
-/// Request target derived from the user and supervisor `MmCommBufferStatus`
-/// mailboxes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestTarget {
-    /// No pending request (neither mailbox is valid).
-    None,
-    /// Request targets the Supervisor.
-    Supervisor,
-    /// Request targets the User module.
-    User,
-}
-
-impl RequestTarget {
-    /// Selects the dispatch target based on the two parallel status mailboxes.
-    ///
-    /// The user mailbox is checked first — if its `is_comm_buffer_valid` flag
-    /// is set, the request belongs to the user module. Otherwise the
-    /// supervisor mailbox is consulted. When neither mailbox is valid the
-    /// request is treated as an asynchronous MMI, which is still dispatched
-    /// through the user path so the user-core's async handler chain can run.
-    pub fn select(user_status: &MmCommBufferStatus, supv_status: &MmCommBufferStatus) -> Self {
-        if user_status.is_comm_buffer_valid != 0 {
-            RequestTarget::User
-        } else if supv_status.is_comm_buffer_valid != 0 {
-            RequestTarget::Supervisor
-        } else {
-            // Async MMI — user-core's async dispatcher runs unconditionally
-            // once we demote, so route through the user path.
-            RequestTarget::User
-        }
-    }
-}
-
 /// The MM Supervisor Core responsible for managing the standalone MM environment.
 ///
 /// This struct is generic over the [`PlatformInfo`] trait, which provides platform-specific
@@ -297,22 +210,6 @@ pub struct MmSupervisorCore<P: PlatformInfo, const MAX_CPUS: usize> {
 pub(crate) fn is_buffer_inside_mmram(base: u64, size: u64) -> bool {
     // we will go over the page allocator to see if this region falls inside any of the MMRAM regions
     security_state().page_allocator().is_region_inside_mmram(base, size)
-}
-
-/// Read CR3 register.
-pub(crate) fn read_cr3() -> u64 {
-    let mut _value = 0u64;
-
-    #[cfg(not(test))]
-    {
-        // SAFETY: inline asm is inherently unsafe because Rust can't reason about it.
-        // In this case we are reading the CR3 register, which is a safe operation.
-        unsafe {
-            core::arch::asm!("mov {}, cr3", out(reg) _value, options(nostack, preserves_flags));
-        }
-    }
-
-    _value
 }
 
 /// Checks if a specific core has completed initialization.

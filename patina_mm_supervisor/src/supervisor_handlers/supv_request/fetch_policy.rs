@@ -14,9 +14,9 @@ use patina::{
 };
 
 use crate::{
+    intrinsics::read_cr3,
     is_buffer_inside_mmram,
     mm_policy::{MemDescriptorV1_0, PolicyError, PolicyGate},
-    read_cr3,
     state::security_state,
 };
 

@@ -19,7 +19,8 @@ use patina::{
 
 use crate::{
     AP_ARRIVAL_TIMEOUT_US, AP_TIMEOUT_US, CommBufferConfig, MmSupervisorCore, PageOwnership, PlatformInfo,
-    cpu::{ApState, is_bsp},
+    cpu::ApState,
+    intrinsics::is_bsp,
     mailbox::{ApCommand, ApResponse},
     privilege_mgmt::invoke_demoted_routine,
     query_address_ownership,

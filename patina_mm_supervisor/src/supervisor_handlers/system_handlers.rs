@@ -12,7 +12,8 @@
 use patina::standard::efi;
 
 use crate::{
-    is_buffer_inside_mmram, read_cr3,
+    intrinsics::read_cr3,
+    is_buffer_inside_mmram,
     state::{init_state, security_state},
 };
 

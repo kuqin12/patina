@@ -1,12 +1,12 @@
 //! CPU Management Module
 //!
-//! This module provides CPU identification and management for the MM Supervisor Core.
-//! It handles BSP/AP detection, CPU registration, and state tracking.
+//! This module provides CPU identification and management for the MM Supervisor
+//! Core. It handles BSP/AP detection, CPU registration, and state tracking.
 //!
 //! ## Memory Model
 //!
-//! This module does not perform heap allocation. All structures use fixed-size arrays
-//! with compile-time constants provided via const generics.
+//! This module does not perform heap allocation. All structures use fixed-size
+//! arrays with compile-time constants provided via const generics.
 //!
 //! ## License
 //!
@@ -15,19 +15,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-use core::{
-    arch::x86_64::{__cpuid, CpuidResult},
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
-};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-/// CPUID leaf 0x1: Version Information (Type, Family, Model, and Stepping ID).
-pub(crate) const CPUID_VERSION_INFO: u32 = 0x01;
-
-/// MSR index for IA32_APIC_BASE.
-const IA32_APIC_BASE_MSR_INDEX: u32 = 0x1B;
-
-/// BSP flag bit in IA32_APIC_BASE MSR (bit 8).
-const IA32_APIC_BSP: u64 = 1 << 8;
+use crate::semaphore::{sem_signal, sem_try_take, sem_wait};
 
 /// The state of an Application Processor (AP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,38 +82,6 @@ impl CpuSlot {
         let id = self.cpu_id.load(Ordering::Acquire);
         if id == u32::MAX { None } else { Some(id) }
     }
-}
-
-/// Signals a counting rendezvous semaphore (atomic increment).
-#[inline]
-fn sem_signal(sem: &AtomicU32) {
-    sem.fetch_add(1, Ordering::AcqRel);
-}
-
-/// Blocks (spins, no timer) until the semaphore is positive, then consumes one count.
-#[inline]
-fn sem_wait(sem: &AtomicU32) {
-    loop {
-        let value = sem.load(Ordering::Acquire);
-        if value != 0 && sem.compare_exchange_weak(value, value - 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return;
-        }
-        core::hint::spin_loop();
-    }
-}
-
-/// Consumes one count if the semaphore is positive. Non-blocking; returns whether a
-/// count was taken.
-#[inline]
-fn sem_try_take(sem: &AtomicU32) -> bool {
-    let mut value = sem.load(Ordering::Acquire);
-    while value != 0 {
-        match sem.compare_exchange_weak(value, value - 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return true,
-            Err(current) => value = current,
-        }
-    }
-    false
 }
 
 /// Manager for CPU-related operations.
@@ -372,75 +330,6 @@ impl<const MAX_CPUS: usize> Default for CpuManager<MAX_CPUS> {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Gets the current CPU's APIC ID.
-///
-/// On x86_64, this reads the APIC ID from the Local APIC or CPUID.
-pub fn get_current_cpu_id() -> u32 {
-    // Use CPUID to get the initial APIC ID
-    // CPUID function 0x01, EBX[31:24] contains the initial APIC ID
-
-    // CPUID is always available on x86_64 and `__cpuid` is a safe intrinsic.
-    let CpuidResult { ebx, .. } = __cpuid(CPUID_VERSION_INFO);
-
-    (ebx >> 24) & 0xff
-}
-
-/// Reads a Model-Specific Register (MSR) by index.
-///
-/// ## Safety
-///
-/// The caller must ensure the MSR index is valid and readable on the current platform.
-pub unsafe fn read_msr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: Reading the MSR is memory safe as long as the caller ensures the MSR index is valid.
-    //         But this could also reveal the contents of the MSR, which is why we should guard this
-    //         behind the syscall gate and only allow access to certain MSRs.
-    unsafe {
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack),
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-/// Writes a 64-bit value to a Model-Specific Register (MSR).
-///
-/// ## Safety
-///
-/// The caller must ensure the MSR index is valid and writable on the current platform.
-pub unsafe fn write_msr(msr: u32, value: u64) {
-    let lo = value as u32;
-    let hi = (value >> 32) as u32;
-    // SAFETY: Writing the MSR is memory safe as long as the caller ensures the MSR index is valid
-    //         and writable (guaranteed by this function's `unsafe` contract). `wrmsr` writes only
-    //         the selected MSR from EDX:EAX and touches no memory (nomem, nostack).
-    unsafe {
-        core::arch::asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") lo,
-            in("edx") hi,
-            options(nomem, nostack),
-        );
-    }
-}
-
-/// Checks if the current processor is the Bootstrap Processor (BSP).
-///
-/// This reads the IA32_APIC_BASE MSR and checks the BSP flag (bit 8).
-/// The BSP flag is set by hardware during reset and indicates which
-/// processor is the bootstrap processor.
-pub fn is_bsp() -> bool {
-    // SAFETY: The IA32_APIC_BASE MSR is safe to read on x86_64.
-    let apic_base = unsafe { read_msr(IA32_APIC_BASE_MSR_INDEX) };
-    (apic_base & IA32_APIC_BSP) != 0
 }
 
 #[cfg(test)]

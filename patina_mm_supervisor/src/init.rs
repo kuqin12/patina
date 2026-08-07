@@ -29,10 +29,11 @@ use patina_paging::{
 
 use crate::{
     AllocationType, CommBufferConfig, MmSupervisorCore, PageOwnership, PlatformInfo, SharedPagingAllocator,
+    intrinsics::read_cr3,
     is_buffer_inside_mmram,
     mem::{self, page_allocator::coalesced_smrr_range},
     mm_policy::{self, MemDescriptorV1_0, dump_policy, gate::PolicyGate, walk_page_table},
-    query_address_ownership, read_cr3,
+    query_address_ownership,
     save_state::SaveStateInfo,
     smrr::{configure_smm_code_access, smrr_initialize},
     state::{init_state, security_state},
