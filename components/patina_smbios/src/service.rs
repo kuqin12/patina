@@ -10,7 +10,6 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-extern crate alloc;
 use alloc::vec::Vec;
 use core::cell::Ref;
 pub use patina::standard::efi::industry::smbios::{
@@ -343,9 +342,6 @@ impl SmbiosExt for patina::component::service::Service<dyn Smbios> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate alloc;
-    extern crate std;
-    use alloc::string::String;
     use std::format;
 
     use crate::{

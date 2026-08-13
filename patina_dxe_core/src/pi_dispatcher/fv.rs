@@ -902,14 +902,13 @@ pub fn device_path_bytes_for_fv_file(fv_handle: efi::Handle, file_name: efi::Gui
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+    use crate::test_collateral;
     use crate::{MockComponentInfo, MockCpuInfo, MockMemoryInfo, test_support};
     use patina::pi::{
         BootMode,
         hob::{self, Hob, HobList},
     };
     use patina_ffs_extractors::CompositeSectionExtractor;
-    extern crate alloc;
-    use crate::test_collateral;
     use std::{
         alloc::{Layout, alloc, dealloc},
         ffi::c_void,

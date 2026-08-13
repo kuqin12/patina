@@ -118,9 +118,6 @@ pub fn expand_device_path<B: BootServices>(boot_services: &B, partial_path: &mut
 
 #[cfg(test)]
 mod tests {
-    extern crate alloc;
-    extern crate std;
-
     use super::*;
     use crate::{
         uefi::boot_services::MockBootServices,

@@ -10,7 +10,6 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-extern crate alloc;
 use super::{AllocationStatistics, AllocationStrategy, DEFAULT_ALLOCATION_STRATEGY, PageAllocator};
 
 use crate::{gcd::SpinLockedGcd, tpl_mutex};

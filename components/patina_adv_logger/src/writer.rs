@@ -192,8 +192,7 @@ impl AdvancedLogWriter {
 #[cfg(all(test, feature = "reader"))]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
-    extern crate std;
-    use alloc::boxed::Box;
+    use std::boxed::Box;
     use core::{mem::size_of, sync::atomic::Ordering};
     use efi::PhysicalAddress;
 

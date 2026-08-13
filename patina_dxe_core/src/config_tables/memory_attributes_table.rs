@@ -6,7 +6,6 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-extern crate alloc;
 use alloc::vec::Vec;
 
 #[cfg(not(test))]

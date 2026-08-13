@@ -19,5 +19,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 #![cfg_attr(coverage, coverage(off))] // Disable all coverage instrumentation for sample code
+extern crate alloc;
+
 pub mod component;
 pub mod smbios_platform;

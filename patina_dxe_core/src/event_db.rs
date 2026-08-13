@@ -10,8 +10,6 @@
 //!
 #![warn(missing_docs)]
 
-extern crate alloc;
-
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,

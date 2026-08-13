@@ -8,8 +8,6 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-extern crate alloc;
-
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec,

@@ -16,7 +16,6 @@
 
 use crate::patina_mm_integration::common::{constants::*, handlers::*};
 
-extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 use patina::Guid;
 use std::{

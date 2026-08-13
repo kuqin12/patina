@@ -153,8 +153,6 @@ mod tests {
     use super::*;
     use proc_macro2::TokenStream;
     use quote::quote;
-    extern crate alloc;
-    use alloc::format;
 
     #[test]
     fn test_config_basic() {
