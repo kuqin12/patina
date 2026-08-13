@@ -14,12 +14,13 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-use core::{fmt, mem, num::Wrapping, ptr, slice};
 
 pub mod ffs;
 pub mod fv;
 pub mod fvb;
 
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use core::{fmt, mem, num::Wrapping, ptr, slice};
 use ffs::{attributes::raw::LARGE_FILE, file, section};
 pub use ffs::{
     attributes::{Attribute as FfsAttribute, raw as FfsRawAttribute},
@@ -40,11 +41,8 @@ pub use fv::{
 pub use fvb::attributes::{EfiFvbAttributes2, Fvb2 as Fvb2Attributes, raw::fvb2 as Fvb2RawAttributes};
 use zerocopy::FromBytes;
 
-#[cfg(test)]
-use crate::Char16String;
 use crate::standard::efi;
 use crate::{BinaryGuid, base::align_up};
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use num_traits::WrappingSub;
 
 /// Well-known GUIDs for firmware file system encapsulation and compression section types.
@@ -1004,14 +1002,14 @@ mod unit_tests {
         path::Path,
     };
 
+    use crate::Char16String;
+    use crate::pi::fw_fs::{SectionMetaData, guid};
     use crate::standard::efi;
     use core::{mem, sync::atomic::AtomicBool};
     use serde::Deserialize;
     use uuid::Uuid;
 
-    use crate::pi::fw_fs::{SectionMetaData, guid};
-
-    use super::{Char16String, FfsSectionType, FirmwareVolume, NullSectionExtractor, Section, SectionExtractor, fv};
+    use super::{FfsSectionType, FirmwareVolume, NullSectionExtractor, Section, SectionExtractor, fv};
 
     #[derive(Debug, Deserialize)]
     struct TargetValues {

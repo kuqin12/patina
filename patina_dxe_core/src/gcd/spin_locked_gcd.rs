@@ -3076,17 +3076,17 @@ mod tests {
     //! ## Global State (`GCD.reset()`)
     //! - Tests reset global GCD state to ensure test isolation
     //! - The test lock prevents concurrent access during reset operations
-    extern crate std;
-    use core::{alloc::Layout, sync::atomic::AtomicBool};
-    use patina::align_up;
-
     use crate::test_support::{self, MockPageTable, MockPageTableWrapper};
+    use core::sync::atomic::AtomicBool;
+    use patina::align_up;
+    use std::alloc::System;
+    use std::alloc::{Layout, alloc};
+    use std::vec::Vec;
+    use std::{alloc::GlobalAlloc, cell::RefCell, rc::Rc};
 
     use super::*;
     use patina::pi::dxe_services::GcdMemoryType;
     use patina::standard::efi;
-    use std::vec::Vec;
-    use std::{alloc::GlobalAlloc, cell::RefCell, rc::Rc};
 
     const DXE_CORE_PE_HEADER_DATA: [u8; 1057] = [
         0x4D, 0x5A, 0x78, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -4744,7 +4744,7 @@ mod tests {
     unsafe fn get_memory(size: usize) -> &'static mut [u8] {
         // SAFETY: Allocates memory from the system allocator with UEFI page alignment.
         // The returned slice is intentionally leaked for test simplicity and valid for 'static lifetime.
-        let addr = unsafe { alloc::alloc::alloc(alloc::alloc::Layout::from_size_align(size, UEFI_PAGE_SIZE).unwrap()) };
+        let addr = unsafe { alloc(Layout::from_size_align(size, UEFI_PAGE_SIZE).unwrap()) };
         // SAFETY: The allocated pointer is valid for `size` bytes and properly aligned.
         unsafe { core::slice::from_raw_parts_mut(addr, size) }
     }
@@ -4888,7 +4888,7 @@ mod tests {
 
             let layout = Layout::from_size_align(GCD_SIZE, 0x1000).unwrap();
             // SAFETY: The allocator returns a test buffer aligned to pages for GCD initialization.
-            let base = unsafe { std::alloc::System.alloc(layout) as u64 };
+            let base = unsafe { System.alloc(layout) as u64 };
             // SAFETY: base/size come from the test allocation and are valid for initializing memory blocks.
             unsafe {
                 GCD.init_memory_blocks(
@@ -4935,7 +4935,7 @@ mod tests {
 
             let layout = Layout::from_size_align(GCD_SIZE, 0x1000).unwrap();
             // SAFETY: The allocator returns a test buffer aligned to pages for GCD initialization.
-            let base = unsafe { std::alloc::System.alloc(layout) as u64 };
+            let base = unsafe { System.alloc(layout) as u64 };
             // SAFETY: base/size come from the test allocation and are valid for initializing memory blocks.
             unsafe {
                 GCD.init_memory_blocks(
@@ -5140,7 +5140,7 @@ mod tests {
 
             let layout = Layout::from_size_align(GCD_SIZE, 0x1000).unwrap();
             // SAFETY: The allocator is set up to return an aligned and available test buffer for GCD initialization.
-            let base = unsafe { std::alloc::System.alloc(layout) as u64 };
+            let base = unsafe { System.alloc(layout) as u64 };
             // SAFETY: base points to the test allocation and GCD_SIZE defines the initialized range.
             unsafe {
                 GCD.init_memory_blocks(
@@ -5194,7 +5194,7 @@ mod tests {
 
             let layout = Layout::from_size_align(GCD_SIZE, 0x1000).unwrap();
             // SAFETY: The allocator is set up to return an aligned and available test buffer for GCD initialization.
-            let base = unsafe { std::alloc::System.alloc(layout) as u64 };
+            let base = unsafe { System.alloc(layout) as u64 };
             // SAFETY: base/size correspond to the test allocation and are safe to register with the GCD.
             unsafe {
                 GCD.init_memory_blocks(

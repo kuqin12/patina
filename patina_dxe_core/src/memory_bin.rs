@@ -25,14 +25,13 @@
 //!
 
 use crate::allocator::{DEFAULT_PAGE_ALLOCATION_GRANULARITY, RUNTIME_PAGE_ALLOCATION_GRANULARITY};
+use alloc::vec::Vec;
 use patina::standard::efi;
 use patina::{
     pi::hob::{self, EFiMemoryTypeInformation, Hob, HobList, MEMORY_TYPE_INFO_HOB_GUID},
     uefi::memory::{EFI_MAX_MEMORY_TYPE, INVALID_INFORMATION_INDEX},
     uefi_pages_to_size, uefi_size_to_pages, {UEFI_PAGE_SHIFT, align_up},
 };
-
-use alloc::vec::Vec;
 
 /// Maximum number of entries in the memory type information array.
 const MAX_MEMORY_TYPE_INFO_ENTRIES: usize = EFI_MAX_MEMORY_TYPE + 1;

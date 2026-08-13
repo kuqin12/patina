@@ -11,6 +11,8 @@
 //! SPDX-License-Identifier: Apache-2.0
 
 use crate::config::CommunicateBuffer;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use patina::{
     UEFI_PAGE_SIZE,
     management_mode::protocol::mm_comm_buffer_update::{self, MmCommBufferUpdateProtocol},
@@ -21,8 +23,6 @@ use patina::{
 use zerocopy::FromBytes;
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-
-use alloc::boxed::Box;
 
 /// Context for the MM Comm Buffer Update Protocol notify callback
 ///
@@ -101,7 +101,7 @@ pub(super) fn register_buffer_update_notify(
 /// - `false` if no update was pending
 pub(super) fn apply_pending_buffer_update(
     context: &ProtocolNotifyContext,
-    comm_buffers: &mut alloc::vec::Vec<CommunicateBuffer>,
+    comm_buffers: &mut Vec<CommunicateBuffer>,
 ) -> bool {
     if !context.has_pending_update.load(Ordering::Acquire) {
         return false;

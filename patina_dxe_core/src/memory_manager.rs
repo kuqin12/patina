@@ -7,6 +7,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use alloc::boxed::Box;
+use core::alloc::Allocator;
 use patina::standard::efi;
 use patina::{
     component::service::{
@@ -91,10 +92,10 @@ impl MemoryManager for CoreMemoryManager {
     // Coverage is turned off since this is a simple wrapper function that would necessitate
     // complex mocking to test.
     #[cfg_attr(coverage, coverage(off))]
-    fn get_allocator(&self, memory_type: EfiMemoryType) -> Result<&'static dyn core::alloc::Allocator, MemoryError> {
+    fn get_allocator(&self, memory_type: EfiMemoryType) -> Result<&'static dyn Allocator, MemoryError> {
         let allocator =
             crate::allocator::core_get_allocator(memory_type.into()).map_err(|_| MemoryError::UnsupportedMemoryType)?;
-        Ok(allocator as &dyn core::alloc::Allocator)
+        Ok(allocator as &dyn Allocator)
     }
 
     /// # Safety

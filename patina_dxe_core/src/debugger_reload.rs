@@ -11,9 +11,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::ffi::c_void;
 
-use alloc::vec::Vec;
 use patina::{
     component::service::memory::{AllocationOptions, MemoryManager, PageAllocationStrategy},
     guid as base_guids,
@@ -176,7 +176,7 @@ fn decompress_image(compressed_image: &[u8], out: &mut dyn core::fmt::Write) -> 
         u32::from_le_bytes(bytes) as usize
     };
 
-    let decompressed_image = alloc::boxed::Box::leak(alloc::vec![0u8; decompressed_size].into_boxed_slice());
+    let decompressed_image = Box::leak(vec![0u8; decompressed_size].into_boxed_slice());
     if let Err(error) =
         decompress_into_with_algo(compressed_image, decompressed_image, DecompressionAlgorithm::UefiDecompress)
     {

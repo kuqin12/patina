@@ -9,6 +9,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use crate::tpl_mutex::TplMutex;
+use alloc::{borrow::Cow, boxed::Box, format, vec::Vec};
 use patina::standard::efi;
 use patina::{
     component::{IntoComponent, Storage, service::IntoService},
@@ -17,8 +18,6 @@ use patina::{
     uefi::boot_services::StandardBootServices,
     uefi::runtime_services::StandardRuntimeServices,
 };
-
-use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 
 /// A trait to be implemented by the platform to register additional components, configurations, and services.
 ///
@@ -197,7 +196,7 @@ impl ComponentDispatcher {
                 let parser_funcs = self.storage.get_hob_parsers(&guid.name);
                 if parser_funcs.is_empty() {
                     let (f0, f1, f2, f3, f4, &[f5, f6, f7, f8, f9, f10]) = guid.name.as_fields();
-                    let name = alloc::format!(
+                    let name = format!(
                         "{f0:08x}-{f1:04x}-{f2:04x}-{f3:02x}{f4:02x}-{f5:02x}{f6:02x}{f7:02x}{f8:02x}{f9:02x}{f10:02x}"
                     );
                     log::warn!(

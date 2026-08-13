@@ -6,6 +6,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::vec::Vec;
 use patina_ffs::{
     FirmwareFileSystemError,
     section::{Section, SectionExtractor},
@@ -50,7 +51,7 @@ impl CompositeSectionExtractor {
 }
 
 impl SectionExtractor for CompositeSectionExtractor {
-    fn extract(&self, _section: &Section) -> Result<alloc::vec::Vec<u8>, FirmwareFileSystemError> {
+    fn extract(&self, _section: &Section) -> Result<Vec<u8>, FirmwareFileSystemError> {
         #[cfg(feature = "brotli")]
         {
             match self.brotli.extract(_section) {

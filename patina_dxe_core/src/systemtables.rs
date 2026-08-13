@@ -8,9 +8,9 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::boxed::Box;
 use core::{ffi::c_void, mem::size_of, slice::from_raw_parts};
 
-use alloc::boxed::Box;
 use patina::standard::efi;
 use patina::{component::component, pi::error_codes::EFI_NOT_AVAILABLE_YET, uefi::boot_services::BootServices};
 

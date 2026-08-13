@@ -13,6 +13,11 @@ mod uefi_allocator;
 #[cfg_attr(coverage, coverage(off))]
 mod usage_tests;
 
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    vec::{IntoIter, Vec},
+};
 use core::{
     ffi::c_void,
     fmt::Debug,
@@ -22,7 +27,6 @@ use core::{
     slice::{self, from_raw_parts_mut},
 };
 
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use patina::function;
 
 use crate::{
@@ -166,7 +170,7 @@ pub trait PageAllocator {
     fn set_reserved_range(&self, range: Range<efi::PhysicalAddress>) -> Result<(), EfiError>;
 
     /// Returns an iterator over the memory ranges managed by this allocator.
-    fn get_memory_ranges(&self) -> alloc::vec::IntoIter<Range<usize>>;
+    fn get_memory_ranges(&self) -> IntoIter<Range<usize>>;
 
     /// Indicates whether the given pointer falls within a memory region managed by this allocator.
     fn contains(&self, ptr: NonNull<u8>) -> bool;
@@ -1632,17 +1636,17 @@ pub(crate) unsafe fn reset_allocators() {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
 
+    use super::*;
     use crate::{
         gcd,
         test_support::{self, build_test_hob_list},
     };
-
-    use super::*;
     use patina::pi::{
         dxe_services, guid as pi_guids,
         hob::{GUID_EXTENSION, GuidHob, Hob, HobHeader},
     };
     use patina::standard::efi;
+    use std::alloc::Allocator;
 
     enum GcdInit {
         /// Initializes a simple test GCD (via init_test_gcd()) with the given size.
@@ -2393,7 +2397,7 @@ mod tests {
                 assert!(!buffer_ptr.is_null());
                 assert!(allocator.get_memory_ranges().next().is_some());
 
-                let _alloc_trait: &dyn core::alloc::Allocator = allocator;
+                let _alloc_trait: &dyn Allocator = allocator;
 
                 assert!(allocator.free_pool(buffer_ptr).is_ok());
             }
@@ -2413,7 +2417,7 @@ mod tests {
                 assert!(!buffer_ptr.is_null());
                 assert!(allocator.get_memory_ranges().next().is_some());
 
-                let _alloc_trait: &dyn core::alloc::Allocator = allocator;
+                let _alloc_trait: &dyn Allocator = allocator;
 
                 assert!(allocator.free_pool(buffer_ptr).is_ok());
             }

@@ -10,6 +10,7 @@
 //!
 
 use alloc::collections::btree_map::BTreeMap;
+use alloc::{vec, vec::Vec};
 use core::{
     any::TypeId,
     cell::OnceCell,
@@ -33,7 +34,6 @@ use patina::{
 
 use crate::{
     acpi_table::{AcpiDsdt, AcpiFacs, AcpiFadt, AcpiRsdp, AcpiTable, AcpiTableHeader, AcpiXsdt, AcpiXsdtMetadata},
-    alloc::{vec, vec::Vec},
     error::AcpiError,
     hob::AcpiMemoryHob,
     service::{AcpiNotifyFn, AcpiProvider, TableKey},

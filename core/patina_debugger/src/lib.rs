@@ -120,6 +120,7 @@ mod transport;
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+use alloc::boxed::Box;
 pub use debugger::PatinaDebugger;
 
 #[cfg(not(test))]
@@ -181,7 +182,7 @@ trait Debugger: Sync {
         &'static self,
         command: &'static str,
         description: Option<&'static str>,
-        callback: alloc::boxed::Box<MonitorCommandFn>,
+        callback: Box<MonitorCommandFn>,
     );
 }
 
@@ -312,7 +313,7 @@ where
     F: Fn(&mut core::str::SplitWhitespace<'_>, &mut dyn core::fmt::Write) + Send + Sync + 'static,
 {
     if let Some(debugger) = DEBUGGER.get() {
-        debugger.add_monitor_command(cmd, description, alloc::boxed::Box::new(function));
+        debugger.add_monitor_command(cmd, description, Box::new(function));
     }
 }
 

@@ -6,6 +6,8 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 use core::{cell::Cell, cmp::Ordering};
 
 use crate::collections::{
@@ -643,8 +645,8 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
     #[allow(dead_code)]
     /// Performs a depth-first search on the tree, returning the ordered values.
-    pub fn dfs(&self) -> alloc::vec::Vec<D> {
-        let mut values = alloc::vec::Vec::new();
+    pub fn dfs(&self) -> Vec<D> {
+        let mut values = Vec::new();
         Self::_dfs(self.root(), &mut values);
         values
     }
@@ -652,7 +654,7 @@ where
     #[cfg(feature = "alloc")]
     #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
     #[allow(dead_code)]
-    fn _dfs(node: Option<&Node<D>>, values: &mut alloc::vec::Vec<D>) {
+    fn _dfs(node: Option<&Node<D>>, values: &mut Vec<D>) {
         if let Some(node) = node {
             Self::_dfs(node.left(), values);
             // SAFETY: Nodes in the tree always have initialized data

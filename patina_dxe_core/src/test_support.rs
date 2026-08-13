@@ -9,6 +9,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use crate::{GCD, allocator::DEFAULT_PAGE_ALLOCATION_GRANULARITY, protocols::PROTOCOL_DB};
+use alloc::alloc::{Layout, alloc};
 use core::ffi::c_void;
 use patina::standard::efi;
 use patina::{
@@ -311,7 +312,7 @@ pub(crate) fn with_clean_global_lock<F: Fn() + std::panic::RefUnwindSafe>(f: F) 
 pub(crate) unsafe fn get_memory(size: usize) -> &'static mut [u8] {
     // SAFETY: Test code - allocates memory from the system allocator with UEFI page alignment.
     // The returned slice is intentionally leaked for test simplicity and valid for 'static lifetime.
-    let addr = unsafe { alloc::alloc::alloc(alloc::alloc::Layout::from_size_align(size, 0x10000).unwrap()) };
+    let addr = unsafe { alloc(Layout::from_size_align(size, 0x10000).unwrap()) };
     // SAFETY: The allocated pointer is valid for `size` bytes and properly aligned.
     unsafe { core::slice::from_raw_parts_mut(addr, size) }
 }
@@ -331,7 +332,7 @@ const TEST_GCD_MEM_SIZE: usize = 0x1000000;
 pub(crate) unsafe fn init_test_gcd(size: Option<usize>) {
     let size = size.unwrap_or(TEST_GCD_MEM_SIZE);
     // SAFETY: Allocates memory from the system allocator with UEFI page alignment for GCD memory blocks.
-    let addr = unsafe { alloc::alloc::alloc(alloc::alloc::Layout::from_size_align(size, 0x1000).unwrap()) };
+    let addr = unsafe { alloc(Layout::from_size_align(size, 0x1000).unwrap()) };
     // SAFETY: Resetting the global GCD state in test context - called with test lock held.
     unsafe { GCD.reset() };
     GCD.init(48, 16);

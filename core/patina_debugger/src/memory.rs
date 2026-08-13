@@ -175,14 +175,13 @@ fn check_paging_range<P: PatinaPageTable>(page_table: &P, start_address: u64, le
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
-
     use super::*;
-
     use crate::*;
     use gdbstub::target::ext::breakpoints;
     use mockall::{predicate::*, *};
     use patina_internal_cpu::paging::CacheAttributeValue;
     use patina_paging::{MemoryAttributes, PtError};
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
 
     mock! {
         pub MemPageTable {}
@@ -348,9 +347,9 @@ mod tests {
         // Write a pattern across the page boundary and verify all bytes land
         // at the correct addresses.
         const SIZE: usize = PAGE_SIZE as usize * 2;
-        let layout = std::alloc::Layout::from_size_align(SIZE, PAGE_SIZE as usize).unwrap();
+        let layout = Layout::from_size_align(SIZE, PAGE_SIZE as usize).unwrap();
         // SAFETY: layout has non-zero size and power-of-two alignment.
-        let dest = unsafe { std::alloc::alloc_zeroed(layout) };
+        let dest = unsafe { alloc_zeroed(layout) };
         assert!(!dest.is_null());
 
         // Start the write halfway into the first page so it crosses the boundary.
@@ -382,7 +381,7 @@ mod tests {
         }
 
         // SAFETY: dest was allocated with this layout.
-        unsafe { std::alloc::dealloc(dest, layout) };
+        unsafe { dealloc(dest, layout) };
     }
 
     #[test]

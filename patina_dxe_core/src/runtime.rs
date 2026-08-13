@@ -7,9 +7,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
+use alloc::collections::LinkedList;
 use core::{ffi::c_void, ptr};
 
-use alloc::collections::LinkedList;
 use patina::error::EfiError;
 use patina::standard::efi;
 use spin::Mutex;

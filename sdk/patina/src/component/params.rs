@@ -100,7 +100,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use alloc::{borrow::Cow, boxed::Box};
+use alloc::{borrow::Cow, boxed::Box, format};
 
 use crate::{
     component::{
@@ -154,7 +154,7 @@ pub unsafe trait Param {
         if Self::validate(state, storage) {
             Ok(())
         } else {
-            Err(Cow::from(alloc::format!("{} not available.", super::type_name::normalized::<Self>())))
+            Err(Cow::from(format!("{} not available.", super::type_name::normalized::<Self>())))
         }
     }
 
@@ -431,14 +431,14 @@ unsafe impl<T: Default + 'static> Param for Config<'_, T> {
         let id = storage.add_config_default_if_not_present::<T>();
 
         if meta.access().has_writes_all_configs() {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "Config<{}> conflicts with a previous &mut Storage access.",
                 super::type_name::normalized::<T>()
             )));
         }
 
         if meta.access().has_config_write(id) {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "Config<{0}> conflicts with a previous ConfigMut<{0}> access.",
                 super::type_name::normalized::<T>()
             )));
@@ -543,28 +543,28 @@ unsafe impl<T: Default + 'static> Param for ConfigMut<'_, T> {
         storage.unlock_config(id);
 
         if meta.access().has_writes_all_configs() {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "ConfigMut<{}> conflicts with a previous &mut Storage access.",
                 super::type_name::normalized::<T>()
             )));
         }
 
         if meta.access().has_reads_all_configs() {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "ConfigMut<{}> conflicts with a previous &Storage access.",
                 super::type_name::normalized::<T>()
             )));
         }
 
         if meta.access().has_config_write(id) {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "ConfigMut<{0}> conflicts with a previous ConfigMut<{0}> access.",
                 super::type_name::normalized::<T>()
             )));
         }
 
         if meta.access().has_config_read(id) {
-            return Err(Cow::from(alloc::format!(
+            return Err(Cow::from(format!(
                 "ConfigMut<{0}> conflicts with a previous Config<{0}> access.",
                 super::type_name::normalized::<T>()
             )));

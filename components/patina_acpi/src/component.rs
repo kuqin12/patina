@@ -8,10 +8,11 @@
 
 use crate::{
     acpi_table::{AcpiTableHeader, AcpiXsdtMetadata},
-    alloc::boxed::Box,
     hob::AcpiMemoryHob,
     service::{AcpiProvider, AcpiTableManager},
 };
+
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use core::mem;

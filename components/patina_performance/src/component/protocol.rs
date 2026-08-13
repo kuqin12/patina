@@ -11,13 +11,14 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
+use alloc::string::ToString;
+
 use core::{
     cell::OnceCell,
     ffi::{c_char, c_void},
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::string::ToString;
 use patina::standard::efi;
 use patina::{
     BinaryGuid, Char8Str,

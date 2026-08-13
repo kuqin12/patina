@@ -14,7 +14,7 @@ use super::{AllocationStatistics, AllocationStrategy, DEFAULT_ALLOCATION_STRATEG
 
 use crate::{gcd::SpinLockedGcd, tpl_mutex};
 
-use alloc::vec::Vec;
+use alloc::vec::{IntoIter, Vec};
 use core::{
     alloc::{AllocError, Allocator, GlobalAlloc, Layout},
     cmp::max,
@@ -656,7 +656,7 @@ impl SpinLockedFixedSizeBlockAllocator {
 
     /// Returns an iterator of the ranges of memory owned by this allocator
     /// Returns an empty iterator if the allocator does not own any memory.
-    pub fn get_memory_ranges(&self) -> alloc::vec::IntoIter<Range<usize>> {
+    pub fn get_memory_ranges(&self) -> IntoIter<Range<usize>> {
         let ranges: Vec<_> = self.lock().get_memory_ranges().collect();
         ranges.into_iter()
     }
@@ -816,7 +816,7 @@ impl PageAllocator for SpinLockedFixedSizeBlockAllocator {
         Self::set_reserved_range(self, range)
     }
 
-    fn get_memory_ranges(&self) -> alloc::vec::IntoIter<Range<usize>> {
+    fn get_memory_ranges(&self) -> IntoIter<Range<usize>> {
         Self::get_memory_ranges(self)
     }
 

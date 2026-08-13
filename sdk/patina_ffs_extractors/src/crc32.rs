@@ -6,6 +6,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::vec::Vec;
 use patina::pi::fw_fs;
 use patina_ffs::{
     FirmwareFileSystemError,
@@ -25,7 +26,7 @@ impl Crc32SectionExtractor {
 }
 
 impl SectionExtractor for Crc32SectionExtractor {
-    fn extract(&self, section: &patina_ffs::section::Section) -> Result<alloc::vec::Vec<u8>, FirmwareFileSystemError> {
+    fn extract(&self, section: &patina_ffs::section::Section) -> Result<Vec<u8>, FirmwareFileSystemError> {
         if let SectionHeader::GuidDefined(guid_header, crc_header, _) = section.header()
             && guid_header.section_definition_guid == fw_fs::guid::CRC32_SECTION_GUID
         {

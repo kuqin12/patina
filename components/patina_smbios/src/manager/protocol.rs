@@ -13,9 +13,10 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
+use alloc::string::ToString;
+
 use core::ffi::c_char;
 
-use alloc::string::ToString;
 use patina::{Char8Str, protocol::ProtocolInterface, standard::efi, uefi::tpl_mutex::TplMutex};
 
 use crate::service::{SMBIOS_HANDLE_PI_RESERVED, SmbiosHandle, SmbiosTableHeader, SmbiosType};

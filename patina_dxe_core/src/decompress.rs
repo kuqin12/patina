@@ -6,9 +6,9 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::boxed::Box;
 use core::ffi::c_void;
 
-use alloc::boxed::Box;
 use patina::{
     component::{Storage, component},
     error::EfiError,

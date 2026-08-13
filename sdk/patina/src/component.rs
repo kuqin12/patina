@@ -145,6 +145,7 @@ mod struct_component;
 mod type_name;
 
 use crate::base::error::Result;
+use alloc::boxed::Box;
 
 pub use metadata::MetaData;
 pub use storage::{Storage, UnsafeStorageCell};
@@ -195,7 +196,7 @@ pub trait IntoComponent<Input> {
     /// Converts a non-[Component] struct into an object that does implement [Component].
     ///
     /// Returns a boxed trait object that implements [Component].
-    fn into_component(self) -> alloc::boxed::Box<dyn Component>;
+    fn into_component(self) -> Box<dyn Component>;
 }
 
 /// A prelude module that re-exports commonly used items from the `component` module.

@@ -13,10 +13,8 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-use crate::{
-    __private_api::{TestCase, TestTrigger},
-    alloc::{boxed::Box, collections::BTreeMap, fmt::Display, string::String, vec::Vec},
-};
+use crate::__private_api::{TestCase, TestTrigger};
+use alloc::{boxed::Box, collections::BTreeMap, fmt::Display, format, string::String, vec::Vec};
 
 use core::{ops::DerefMut, ptr::NonNull};
 
@@ -139,12 +137,12 @@ impl TestRecord {
 
     /// Serializes the test record to a JSON string for logging or reporting purposes.
     fn json(&self) -> String {
-        alloc::format!(
+        format!(
             r#"{{"name":"{}","pass":{},"fail":{},"err_msg":{}}}"#,
             self.test_case.name,
             self.pass,
             self.fail,
-            self.err_msg.map_or(String::from("null"), |msg| alloc::format!(r#""{}""#, msg))
+            self.err_msg.map_or(String::from("null"), |msg| format!(r#""{}""#, msg))
         )
     }
 

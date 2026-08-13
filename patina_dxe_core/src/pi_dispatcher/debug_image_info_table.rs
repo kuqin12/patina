@@ -6,6 +6,11 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::alloc::LayoutError;
+use alloc::{
+    alloc::{alloc_zeroed, dealloc, realloc},
+    boxed::Box,
+};
 use core::{
     alloc::Layout,
     fmt,
@@ -22,7 +27,7 @@ const _: () = assert!(DEFAULT_CAPACITY > 0);
 #[derive(Debug)]
 enum GrowError {
     /// The requested layout was invalid.
-    InvalidLayout(alloc::alloc::LayoutError),
+    InvalidLayout(LayoutError),
     /// The allocator returned a null pointer.
     AllocFailed,
 }
@@ -36,8 +41,8 @@ impl fmt::Display for GrowError {
     }
 }
 
-impl From<alloc::alloc::LayoutError> for GrowError {
-    fn from(e: alloc::alloc::LayoutError) -> Self {
+impl From<LayoutError> for GrowError {
+    fn from(e: LayoutError) -> Self {
         GrowError::InvalidLayout(e)
     }
 }
@@ -248,7 +253,7 @@ impl DebugImageInfoData {
             let layout = Layout::array::<efi::DebugImageInfo>(DEFAULT_CAPACITY)?;
 
             // SAFETY: layout is non-zero sized due to DEFAULT_CAPACITY being non-zero
-            let data = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            let data = unsafe { alloc_zeroed(layout) };
             (data, DEFAULT_CAPACITY)
         } else {
             let old_layout = Layout::array::<efi::DebugImageInfo>(self.capacity)?;
@@ -258,7 +263,7 @@ impl DebugImageInfoData {
             //   of this struct.
             // SAFETY: new_size is greater than zero due to the if branch above ensuring capacity is non-zero.
             // SAFETY: new_size does not exceed isize::MAX as the `Layout` call would have failed.
-            let data = unsafe { alloc::alloc::realloc(self.table_mut().cast::<u8>(), old_layout, new_layout.size()) };
+            let data = unsafe { realloc(self.table_mut().cast::<u8>(), old_layout, new_layout.size()) };
             (data, new_capacity)
         };
 
@@ -288,7 +293,7 @@ impl Drop for DebugImageInfoData {
             let layout = Layout::array::<efi::DebugImageInfo>(self.capacity).unwrap();
             // SAFETY: Invariants of this struct ensure that `data` was allocated with this layout.
             unsafe {
-                alloc::alloc::dealloc(self.table_mut().cast::<u8>(), layout);
+                dealloc(self.table_mut().cast::<u8>(), layout);
             }
         }
     }
@@ -302,7 +307,7 @@ fn new_debug_image_info(
     handle: efi::Handle,
 ) -> efi::DebugImageInfo {
     efi::DebugImageInfo {
-        normal_image: alloc::boxed::Box::into_raw(alloc::boxed::Box::new(efi::DebugImageInfoNormal {
+        normal_image: Box::into_raw(Box::new(efi::DebugImageInfoNormal {
             image_info_type: image_info_type.into(),
             loaded_image_protocol_instance: protocol.as_ptr(),
             image_handle: handle,
@@ -321,7 +326,7 @@ fn debug_image_info_handle(info: &efi::DebugImageInfo) -> Option<efi::Handle> {
 /// Frees the heap allocation backing a debug image info entry.
 fn drop_debug_image_info(info: &mut efi::DebugImageInfo) {
     // SAFETY: `normal_image` was produced by `Box::into_raw` in `new_debug_image_info` and has not yet been freed.
-    let normal = unsafe { alloc::boxed::Box::from_raw(info.normal_image) };
+    let normal = unsafe { Box::from_raw(info.normal_image) };
     drop(normal);
 }
 

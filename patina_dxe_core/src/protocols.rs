@@ -6,9 +6,9 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::{slice, vec, vec::Vec};
 use core::{ffi::c_void, mem::size_of, ptr::NonNull};
 
-use alloc::{slice, vec, vec::Vec};
 use patina::standard::efi::{self, protocols::device_path::Protocol};
 use patina::{
     OwnedGuid,

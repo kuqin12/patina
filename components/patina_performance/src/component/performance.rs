@@ -18,7 +18,7 @@ use crate::{
     },
     mm,
 };
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::ffi::c_void;
 use patina::standard::efi::EVENT_GROUP_READY_TO_BOOT;
 use patina::{
@@ -223,7 +223,7 @@ fn fetch_mm_record_chunk(
     data_req.boot_record_data_size = chunk_size;
 
     let buffer_size = mm::SMM_COMM_HEADER_SIZE + chunk_size;
-    let mut data_req_buf = alloc::vec![0u8; buffer_size];
+    let mut data_req_buf = vec![0u8; buffer_size];
 
     data_req
         .write_into(&mut data_req_buf)
@@ -304,7 +304,7 @@ impl<'a> Iterator for PerformanceRecordIterator<'a> {
         let rec_len = header.length as usize;
         if rec_len < PerformanceRecordHeader::SIZE {
             self.bytes = self.bytes.get(PerformanceRecordHeader::SIZE..).unwrap_or(&[]);
-            return Some(Err(MmPerformanceError::RecordError(alloc::format!(
+            return Some(Err(MmPerformanceError::RecordError(format!(
                 "Record reports too small length {} (< {})",
                 rec_len,
                 PerformanceRecordHeader::SIZE
@@ -314,10 +314,9 @@ impl<'a> Iterator for PerformanceRecordIterator<'a> {
         if rec_len > self.bytes.len() {
             let available = self.bytes.len();
             self.bytes = &[];
-            return Some(Err(MmPerformanceError::RecordError(alloc::format!(
+            return Some(Err(MmPerformanceError::RecordError(format!(
                 "Truncated record (needed {}, had {})",
-                rec_len,
-                available
+                rec_len, available
             ))));
         }
 
@@ -326,7 +325,7 @@ impl<'a> Iterator for PerformanceRecordIterator<'a> {
             Ok(record) => record,
             Err(err) => {
                 self.bytes = &[];
-                return Some(Err(MmPerformanceError::RecordError(alloc::format!("Failed to parse record: {:?}", err))));
+                return Some(Err(MmPerformanceError::RecordError(format!("Failed to parse record: {:?}", err))));
             }
         };
 

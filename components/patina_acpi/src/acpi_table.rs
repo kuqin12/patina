@@ -14,7 +14,7 @@ use crate::{
     error::AcpiError,
     signature::{self, ACPI_CHECKSUM_OFFSET},
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{alloc::Allocator, boxed::Box, vec::Vec};
 use patina::{
     SIZE_4GB,
     component::service::{
@@ -225,7 +225,7 @@ pub struct AcpiXsdt {
 pub(crate) struct AcpiXsdtMetadata {
     pub(crate) n_entries: usize,
     pub(crate) max_capacity: usize,
-    pub(crate) slice: Box<[u8], &'static dyn alloc::alloc::Allocator>,
+    pub(crate) slice: Box<[u8], &'static dyn Allocator>,
 }
 
 impl AcpiXsdtMetadata {

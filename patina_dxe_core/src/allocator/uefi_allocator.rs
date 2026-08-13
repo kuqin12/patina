@@ -13,13 +13,12 @@ use patina::{error::EfiError, writelncrlf};
 
 use super::{AllocationStatistics, AllocationStrategy, PageAllocator};
 use core::{
-    alloc::{Allocator, GlobalAlloc, Layout},
+    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
     ffi::c_void,
     fmt::{self, Display},
     ops::Range,
     ptr::NonNull,
 };
-
 const POOL_SIG: u32 = 0x04151980; //arbitrary number.
 const UEFI_POOL_ALIGN: usize = 8; //per UEFI spec.
 
@@ -221,11 +220,11 @@ unsafe impl<A> GlobalAlloc for UefiAllocator<A>
 where
     A: PageAllocator + GlobalAlloc + Allocator + Display + Sync + Send,
 {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: layout comes from the global allocator contract.
         unsafe { self.allocator.alloc(layout) }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: ptr was returned by alloc with the same layout.
         unsafe { self.allocator.dealloc(ptr, layout) }
     }
@@ -236,10 +235,10 @@ unsafe impl<A> Allocator for UefiAllocator<A>
 where
     A: PageAllocator + GlobalAlloc + Allocator + Display + Sync + Send,
 {
-    fn allocate(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+    fn allocate(&self, layout: Layout) -> Result<core::ptr::NonNull<[u8]>, AllocError> {
         self.allocator.allocate(layout)
     }
-    unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: Layout) {
         // SAFETY: ptr was returned by allocate with the same layout.
         unsafe { self.allocator.deallocate(ptr, layout) }
     }

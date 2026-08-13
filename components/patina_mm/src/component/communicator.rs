@@ -15,6 +15,8 @@
 
 mod comm_buffer_update;
 
+use alloc::vec::Vec;
+
 use crate::{
     config::{CommunicateBuffer, MmCommunicationConfiguration},
     service::SwMmiTrigger,
@@ -29,8 +31,6 @@ use patina::{
     uefi::boot_services::StandardBootServices,
     writelncrlf,
 };
-
-use alloc::vec::Vec;
 
 use core::{
     cell::RefCell,
@@ -386,6 +386,7 @@ mod tests {
     };
 
     use core::{cell::RefCell, pin::Pin};
+    use std::alloc::{Layout, alloc, dealloc};
 
     use std::vec::Vec;
 
@@ -795,8 +796,6 @@ mod tests {
 
     #[test]
     fn test_communicate_non_zero_mm_return_status() {
-        use std::alloc::{Layout, alloc, dealloc};
-
         // Create a buffer with a mailbox using from_firmware_region
         let buffer_size = 4096;
         let page_align = 4096;
@@ -876,8 +875,6 @@ mod tests {
 
     #[test]
     fn test_communicate_get_message_fails_after_mm() {
-        use std::alloc::{Layout, alloc, dealloc};
-
         // Create a buffer with a mailbox using from_firmware_region
         let buffer_size = 4096;
         let page_align = 4096;

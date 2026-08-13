@@ -31,12 +31,13 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use crate::standard::efi;
+use core::alloc::AllocError;
+use core::alloc::Layout;
 use core::{
     mem::{ManuallyDrop, MaybeUninit},
     ptr::{NonNull, with_exposed_provenance_mut},
 };
-
-use crate::standard::efi;
 
 use crate::{
     base::{UEFI_PAGE_SIZE, error::EfiError},
@@ -668,11 +669,11 @@ pub struct PageFree {
 // allocate() always fails. deallocate() frees the specific pages tracked by this struct.
 // The caller must ensure the memory was allocated using the same MemoryManager.
 unsafe impl Allocator for PageFree {
-    fn allocate(&self, _layout: core::alloc::Layout) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
-        Err(core::alloc::AllocError)
+    fn allocate(&self, _layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        Err(AllocError)
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: core::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
         if self.blob != ptr {
             log_debug_assert!(
                 "PageFree was not used to free the correct memory! Leaking memory at {:?}!",
@@ -923,13 +924,13 @@ mod mock {
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
+    use super::*;
+    use crate::component::service::Service;
+    use core::alloc::AllocError;
     use core::{
         alloc::Layout,
         sync::atomic::{AtomicBool, AtomicUsize},
     };
-
-    use super::*;
-    use crate::component::service::Service;
 
     #[test]
     fn test_custom_mock_with_failing() {
@@ -1054,7 +1055,7 @@ mod tests {
             memory_manager: Box::leak(Box::new(StdMemoryManager::new())),
         };
 
-        assert!(pf.allocate(Layout::new::<u8>()).is_err_and(|e| matches!(e, core::alloc::AllocError)));
+        assert!(pf.allocate(Layout::new::<u8>()).is_err_and(|e| matches!(e, AllocError)));
     }
 
     #[test]

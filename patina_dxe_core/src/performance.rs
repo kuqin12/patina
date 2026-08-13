@@ -5,12 +5,11 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+use alloc::vec::Vec;
 use core::{
     mem, ptr,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-
-use alloc::vec::Vec;
 
 use patina::{
     BinaryGuid,

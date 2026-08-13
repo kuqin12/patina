@@ -28,7 +28,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 
-use alloc::{string::String, vec};
+use alloc::{string::String, vec, vec::Vec};
 use patina::{
     component::{component, service::Service},
     error::Result,
@@ -57,7 +57,7 @@ pub struct VendorOemRecord {
     pub oem_field: u32,
     /// String pool containing vendor and platform data strings
     #[string_pool]
-    pub string_pool: alloc::vec::Vec<String>,
+    pub string_pool: Vec<String>,
 }
 
 /// Example Platform SMBIOS Component
