@@ -38,7 +38,6 @@ impl SmbiosRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate std;
     use std::vec;
 
     use patina::standard::efi;

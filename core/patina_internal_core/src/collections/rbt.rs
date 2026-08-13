@@ -917,8 +917,6 @@ where
 #[cfg_attr(coverage, coverage(off))]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod tests {
-    extern crate std;
-
     use super::*;
     use crate::collections::node_size;
 
@@ -1842,7 +1840,6 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::undocumented_unsafe_blocks)]
 mod fuzz_tests {
-    extern crate std;
     use crate::collections::{Rbt, node_size};
     use rand::{
         RngExt,

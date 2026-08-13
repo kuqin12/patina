@@ -552,7 +552,6 @@ mod tests {
     use crate::test_support;
 
     use super::*;
-    extern crate std;
 
     use std::vec;
 

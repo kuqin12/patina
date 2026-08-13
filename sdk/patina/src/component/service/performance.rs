@@ -191,9 +191,9 @@ pub trait PerformanceManager: Send + Sync {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
-    use alloc::string::{String, ToString};
-    use alloc::vec::Vec;
+    use std::string::{String, ToString};
     use std::sync::Mutex;
+    use std::vec::Vec;
 
     struct Recorded {
         caller_guid: Option<efi::Guid>,

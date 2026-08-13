@@ -358,7 +358,6 @@ impl SmbiosProtocol {
 mod tests {
     use super::*;
     use crate::{error::SmbiosError, manager::SmbiosManager};
-    extern crate std;
     use std::vec::Vec;
 
     fn create_test_bios_info_record() -> Vec<u8> {

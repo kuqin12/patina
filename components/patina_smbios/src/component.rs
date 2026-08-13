@@ -142,7 +142,6 @@ impl SmbiosProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate std;
 
     #[test]
     fn test_smbios_provider_new() {

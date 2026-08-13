@@ -16,11 +16,12 @@
 
 use crate::patina_mm_integration::common::{constants::*, handlers::*};
 
-use alloc::{boxed::Box, vec::Vec};
 use patina::Guid;
 use std::{
+    boxed::Box,
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    vec::Vec,
 };
 
 // Import the real patina_mm components and services

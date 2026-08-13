@@ -845,16 +845,15 @@ impl PageAllocator for SpinLockedFixedSizeBlockAllocator {
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
-    extern crate std;
     use crate::{
         allocator::{
             DEFAULT_ALLOCATION_STRATEGY, DEFAULT_PAGE_ALLOCATION_GRANULARITY, HIGH_TRAFFIC_ALLOC_MIN_EXPANSION,
         },
         gcd, test_support,
     };
-    use alloc::vec::Vec;
     use core::{alloc::GlobalAlloc, ffi::c_void, panic};
     use std::alloc::System;
+    use std::vec::Vec;
 
     use patina::{
         uefi_pages_to_size, {SIZE_64KB, UEFI_PAGE_SHIFT, UEFI_PAGE_SIZE},

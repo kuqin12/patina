@@ -15,7 +15,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(missing_docs)]
 #![cfg_attr(coverage, feature(coverage_attribute))]
 #![cfg_attr(coverage, coverage(off))] // Disable all coverage instrumentation for sample code

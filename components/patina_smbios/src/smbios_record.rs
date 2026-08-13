@@ -804,7 +804,7 @@ impl Default for Type127EndOfTable {
 mod tests {
     use super::*;
     use crate::{service::SMBIOS_STRING_MAX_LENGTH, smbios_types};
-    use alloc::vec;
+    use std::vec;
 
     #[test]
     fn test_type0_new() {
