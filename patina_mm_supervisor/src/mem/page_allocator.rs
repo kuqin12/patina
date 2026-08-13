@@ -40,13 +40,13 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use patina::standard::efi;
 use patina::{
     base::UEFI_PAGE_SIZE,
     pi::hob::{Hob, PhaseHandoffInformationTable},
     uefi_pages_to_size, uefi_size_to_pages,
 };
 use patina_paging::{MemoryAttributes, PageTable};
-use r_efi::efi;
 use spin::{Mutex, MutexGuard, relax::Spin};
 
 /// Bits per byte.

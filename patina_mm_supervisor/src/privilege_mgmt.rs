@@ -46,7 +46,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-use r_efi::efi::Status;
+use patina::standard::efi::Status;
 
 mod call_gate;
 mod syscall_dispatcher;

@@ -9,7 +9,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 
-use r_efi::efi;
+use patina::standard::efi;
 
 use crate::{
     is_buffer_inside_mmram, read_cr3,

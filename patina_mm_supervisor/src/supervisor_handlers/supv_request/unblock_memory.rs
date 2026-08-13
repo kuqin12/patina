@@ -27,7 +27,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-use r_efi::efi;
+use patina::standard::efi;
 
 use patina::UEFI_PAGE_SIZE;
 use patina_paging::{MemoryAttributes, PageTable, PtError};

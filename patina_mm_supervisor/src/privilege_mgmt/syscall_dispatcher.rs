@@ -29,7 +29,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 use core::arch::asm;
-use r_efi::efi::{ALLOCATE_ANY_PAGES, AllocateType, MemoryType, RUNTIME_SERVICES_DATA};
+use patina::standard::efi::{ALLOCATE_ANY_PAGES, AllocateType, MemoryType, RUNTIME_SERVICES_DATA};
 
 use crate::mm_policy::{AccessType, Instruction, IoWidth};
 use patina::{UEFI_PAGE_SIZE, management_mode::supervisor::SyscallIndex};
@@ -38,7 +38,7 @@ use crate::{
     PageOwnership, query_address_ownership,
     state::{init_state, security_state},
 };
-use r_efi::efi::Status;
+use patina::standard::efi::Status;
 
 use super::SyscallResult;
 

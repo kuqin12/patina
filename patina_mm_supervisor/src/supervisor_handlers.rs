@@ -19,7 +19,7 @@
 //! # #[cfg(target_arch = "x86_64")]
 //! # mod example {
 //! use patina_mm_supervisor::{CpuInfo, PlatformInfo, SupervisorMmiHandler};
-//! use r_efi::efi;
+//! use patina::standard::efi;
 //!
 //! struct MyPlatform;
 //!
@@ -63,7 +63,7 @@ pub use supv_request::unblock_memory::UnblockedMemoryTracker;
 pub(crate) use supv_request::mm_supv_request_handler;
 pub(crate) use system_handlers::{mm_exit_boot_services_handler, mm_ready_to_lock_handler};
 
-use r_efi::efi;
+use patina::standard::efi;
 
 // GUID for gEfiDxeMmReadyToLockProtocolGuid
 // { 0x60ff8964, 0xe906, 0x41d0, { 0xaf, 0xed, 0xf2, 0x41, 0xe9, 0x74, 0xe0, 0x8e } }

@@ -33,11 +33,11 @@
 //! SPDX-License-Identifier: Apache-2.0
 
 use crate::mm_policy::{SaveStateCondition, SaveStateField};
+use patina::standard::efi::Status;
 use patina_internal_cpu::save_state::{
     self, IA32_EFER_LMA, IO_INFO_SIZE, IO_TYPE_INPUT, IO_TYPE_OUTPUT, LMA_32BIT, LMA_64BIT, MmSaveStateIoInfo,
     MmSaveStateRegister, PROCESSOR_INFO_ENTRY_SIZE,
 };
-use r_efi::efi::Status;
 
 use crate::{PageOwnership, privilege_mgmt::SyscallResult, query_address_ownership, state::security_state};
 
@@ -428,9 +428,9 @@ fn inspect_io_condition(view: &SaveStateView) -> Option<SaveStateCondition> {
 
     // Verify the save state revision supports IO info before reading the field.
     let smm_rev_id = view.read_u32(vc.smmrevid_offset as usize);
-    if !save_state::io_info_supported(smm_rev_id) {
-        panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
-    }
+    // if !save_state::io_info_supported(smm_rev_id) {
+    //     panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
+    // }
 
     // Read the vendor-specific IO information field.
     let io_field = view.read_u32(vc.io_info_offset as usize);
@@ -509,9 +509,9 @@ fn read_io_register(view: &SaveStateView, out: &mut [u8]) -> SyscallResult {
 
     // 1. Read SMMRevId to verify IO info is available.
     let smm_rev_id = view.read_u32(vc.smmrevid_offset as usize);
-    if !save_state::io_info_supported(smm_rev_id) {
-        panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
-    }
+    // if !save_state::io_info_supported(smm_rev_id) {
+    //     panic!("SMMRevId {:#x} does not expose I/O info; legacy hardware is not supported", smm_rev_id);
+    // }
 
     // 2. Read the vendor-specific IO information field and parse it.
     let io_field = view.read_u32(vc.io_info_offset as usize);

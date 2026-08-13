@@ -139,7 +139,7 @@ its built-in handlers first, then the platform handlers.
 
 ```rust
 use patina_mm_supervisor::*;
-use r_efi::efi;
+use patina::standard::efi;
 
 fn my_handler(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     // Handle the request

@@ -6,7 +6,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 
-use r_efi::efi;
+use patina::standard::efi;
 
 use patina::management_mode::protocol::mm_supervisor_request::MmSupervisorRequestHeader;
 

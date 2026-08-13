@@ -20,7 +20,7 @@ mod fetch_policy;
 pub(crate) mod unblock_memory;
 mod version_info;
 
-use r_efi::efi;
+use patina::standard::efi;
 
 use patina::management_mode::protocol::mm_supervisor_request::{
     MmSupervisorRequestHeader, REVISION, RequestType, SIGNATURE,

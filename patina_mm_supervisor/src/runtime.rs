@@ -11,11 +11,11 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
+use patina::standard::efi;
 use patina::{
     management_mode::{MmCommBufferStatus, supervisor::UserCommandType},
     pi::{mm_cis::EfiMmEntryContext, protocol::communication::EfiMmCommunicateHeader},
 };
-use r_efi::efi;
 
 use crate::{
     AP_ARRIVAL_TIMEOUT_US, AP_TIMEOUT_US, CommBufferConfig, MmSupervisorCore, PageOwnership, PlatformInfo,
