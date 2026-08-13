@@ -29,44 +29,6 @@ const IA32_APIC_BASE_MSR_INDEX: u32 = 0x1B;
 /// BSP flag bit in IA32_APIC_BASE MSR (bit 8).
 const IA32_APIC_BSP: u64 = 1 << 8;
 
-/// A trait to be implemented by the platform to provide CPU-related configuration.
-///
-/// ## Examples
-///
-/// ```rust,no_run
-/// # #[cfg(target_arch = "x86_64")]
-/// # mod example {
-/// use patina_mm_supervisor::CpuInfo;
-///
-/// struct ExamplePlatform;
-///
-/// impl CpuInfo for ExamplePlatform {
-///     fn ap_poll_timeout_us() -> u64 { 500 }
-/// }
-/// # }
-/// ```
-#[cfg_attr(test, mockall::automock)]
-pub trait CpuInfo {
-    /// Returns the timeout in microseconds for AP mailbox polling.
-    ///
-    /// By default, this returns 1000 (1ms) which is a reasonable polling interval.
-    #[inline(always)]
-    fn ap_poll_timeout_us() -> u64 {
-        1000
-    }
-
-    /// Returns the performance counter frequency in Hz, if known by the platform.
-    ///
-    /// For example, on QEMU Q35 the platform can calibrate the TSC frequency
-    /// from the ACPI PM Timer and return it here.
-    ///
-    /// If `None` is returned (the default), the supervisor will attempt
-    /// auto-detection via CPUID.
-    fn perf_timer_frequency() -> Option<u64> {
-        None
-    }
-}
-
 /// The state of an Application Processor (AP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

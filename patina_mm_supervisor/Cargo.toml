@@ -27,7 +27,6 @@ zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
 
 [dev-dependencies]
-mockall = { workspace = true }
 serial_test = { workspace = true }
 
 [features]

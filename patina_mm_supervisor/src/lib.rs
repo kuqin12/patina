@@ -25,13 +25,7 @@
 //!
 //! struct MyPlatform;
 //!
-//! impl CpuInfo for MyPlatform {
-//!     fn ap_poll_timeout_us() -> u64 { 1000 }
-//! }
-//!
-//! impl PlatformInfo for MyPlatform {
-//!     type CpuInfo = Self;
-//! }
+//! impl PlatformInfo for MyPlatform {}
 //!
 //! // The const generic argument is the maximum CPU count used to size internal arrays.
 //! static SUPERVISOR: MmSupervisorCore<MyPlatform, 8> = MmSupervisorCore::new();
@@ -82,9 +76,6 @@ use patina::{
 use patina_paging::{MemoryAttributes, PageTable};
 
 use state::{init_state, security_state};
-
-// Public API: traits that platform binaries must implement.
-pub use cpu::CpuInfo;
 
 // Publicly re-export the handler types since platform-specific handlers will need to reference these for
 // their function signatures and return types.
@@ -139,19 +130,10 @@ const AP_TIMEOUT_US: u64 = 10_000_000;
 ///
 /// struct ExamplePlatform;
 ///
-/// impl CpuInfo for ExamplePlatform {
-///     fn ap_poll_timeout_us() -> u64 { 1000 }
-/// }
-///
-/// impl PlatformInfo for ExamplePlatform {
-///     type CpuInfo = Self;
-/// }
+/// impl PlatformInfo for ExamplePlatform {}
 /// # }
 /// ```
 pub trait PlatformInfo: 'static {
-    /// The platform's CPU information and configuration.
-    type CpuInfo: CpuInfo;
-
     /// Returns the platform-specific supervisor MMI handlers.
     ///
     /// The supervisor dispatch loop iterates the core's built-in handlers first and then
@@ -285,13 +267,7 @@ impl RequestTarget {
 ///
 /// struct MyPlatform;
 ///
-/// impl CpuInfo for MyPlatform {
-///     fn ap_poll_timeout_us() -> u64 { 1000 }
-/// }
-///
-/// impl PlatformInfo for MyPlatform {
-///     type CpuInfo = Self;
-/// }
+/// impl PlatformInfo for MyPlatform {}
 ///
 /// // The const generic argument is the maximum CPU count used to size internal arrays.
 /// static SUPERVISOR: MmSupervisorCore<MyPlatform, 8> = MmSupervisorCore::new();
@@ -307,7 +283,7 @@ pub struct MmSupervisorCore<P: PlatformInfo, const MAX_CPUS: usize> {
     /// Manager for CPU-related operations.
     cpu_manager: CpuManager<MAX_CPUS>,
     /// Manager for AP mailboxes.
-    mailbox_manager: MailboxManager<MAX_CPUS, P::CpuInfo>,
+    mailbox_manager: MailboxManager<MAX_CPUS>,
     /// Syscall interface for privilege transitions.
     syscall_interface: SyscallInterface<MAX_CPUS>,
     /// Flag indicating if the core has been initialized.
@@ -559,7 +535,7 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
     }
 
     /// Get the mailbox manager.
-    pub fn mailbox_manager(&self) -> &MailboxManager<MAX_CPUS, P::CpuInfo> {
+    pub fn mailbox_manager(&self) -> &MailboxManager<MAX_CPUS> {
         &self.mailbox_manager
     }
 }
@@ -576,16 +552,7 @@ mod tests {
 
     struct TestPlatform;
 
-    impl CpuInfo for TestPlatform {}
-
-    impl PlatformInfo for TestPlatform {
-        type CpuInfo = Self;
-    }
-
-    #[test]
-    fn test_cpu_info_defaults() {
-        assert_eq!(<TestPlatform as CpuInfo>::ap_poll_timeout_us(), 1000);
-    }
+    impl PlatformInfo for TestPlatform {}
 
     #[test]
     fn test_supervisor_creation() {

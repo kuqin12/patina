@@ -18,7 +18,7 @@
 //! ```rust,no_run
 //! # #[cfg(target_arch = "x86_64")]
 //! # mod example {
-//! use patina_mm_supervisor::{CpuInfo, PlatformInfo, SupervisorMmiHandler};
+//! use patina_mm_supervisor::{PlatformInfo, SupervisorMmiHandler};
 //! use patina::standard::efi;
 //!
 //! struct MyPlatform;
@@ -34,13 +34,7 @@
 //!     handle: my_handler,
 //! }];
 //!
-//! impl CpuInfo for MyPlatform {
-//!     fn ap_poll_timeout_us() -> u64 { 1000 }
-//! }
-//!
 //! impl PlatformInfo for MyPlatform {
-//!     type CpuInfo = Self;
-//!
 //!     fn mmi_handlers() -> &'static [SupervisorMmiHandler] {
 //!         MY_HANDLERS
 //!     }

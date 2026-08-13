@@ -108,13 +108,7 @@ use patina_mm_supervisor::*;
 
 struct MyPlatform;
 
-impl CpuInfo for MyPlatform {
-    fn ap_poll_timeout_us() -> u64 { 1000 }
-}
-
-impl PlatformInfo for MyPlatform {
-    type CpuInfo = Self;
-}
+impl PlatformInfo for MyPlatform {}
 
 // Static instance - no heap allocation required.
 // The const generic argument is the maximum CPU count used to size internal arrays.
@@ -153,8 +147,6 @@ static MY_HANDLERS: &[SupervisorMmiHandler] = &[SupervisorMmiHandler {
 }];
 
 impl PlatformInfo for MyPlatform {
-    type CpuInfo = Self;
-
     fn mmi_handlers() -> &'static [SupervisorMmiHandler] {
         MY_HANDLERS
     }

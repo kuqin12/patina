@@ -25,7 +25,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::{CpuInfo, perf_timer};
+use crate::perf_timer;
 
 /// Commands that can be sent from BSP to APs via the mailbox.
 ///
@@ -230,19 +230,17 @@ impl Default for ApMailbox {
 /// ## Const Generic Parameters
 ///
 /// * `MAX_APS` - The maximum number of APs that can be managed.
-pub struct MailboxManager<const MAX_APS: usize, C: CpuInfo> {
+pub struct MailboxManager<const MAX_APS: usize> {
     /// Mailboxes - fixed size array.
     mailboxes: [ApMailbox; MAX_APS],
-    /// Phantom data for the CpuInfo type.
-    _cpu_info: core::marker::PhantomData<fn() -> C>,
 }
 
-impl<const MAX_APS: usize, C: CpuInfo> MailboxManager<MAX_APS, C> {
+impl<const MAX_APS: usize> MailboxManager<MAX_APS> {
     /// Creates a new mailbox manager.
     ///
     /// This is a const fn and performs no heap allocation.
     pub const fn new() -> Self {
-        Self { mailboxes: [const { ApMailbox::new() }; MAX_APS], _cpu_info: core::marker::PhantomData }
+        Self { mailboxes: [const { ApMailbox::new() }; MAX_APS] }
     }
 
     /// Sends a command to a specific AP.
@@ -278,7 +276,7 @@ impl<const MAX_APS: usize, C: CpuInfo> MailboxManager<MAX_APS, C> {
         let mailbox = self.mailboxes.get(cpu_index)?;
         let mut result = None;
 
-        perf_timer::spin_until::<C, _>(timeout_us, || {
+        perf_timer::spin_until(timeout_us, || {
             if let Some(response) = mailbox.get_response() {
                 result = Some(response);
                 true
@@ -291,7 +289,7 @@ impl<const MAX_APS: usize, C: CpuInfo> MailboxManager<MAX_APS, C> {
     }
 }
 
-impl<const MAX_APS: usize, C: CpuInfo> Default for MailboxManager<MAX_APS, C> {
+impl<const MAX_APS: usize> Default for MailboxManager<MAX_APS> {
     fn default() -> Self {
         Self::new()
     }
@@ -300,10 +298,6 @@ impl<const MAX_APS: usize, C: CpuInfo> Default for MailboxManager<MAX_APS, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Minimal `CpuInfo` implementation for tests (all methods use defaults).
-    struct TestCpuInfo;
-    impl CpuInfo for TestCpuInfo {}
 
     #[test]
     fn test_mailbox_creation() {
@@ -351,12 +345,12 @@ mod tests {
     #[test]
     fn test_mailbox_manager_is_const() {
         // Verify we can create a static manager
-        static _MANAGER: MailboxManager<8, TestCpuInfo> = MailboxManager::new();
+        static _MANAGER: MailboxManager<8> = MailboxManager::new();
     }
 
     #[test]
     fn test_mailbox_manager() {
-        let manager: MailboxManager<4, TestCpuInfo> = MailboxManager::new();
+        let manager: MailboxManager<4> = MailboxManager::new();
 
         // Send a command to the AP occupying slot index 1.
         let command = ApCommand::RunProcedure { procedure: 0x1000, argument: 0x2000 };
@@ -393,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_manager_reset_all_scrubs_every_mailbox() {
-        let manager: MailboxManager<4, TestCpuInfo> = MailboxManager::new();
+        let manager: MailboxManager<4> = MailboxManager::new();
 
         // Leave two different slots' mailboxes stuck in non-empty states.
         assert!(manager.send_command(1, ApCommand::RunProcedure { procedure: 0x10, argument: 0 }).is_ok());

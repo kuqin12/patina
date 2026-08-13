@@ -13,8 +13,6 @@
 use core::arch::x86_64;
 use core::arch::x86_64::{__cpuid, CpuidResult};
 
-use crate::CpuInfo;
-
 const CPUID_TIME_STAMP_COUNTER: u32 = 0x15;
 const CPUID_PROCESSOR_FREQUENCY: u32 = 0x16;
 
@@ -28,23 +26,11 @@ fn ticks() -> u64 {
     unsafe { x86_64::_rdtsc() }
 }
 
-/// Returns the frequency in Hz from the platform's CpuInfo, or `0` if
-/// not determinable.
+/// Converts a duration in microseconds to the equivalent tick count using the
+/// CPU's detected performance-counter frequency (via CPUID).
 #[inline]
-pub fn frequency<C: CpuInfo>() -> u64 {
-    C::perf_timer_frequency().unwrap_or(0)
-}
-
-/// Converts a duration in microseconds to the equivalent tick count using
-/// the given CpuInfo's frequency.
-///
-/// Returns `None` if the frequency is unknown (0).
-#[inline]
-pub fn us_to_ticks<C: CpuInfo>(us: u64) -> Option<u64> {
-    let mut freq = frequency::<C>();
-    if freq == 0 {
-        freq = arch_perf_frequency();
-    }
+pub fn us_to_ticks(us: u64) -> Option<u64> {
+    let freq = arch_perf_frequency();
     Some(((freq as u128 * us as u128) / 1_000_000) as u64)
 }
 
@@ -78,11 +64,11 @@ pub(crate) fn arch_perf_frequency() -> u64 {
 ///
 /// If the performance frequency is unknown, falls back to a conservative
 /// iteration-count heuristic (`timeout_us * 10` loops).
-pub fn spin_until<C: CpuInfo, F>(timeout_us: u64, mut condition: F) -> bool
+pub fn spin_until<F>(timeout_us: u64, mut condition: F) -> bool
 where
     F: FnMut() -> bool,
 {
-    if let Some(deadline_ticks) = us_to_ticks::<C>(timeout_us) {
+    if let Some(deadline_ticks) = us_to_ticks(timeout_us) {
         let start = ticks();
         loop {
             if condition() {
@@ -110,30 +96,16 @@ where
 mod tests {
     use super::*;
 
-    struct TestCpu;
-    impl CpuInfo for TestCpu {
-        fn perf_timer_frequency() -> Option<u64> {
-            None
-        }
-    }
-
-    /// A CPU to make timer test happy.
-    struct FixedFreqCpu;
-    impl CpuInfo for FixedFreqCpu {
-        fn perf_timer_frequency() -> Option<u64> {
-            Some(1_000_000)
-        }
-    }
-
     #[test]
-    fn test_us_to_ticks_basic() {
-        // With a known 1 MHz frequency, 1000 us converts to exactly 1000 ticks.
-        assert_eq!(us_to_ticks::<FixedFreqCpu>(1000), Some(1000));
+    fn test_us_to_ticks_returns_some() {
+        // The exact value depends on the CPU's detected frequency, but a conversion is
+        // always produced.
+        assert!(us_to_ticks(1000).is_some());
     }
 
     #[test]
     fn test_spin_until_immediate_true() {
-        let result = spin_until::<TestCpu, _>(1_000, || true);
+        let result = spin_until(1_000, || true);
         assert!(result);
     }
 }

@@ -143,7 +143,7 @@ impl<P: PlatformInfo, const MAX_CPUS: usize> MmSupervisorCore<P, MAX_CPUS> {
             return;
         }
 
-        let all_arrived = crate::perf_timer::spin_until::<P::CpuInfo, _>(AP_ARRIVAL_TIMEOUT_US, || {
+        let all_arrived = crate::perf_timer::spin_until(AP_ARRIVAL_TIMEOUT_US, || {
             self.cpu_manager.count_aps_in_state(ApState::InHoldingPen) >= expected_aps
         });
 
