@@ -10,6 +10,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 
 #[test]
+#[ignore = "Ignore compilation tests by default since they are slow."]
 fn compile_fail_tests() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/duplicate_config_mut.rs");

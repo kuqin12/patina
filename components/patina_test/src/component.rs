@@ -144,10 +144,8 @@ pub(crate) mod tests {
     extern crate std;
 
     use super::*;
-    use crate::{
-        __private_api::TestCase,
-        alloc::{boxed::Box, format},
-    };
+
+    use crate::alloc::{boxed::Box, format};
     use core::mem::MaybeUninit;
     use patina::{
         BinaryGuid,
@@ -228,51 +226,6 @@ pub(crate) mod tests {
         fail_msg: None,
         func: |storage| crate::__private_api::FunctionTest::new(test_function_invalid).run(storage.into()),
     };
-
-    #[test]
-    #[ignore = "Skipping test until the service for UEFI services is out, so we can mock it."]
-    fn test_we_can_initialize_the_component() {
-        let mut storage = Storage::new();
-
-        let mut component = super::TestRunner::default().into_component();
-        component.initialize(&mut storage);
-    }
-
-    #[test]
-    #[ignore = "Skipping test until the service for UEFI services is out, so we can mock it."]
-    fn test_we_can_collect_and_execute_tests() {
-        assert_eq!(TEST_TESTS.len(), 2);
-        let mut storage = Storage::new();
-        storage.add_config(1_i32);
-
-        let component = super::TestRunner::default();
-        let result = component.register_tests(&TEST_TESTS, &mut storage);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    #[ignore = "Skipping test until the service for UEFI services is out, so we can mock it."]
-    fn test_handle_different_test_counts() {
-        let mut storage = Storage::new();
-        storage.add_config(1_i32);
-
-        let test_cases: &'static [TestCase] = Box::leak(Box::new([]));
-        let component = super::TestRunner::default();
-        let result = component.register_tests(test_cases, &mut storage);
-        assert!(result.is_ok());
-
-        let test_cases: &'static [TestCase] = Box::leak(Box::new([TEST_CASE1]));
-        let result = component.register_tests(test_cases, &mut storage);
-        assert!(result.is_ok());
-
-        let test_cases: &'static [TestCase] = Box::leak(Box::new([TEST_CASE1, TEST_CASE2]));
-        let result = component.register_tests(test_cases, &mut storage);
-        assert!(result.is_ok());
-
-        let test_cases: &'static [TestCase] = Box::leak(Box::new([TEST_CASE1, TEST_CASE2, TEST_CASE3]));
-        let result = component.register_tests(test_cases, &mut storage);
-        assert!(result.is_ok());
-    }
 
     #[test]
     fn test_func_implements_into_component() {
