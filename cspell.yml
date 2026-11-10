@@ -125,6 +125,7 @@ words:
   - impls
   - inmodule
   - intid
+  - iommu
   - irouter
   - iscsi
   - isenabler
@@ -146,6 +147,7 @@ words:
   - lstar
   - lzmatest
   - maxnp
+  - maxphyaddr
   - mdbook
   - mdscr
   - mmbase
@@ -157,6 +159,7 @@ words:
   - msdia
   - mtrrcap
   - mtrrs
+  - nasmb
   - nestedfv
   - nocapture
   - nologo
@@ -176,6 +179,7 @@ words:
   - ordinalize
   - oslar
   - oslsr
+  - otherseg
   - pacibsp
   - pccard
   - pcddxe
@@ -203,6 +207,7 @@ words:
   - relia
   - reloc
   - reowned
+  - revid
   - riscv
   - rlibs
   - rposition
@@ -213,6 +218,7 @@ words:
   - sgram
   - smbus
   - smbase
+  - smbases
   - smcport
   - smiport
   - smmrevid
@@ -232,6 +238,7 @@ words:
   - tianocore
   - tolnay
   - turion
+  - txtpssig
   - typenum
   - typer
   - uefiext
@@ -242,6 +249,7 @@ words:
   - unconfigured
   - uncontained
   - uncrustify
+  - unmapping
   - unmaps
   - unrecovered
   - unreg
