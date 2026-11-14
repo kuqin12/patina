@@ -279,24 +279,36 @@ struct MmiEntryStructures {
     ist1_top: MemoryRange,
 }
 
-/// Validates the MMI entry of core `cpu` and the state it established on this core.
+/// Validates the MMI entry of core `cpu_index` and the state it established on this core.
 ///
 /// `hob_list` is the HOB list pointer the entry code passed to the supervisor. On the BSP
 /// (`is_bsp`), every core's entry is also checked against the others; see the module
 /// documentation.
 ///
-/// Must run on core `cpu` during its first entry, after the BSP has patched the IDT descriptors.
+/// Must run on core `cpu_index` during its first entry, after the BSP has patched the IDT descriptors.
 /// The first SMI reaches the BSP, which finishes initialization before the APs are sent theirs,
 /// so every AP loads the patched IDT descriptor on its way in.
 #[inline(never)]
-pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmSupervisorResult<()> {
+pub(crate) fn validate_mmi_entry(cpu_index: usize, hob_list: u64, is_bsp: bool) -> MmSupervisorResult<()> {
     let info = security_state().save_state_info().ok_or(MmiEntryValidationError::SaveStateInfoUnavailable)?;
     let entry_size = usize::try_from(info.mmi_entry_size()).map_err(|_| SmiHandlerIdtPatchError::EntrySizeTooLarge)?;
-    let core = read_mmi_entry_structures(&info, cpu, entry_size)?;
+    let core = read_mmi_entry_structures(&info, cpu_index, entry_size)?;
     let smbase = core.smbase;
 
-    if !MemoryRange::new(smbase, SMRAM_WINDOW_SIZE).is_ok_and(|window| is_range_inside_mmram(&window)) {
-        return Err(MmiEntryValidationError::OutsideMmram { cpu, structure: "SMRAM window", base: smbase }.into());
+    // Only the upper half of the 64 KiB window belongs to this core: the entry code at
+    // `SMBASE + 0x8000`, then the PSD and the save-state map. Init packs the tiles closer than
+    // 64 KiB, so the lower half overlaps other cores' tiles and, for the first core, lies below
+    // MMRAM.
+    let owned_base = smbase.saturating_add(SMM_HANDLER_OFFSET);
+    if !MemoryRange::new(owned_base, SMRAM_WINDOW_SIZE - SMM_HANDLER_OFFSET)
+        .is_ok_and(|owned| is_range_inside_mmram(&owned))
+    {
+        return Err(MmiEntryValidationError::OutsideMmram {
+            cpu: cpu_index,
+            structure: "SMI handler and save state",
+            base: owned_base,
+        }
+        .into());
     }
 
     if cpuid_version_info().ecx & CPUID_ECX_VMX != 0
@@ -306,7 +318,7 @@ pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmS
         // SAFETY: `IA32_VMX_MISC` bit 15 reports that `IA32_SMBASE` can be read in SMM.
         let msr = unsafe { read_msr(MSR_IA32_SMBASE) };
         if msr != smbase {
-            return Err(MmiEntryValidationError::SmBaseMismatch { cpu, smbase, msr }.into());
+            return Err(MmiEntryValidationError::SmBaseMismatch { cpu: cpu_index, smbase, msr }.into());
         }
     }
 
@@ -334,8 +346,8 @@ pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmS
         misc_enable_supported: !is_amd,
         five_level_paging: read_cr4() & CR4_LA57 != 0,
     };
-    check_fixups(cpu, &core.fixups, &expected)?;
-    check_gdt(cpu, &core.gdt_image, core.gdtr.base)?;
+    check_fixups(cpu_index, &core.fixups, &expected)?;
+    check_gdt(cpu_index, &core.gdt_image, core.gdtr.base)?;
 
     let (cr3, idtr, gdtr) = (read_cr3(), read_idtr(), read_gdtr());
     let registers = [
@@ -349,17 +361,17 @@ pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmS
     ];
     for (register, expected, found) in registers {
         if expected != found {
-            return Err(MmiEntryValidationError::RegisterMismatch { cpu, register, expected, found }.into());
+            return Err(MmiEntryValidationError::RegisterMismatch { cpu: cpu_index, register, expected, found }.into());
         }
     }
 
     let idt = MemoryRange::new(idtr.base, u64::from(IDT_LIMIT) + 1)
         .ok()
         .filter(is_range_inside_mmram)
-        .ok_or(MmiEntryValidationError::OutsideMmram { cpu, structure: "IDT", base: idtr.base })?;
+        .ok_or(MmiEntryValidationError::OutsideMmram { cpu: cpu_index, structure: "IDT", base: idtr.base })?;
 
-    if core.stack_top_value != cpu as u64 {
-        return Err(MmiEntryValidationError::StackTopMismatch { cpu, found: core.stack_top_value }.into());
+    if core.stack_top_value != cpu_index as u64 {
+        return Err(MmiEntryValidationError::StackTopMismatch { cpu: cpu_index, found: core.stack_top_value }.into());
     }
 
     let supervisor_data = MemoryAttributes::Supervisor | MemoryAttributes::ExecuteProtect;
@@ -381,7 +393,7 @@ pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmS
     with_active_page_table(|page_table| {
         for (structure, range, required, forbidden) in protections {
             if let Err(error) = verify_page_attributes(page_table, &range, required, forbidden) {
-                log::error!("CPU {cpu}: the {structure} at {range} is not mapped as it must be: {error}");
+                log::error!("CPU {cpu_index}: the {structure} at {range} is not mapped as it must be: {error}");
                 return Err(error);
             }
         }
@@ -392,7 +404,7 @@ pub(crate) fn validate_mmi_entry(cpu: usize, hob_list: u64, is_bsp: bool) -> MmS
         check_cores_distinct(&info, entry_size, cr3)?;
     }
 
-    log::debug!("CPU {cpu}: MMI entry at 0x{:016x} validated", smbase + SMM_HANDLER_OFFSET);
+    log::debug!("CPU {cpu_index}: MMI entry at 0x{:016x} validated", smbase + SMM_HANDLER_OFFSET);
     Ok(())
 }
 

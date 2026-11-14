@@ -35,8 +35,9 @@
 //!    the SMBASE area (lowest SMBASE + 0x8000 to highest SMBASE + 0x10000) and
 //!    MSEG, when an MSEG SMRAM HOB is present, each lie in pages the producer
 //!    marked allocated, no two share a page, and the Ring 3 stacks start and end
-//!    on page boundaries. An MSEG SMRAM HOB that is present must describe a
-//!    non-empty, page-aligned MSEG below 4 GiB.
+//!    on page boundaries. Inside the SMBASE area, no CPU's SMI entry code or
+//!    SMM descriptor and save state overlaps another's. An MSEG SMRAM HOB that
+//!    is present must describe a non-empty, page-aligned MSEG below 4 GiB.
 //! 7. Every unblock-region and protected-region HOB describes a non-empty,
 //!    page-aligned range that does not overlap MMRAM. Unblock regions name their
 //!    requester with a non-zero GUID, and protected regions are of the IOMMU
@@ -1121,7 +1122,8 @@ fn validate_named_regions<'a>(
 
     // SAFETY: the loop above placed the SMBASE array's `number_of_cpus` entries in allocated MMRAM.
     let smbases = unsafe { smbase_array(pass_down, number_of_cpus) }?;
-    let smbase_area = ("SMBASE area", allocated_pages("SMBASE area", smbase_area(smbases)?, regions)?);
+    let smbase_area =
+        ("SMBASE area", allocated_pages("SMBASE area", smbase_area(smbases, pass_down.mmi_entry_size)?, regions)?);
 
     let named = named.iter().flatten().chain(core::iter::once(&smbase_area));
     for (index, &(first_kind, first)) in named.clone().enumerate() {
@@ -1162,15 +1164,45 @@ unsafe fn smbase_array<'a>(
 /// SMI entry code starts, to the highest SMBASE + `0x10000`, where the save-state map ends.
 ///
 /// The SMBASEs are closer together than a CPU's window is long, so one CPU's entry code sits
-/// beside another's save state. The windows are therefore one area rather than one per CPU.
-fn smbase_area(smbases: &[[u8; size_of::<u64>()]]) -> MmSupervisorResult<MemoryRange> {
+/// beside another's save state. The windows are therefore one area rather than one per CPU, and
+/// within it no two of the pieces the processor uses may overlap: each CPU's entry code
+/// (`mmi_entry_size` bytes at SMBASE + `0x8000`) and its SMM descriptor and save state (SMBASE +
+/// `0xFB00` to SMBASE + `0x10000`). The processor writes the save state on every SMI without regard
+/// to paging, so an overlap would let one CPU's SMI overwrite code another CPU runs.
+fn smbase_area(smbases: &[[u8; size_of::<u64>()]], mmi_entry_size: u64) -> MmSupervisorResult<MemoryRange> {
     let smbases = smbases.iter().copied().map(u64::from_ne_bytes);
-    let (Some(lowest), Some(highest)) = (smbases.clone().min(), smbases.max()) else {
+    let (Some(lowest), Some(highest)) = (smbases.clone().min(), smbases.clone().max()) else {
         return Err(HobValidationError::InvalidAddressRange { kind: "SMBASE area", base: 0, length: 0 }.into());
     };
     // Each window must fit the address space, so the offsets below cannot overflow.
     let lowest = checked_range("SMBASE area", lowest, SMRAM_WINDOW_SIZE)?;
     let highest = checked_range("SMBASE area", highest, SMRAM_WINDOW_SIZE)?;
+
+    // Every CPU's entry code, then its SMM descriptor and save state. Each SMBASE lies between
+    // the two windows checked above, so neither offset overflows.
+    let pieces = smbases.flat_map(|smbase| {
+        [
+            ("SMI entry code", checked_range("SMI entry code", smbase + SMM_HANDLER_OFFSET, mmi_entry_size)),
+            (
+                "SMM descriptor and save state",
+                checked_range(
+                    "SMM descriptor and save state",
+                    smbase + SMM_PSD_OFFSET,
+                    SMRAM_WINDOW_SIZE - SMM_PSD_OFFSET,
+                ),
+            ),
+        ]
+    });
+    for (index, (first_kind, first)) in pieces.clone().enumerate() {
+        let first = first?;
+        for (second_kind, second) in pieces.clone().skip(index + 1) {
+            let second = second?;
+            if first.overlaps(&second) {
+                return Err(HobValidationError::RegionsOverlap { first_kind, first, second_kind, second }.into());
+            }
+        }
+    }
+
     let base = lowest.base() + SMM_HANDLER_OFFSET;
     checked_range("SMBASE area", base, highest.end() - base)
 }
@@ -3253,6 +3285,37 @@ mod tests {
         assert_eq!(
             check(pd),
             Err(HobValidationError::InvalidAddressRange { kind: "SMBASE area", base: top, length: 0x1_0000 }.into())
+        );
+
+        // Inside the area, the pieces the processor uses may not overlap. CPU 0's SMBASE is
+        // 0x1_8000, so its entry code starts at 0x2_0000 and its descriptor and save state at
+        // 0x2_7B00.
+        let entry = |base: u64, size: u64| ("SMI entry code", span(base, size));
+        let save_state = |base: u64| ("SMM descriptor and save state", span(base, 0x500));
+        for (smbases, mmi_entry_size, (first_kind, first), (second_kind, second)) in [
+            // Two CPUs on one SMBASE.
+            ([0x1_8000, 0x1_8000], 0x100, entry(0x2_0000, 0x100), entry(0x2_0000, 0x100)),
+            // Entry code long enough to reach its own CPU's descriptor.
+            ([0x1_8000, 0x1_A000], 0x7C00, entry(0x2_0000, 0x7C00), save_state(0x2_7B00)),
+            // Entry code long enough to reach the next CPU's entry code.
+            ([0x1_8000, 0x1_A000], 0x2100, entry(0x2_0000, 0x2100), entry(0x2_2000, 0x2100)),
+            // Three 8 KiB tiles apart, as CPUs k and k + 3 are, entry code longer than 0x1B00
+            // reaches the descriptor the lower CPU keeps in the upper one's tile.
+            ([0x1_8000, 0x1_E000], 0x1C00, save_state(0x2_7B00), entry(0x2_6000, 0x1C00)),
+        ] {
+            set_smbases(smbases);
+            assert_eq!(
+                check(MmSupvPassDownHobData { mmi_entry_size, ..pd }),
+                Err(HobValidationError::RegionsOverlap { first_kind, first, second_kind, second }.into()),
+                "SMBASEs {smbases:x?}, entry size 0x{mmi_entry_size:x}"
+            );
+        }
+
+        // An empty entry is not a usable entry.
+        set_smbases([0x1_8000, 0x1_A000]);
+        assert_eq!(
+            check(MmSupvPassDownHobData { mmi_entry_size: 0, ..pd }),
+            Err(HobValidationError::InvalidAddressRange { kind: "SMI entry code", base: 0x2_0000, length: 0 }.into())
         );
     }
 
