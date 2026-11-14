@@ -18,6 +18,7 @@ use patina::management_mode::supervisor::UserCommandType;
 use patina::pi::hob::PhaseHandoffInformationTable;
 
 use super::CoreInitError;
+use super::validation::validate_mmi_entry;
 use super::{cpu::CpuManager, mailbox::MailboxManager, smrr::smrr_enable};
 use crate::{
     MmSupervisorCore, PlatformInfo,
@@ -225,6 +226,8 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
 
             self.cpu_manager.register_cpu(cpu_id, cpu_index, false)?;
         }
+
+        validate_mmi_entry(cpu_index, hob_list as u64, is_bsp)?;
 
         self.per_core_init(cpu_id)?;
 

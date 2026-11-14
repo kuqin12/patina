@@ -123,7 +123,8 @@ impl core::fmt::Display for SaveStateValidationError {
 /// Size of one save-state map, as a `u64` for address arithmetic.
 const MAP_SIZE: u64 = SMRAM_SAVE_STATE_MAP_SIZE as u64;
 
-/// The per-CPU SMBASE array the MM IPL hands over in the `PassDown` HOB, and the CPU count.
+/// The per-CPU SMBASE array the MM IPL hands over in the `PassDown` HOB, the CPU count, and the
+/// size of the MMI entry copied to each SMBASE.
 ///
 /// The array holds one `u64` SMBASE per CPU. [`get_save_state`](Self::get_save_state)
 /// copies one CPU's save state map out of SMRAM as a [`SaveState`].
@@ -133,6 +134,9 @@ pub(crate) struct SaveStateInfo {
     number_of_cores: usize,
     /// The SMBASE array (`u64[number_of_cores]`).
     smbase_array: MemoryRange,
+    /// Size in bytes of the MMI entry at each `SMBASE + 0x8000`, from the `PassDown` HOB. Kept
+    /// here because each core validates its entry after the HOB list has been reclaimed.
+    mmi_entry_size: u64,
 }
 
 impl SaveStateInfo {
@@ -160,7 +164,11 @@ impl SaveStateInfo {
     /// Both must stay true for as long as those methods are called. The value may be built
     /// before [`validate_save_state_regions`] checks the regions, as long as each check
     /// finishes before the first read it covers.
-    pub(crate) unsafe fn new(number_of_cores: usize, smbase_array: u64) -> Result<Self, SaveStateValidationError> {
+    pub(crate) unsafe fn new(
+        number_of_cores: usize,
+        smbase_array: u64,
+        mmi_entry_size: u64,
+    ) -> Result<Self, SaveStateValidationError> {
         let invalid = SaveStateValidationError::UnusableSmBaseArray { base: smbase_array, count: number_of_cores };
         if smbase_array == 0 || !smbase_array.is_multiple_of(core::mem::align_of::<u64>() as u64) {
             return Err(invalid);
@@ -171,12 +179,17 @@ impl SaveStateInfo {
             .and_then(|size| MemoryRange::new(smbase_array, size).ok())
             .ok_or(invalid)?;
 
-        Ok(Self { number_of_cores, smbase_array: array })
+        Ok(Self { number_of_cores, smbase_array: array, mmi_entry_size })
     }
 
     /// Returns the number of CPUs.
     pub(crate) fn number_of_cores(&self) -> usize {
         self.number_of_cores
+    }
+
+    /// Returns the size in bytes of the MMI entry at each `SMBASE + 0x8000`.
+    pub(crate) fn mmi_entry_size(&self) -> u64 {
+        self.mmi_entry_size
     }
 
     /// Returns the address of the SMBASE array.
@@ -684,7 +697,7 @@ mod tests {
         fn info(&self) -> SaveStateInfo {
             // SAFETY: every SMBASE in `sm_bases` points at `region`, whose map window holds a full
             // `SMRAM_SAVE_STATE_MAP_SIZE` map, and both live as long as this `FakeSmram`.
-            unsafe { SaveStateInfo::new(self.sm_bases.len(), self.sm_bases.as_ptr() as u64) }
+            unsafe { SaveStateInfo::new(self.sm_bases.len(), self.sm_bases.as_ptr() as u64, 0x1000) }
                 .expect("the fake SMBASE array is valid")
         }
 
@@ -715,7 +728,7 @@ mod tests {
     /// Wraps an SMBASE array that the validator must reject before it reads any entry.
     fn unchecked_info(smbase_array: u64, number_of_cores: usize) -> SaveStateInfo {
         // SAFETY: each caller passes an array the validator rejects before reading through it.
-        unsafe { SaveStateInfo::new(number_of_cores, smbase_array) }.expect("the array has a valid shape")
+        unsafe { SaveStateInfo::new(number_of_cores, smbase_array, 0x1000) }.expect("the array has a valid shape")
     }
 
     /// Answers "supervisor-owned" for every range, isolating the containment rules.
@@ -771,7 +784,7 @@ mod tests {
         // count whose byte size overflows.
         for (base, count) in [(0, 2), (array, 0), (u64::MAX - 7, 2), (array + 1, 2), (array, usize::MAX)] {
             // SAFETY: each array is rejected before it is read.
-            let result = unsafe { SaveStateInfo::new(count, base) };
+            let result = unsafe { SaveStateInfo::new(count, base, 0x1000) };
             assert_eq!(
                 result.err(),
                 Some(SaveStateValidationError::UnusableSmBaseArray { base, count }),
@@ -785,8 +798,9 @@ mod tests {
         let smbase_entries = [0x3000_0000u64, u64::MAX - 0x1_0000, 0, u64::MAX];
         // SAFETY: `smbase_entries` holds four entries and outlives every call below, none of which
         // reads a map.
-        let info = unsafe { SaveStateInfo::new(smbase_entries.len(), smbase_entries.as_ptr() as u64) }.unwrap();
+        let info = unsafe { SaveStateInfo::new(smbase_entries.len(), smbase_entries.as_ptr() as u64, 0x1000) }.unwrap();
         assert_eq!(info.smbase_array_range().size(), 32);
+        assert_eq!(info.mmi_entry_size(), 0x1000);
 
         assert_eq!(info.smbase(0), Ok(0x3000_0000));
         assert_eq!(info.smbase(2), Ok(0));

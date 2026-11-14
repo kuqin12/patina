@@ -27,6 +27,7 @@ pub(crate) mod request_target;
 pub(crate) mod runtime;
 pub(crate) mod smi_idt_patch;
 pub(crate) mod smrr;
+pub(crate) mod validation;
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize};

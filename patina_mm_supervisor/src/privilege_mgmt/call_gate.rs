@@ -19,7 +19,7 @@ use patina_internal_cpu::gdt::TaskStateSegment;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::error::MmSupervisorResult;
-use crate::intrinsics::with_write_protection_disabled;
+use crate::intrinsics::{read_gdtr, with_write_protection_disabled};
 
 // The transfer assembly is built only for the UEFI target so host builds (tests, doctests) link.
 #[cfg(target_os = "uefi")]
@@ -39,7 +39,7 @@ pub const TSS_DESC_OFFSET: u16 = 0x80;
 
 /// Type and attribute byte of the return call gate: present (P = 1), callable from Ring 3
 /// (DPL = 3) and of type 0xC (64-bit call gate).
-const CALL_GATE_TYPE_ATTR: u8 = 0xEC;
+pub(crate) const CALL_GATE_TYPE_ATTR: u8 = 0xEC;
 
 /// Number of bytes of the GDT image that [`setup_call_gate`] programs, up to and including the
 /// TSS that follows the descriptors.
@@ -162,41 +162,12 @@ impl TssDescriptor {
     }
 
     /// Returns the base address stored in the descriptor.
-    ///
-    /// Only used by the unit tests, which read back what [`Self::set_base`] encoded.
-    #[cfg(test)]
     pub fn base(&self) -> u64 {
         u64::from(self.base_high) << 32
             | u64::from(self.base_mid_high) << 24
             | u64::from(self.base_mid_low) << 16
             | u64::from(self.base_low)
     }
-}
-
-/// In-memory image of the GDTR, as stored by sgdt.
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GdtRegister {
-    /// Size of the GDT minus 1
-    pub limit: u16,
-    /// Linear address of the GDT
-    pub base: u64,
-}
-
-/// Returns the base address of the current GDT, read from GDTR.
-// Reads the running processor's GDTR, so it cannot be tested deterministically on the host.
-pub fn get_current_gdt_base() -> u64 {
-    let mut gdtr = GdtRegister::default();
-    // SAFETY: sgdt only stores GDTR into `gdtr` and has no other side effects.
-    unsafe {
-        core::arch::asm!(
-            "sgdt [{}]",
-            in(reg) &raw mut gdtr,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    gdtr.base
 }
 
 /// Reads the entry of type `T` at `offset` in `gdt`, hands it to `update`, and writes it back.
@@ -271,7 +242,7 @@ fn program_privilege_transition_entries(
 /// Panics if the GDT image does not contain the call gate, TSS descriptor and TSS.
 #[unsafe(no_mangle)]
 pub unsafe extern "efiapi" fn setup_call_gate(return_pointer: u64, cpl0_stack_ptr: u64) {
-    let gdt_base = get_current_gdt_base();
+    let gdt_base = read_gdtr().base;
 
     let program = || {
         // SAFETY: `gdt_base` is the base of the GDT the processor is running on. The platform
@@ -341,7 +312,6 @@ mod tests {
         assert_eq!(core::mem::size_of::<CallGateDescriptor>(), 16);
         assert_eq!(core::mem::size_of::<TssDescriptor>(), 16);
         assert_eq!(core::mem::size_of::<TaskStateSegment>(), 0x68);
-        assert_eq!(core::mem::size_of::<GdtRegister>(), 10);
         // The programmed window covers the TSS that follows the descriptors.
         assert_eq!(GDT_PROGRAMMED_SIZE, 0x80 + 0x68);
     }

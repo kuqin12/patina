@@ -367,8 +367,7 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
             .ok_or(PassDownHobError::Missing)?;
         // SAFETY: `pass_down_data` is a slice into the validated HOB list, so the buffer pointers
         // it carries reference live memory as `init_from_pass_down_hob` requires.
-        let (save_state_info, mmi_entry_size) =
-            unsafe { self.init_from_pass_down_hob(pass_down_data, number_of_cores) }?;
+        let save_state_info = unsafe { self.init_from_pass_down_hob(pass_down_data, number_of_cores) }?;
 
         // `init_from_pass_down_hob` has just checked every save-state region it describes.
         self.publish_save_state_metadata(save_state_info);
@@ -377,7 +376,7 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
 
         // The SMI entry blocks were already copied per SMBASE, so every core is patched here,
         // not only the BSP.
-        patch_smi_handler_idt(save_state_info.smbase_array(), number_of_cores, mmi_entry_size)?;
+        patch_smi_handler_idt(save_state_info.smbase_array(), number_of_cores, save_state_info.mmi_entry_size())?;
 
         self.init_comm_buffers(hob_hand_off_table)?;
 
@@ -838,7 +837,8 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
     /// unblocked memory tracker. The stacks are mapped before the page-table walk so the
     /// descriptors it generates see their final attributes.
     ///
-    /// Returns the checked save-state metadata and the `mmi_entry_size` carried by the HOB.
+    /// Returns the checked save-state metadata, which also carries the `mmi_entry_size` from the
+    /// HOB.
     ///
     /// ## Safety
     ///
@@ -850,7 +850,7 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
         &self,
         data: &[u8],
         number_of_cores: usize,
-    ) -> MmSupervisorResult<(SaveStateInfo, u64)> {
+    ) -> MmSupervisorResult<SaveStateInfo> {
         let MmSupvPassDownHobData {
             cpl3_stack_base,
             cpl3_stack_size,
@@ -869,7 +869,7 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
         // SAFETY: `check_save_state_regions` proves the SMBASE array and every map it describes
         // before anything reads through them, and the MM IPL keeps them resident for the
         // supervisor's lifetime.
-        let save_state_info = unsafe { SaveStateInfo::new(number_of_cores, sm_base_array) }
+        let save_state_info = unsafe { SaveStateInfo::new(number_of_cores, sm_base_array, mmi_entry_size) }
             .inspect_err(|err| log::error!("PassDown HOB does not describe a usable SMBASE array: {err}"))?;
         self.check_save_state_regions(&save_state_info)?;
 
@@ -884,7 +884,7 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
         // `MEMORY_POLICY_DESCRIPTORS_PER_PAGE` descriptors and stays resident.
         unsafe { self.record_unblocked_memory(memory_policy_buffer) }?;
 
-        Ok((save_state_info, mmi_entry_size))
+        Ok(save_state_info)
     }
 }
 

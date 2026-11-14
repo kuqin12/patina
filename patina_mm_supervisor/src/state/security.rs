@@ -170,7 +170,7 @@ mod tests {
 
         // SAFETY: the SMBASE addresses are placeholders that nothing in this test reads through.
         let (first, second) =
-            unsafe { (SaveStateInfo::new(4, 0x3000).unwrap(), SaveStateInfo::new(8, 0x9000).unwrap()) };
+            unsafe { (SaveStateInfo::new(4, 0x3000, 0x1000).unwrap(), SaveStateInfo::new(8, 0x9000, 0x1000).unwrap()) };
         state.set_save_state_info(first);
         state.set_save_state_info(second);
         let info = state.save_state_info().unwrap();

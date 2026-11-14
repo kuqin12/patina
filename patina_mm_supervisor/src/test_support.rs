@@ -14,7 +14,7 @@ use crate::hob::pass_down::{MM_SUPV_PASS_DOWN_HOB_GUID, MM_SUPV_PASS_DOWN_HOB_RE
 use crate::memory::SharedPagingAllocator;
 use crate::mmcore::init::MP_INFORMATION_HOB_GUID;
 use crate::mmcore::mseg::MSEG_SMRAM_HOB_GUID;
-use crate::mmcore::smi_idt_patch::{FIXUP64_SMI_HANDLER_IDTR, PerCoreMmiEntryStructHdr};
+use crate::mmcore::smi_idt_patch::{FIXUP64_SMI_HANDLER_IDTR, MMI_ENTRY_STRUCT_VERSION, PerCoreMmiEntryStructHdr};
 use crate::{
     MmSupervisorCore, PlatformInfo,
     memory::{AllocationType, PageAllocator, mmram::MmramRegion},
@@ -283,22 +283,42 @@ pub(crate) fn smram_hob_list(memory: &PageAlignedMemory) -> RawHobList {
     list.finish()
 }
 pub(crate) fn mmi_entry(fixup64_count: u8, idt_descriptor_address: u64) -> Vec<u8> {
+    let mut fixup64 = vec![0_u64; usize::from(fixup64_count)];
+    if let Some(slot) = fixup64.get_mut(FIXUP64_SMI_HANDLER_IDTR) {
+        *slot = idt_descriptor_address;
+    }
+    mmi_entry_with(&fixup64, &[], &[])
+}
+
+/// Builds an MMI entry whose fixup structure holds the given Fixup64, Fixup32 and Fixup8 arrays,
+/// laid out as the V5 entry code lays them out: an 8-byte stand-in for the code, then the header,
+/// the arrays in that order, and the trailing structure size.
+pub(crate) fn mmi_entry_with(fixup64: &[u64], fixup32: &[u32], fixup8: &[u8]) -> Vec<u8> {
     const PREFIX_SIZE: usize = 8;
 
     let header_size = size_of::<PerCoreMmiEntryStructHdr>();
-    let fixup64_size = usize::from(fixup64_count) * size_of::<u64>();
-    let fixup_structure_size = header_size + fixup64_size;
+    let fixup64_offset = header_size;
+    let fixup32_offset = fixup64_offset + size_of_val(fixup64);
+    let fixup8_offset = fixup32_offset + size_of_val(fixup32);
+    let fixup_structure_size = fixup8_offset + fixup8.len();
     let mut entry = vec![0_u8; PREFIX_SIZE + fixup_structure_size + size_of::<u32>()];
     let header_start = PREFIX_SIZE;
 
-    entry[header_start..header_start + 4].copy_from_slice(&4_u32.to_ne_bytes());
-    entry[header_start + 6] = header_size as u8;
-    entry[header_start + 7] = fixup64_count;
+    entry[header_start..header_start + 4].copy_from_slice(&MMI_ENTRY_STRUCT_VERSION.to_ne_bytes());
+    entry[header_start + 6] = fixup64_offset as u8;
+    entry[header_start + 7] = fixup64.len() as u8;
+    entry[header_start + 8] = fixup32_offset as u8;
+    entry[header_start + 9] = fixup32.len() as u8;
+    entry[header_start + 10] = fixup8_offset as u8;
+    entry[header_start + 11] = fixup8.len() as u8;
 
-    if usize::from(fixup64_count) > FIXUP64_SMI_HANDLER_IDTR {
-        let idt_fixup_start = header_start + header_size + FIXUP64_SMI_HANDLER_IDTR * size_of::<u64>();
-        entry[idt_fixup_start..idt_fixup_start + size_of::<u64>()]
-            .copy_from_slice(&idt_descriptor_address.to_ne_bytes());
+    let arrays = fixup64
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .chain(fixup32.iter().flat_map(|value| value.to_ne_bytes()))
+        .chain(fixup8.iter().copied());
+    for (byte, value) in entry[header_start + fixup64_offset..].iter_mut().zip(arrays) {
+        *byte = value;
     }
 
     let trailer_start = entry.len() - size_of::<u32>();

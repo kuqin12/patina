@@ -24,16 +24,59 @@ use crate::memory::mmram::is_range_inside_mmram;
 /// Offset from SMBASE where the SMI handler code is located.
 pub(crate) const SMM_HANDLER_OFFSET: u64 = 0x8000;
 
-/// Index into the Fixup64 array for the SMI handler IDTR pointer.
-pub(crate) const FIXUP64_SMI_HANDLER_IDTR: usize = 5;
-
 /// Oldest MMI entry header version whose layout matches [`PerCoreMmiEntryStructHdr`]
 /// (`MMI_ENTRY_STRUCT_V4` in `SeaResponder.h`).
 const MMI_ENTRY_STRUCT_V4: u32 = 4;
 
 /// Newest MMI entry header version the supervisor understands (`MMI_ENTRY_STRUCT_VERSION` in
-/// `SeaResponder.h`). Version 5 keeps the version 4 header and the IDTR slot in the Fixup64 array.
-const MMI_ENTRY_STRUCT_VERSION: u32 = 5;
+/// `SeaResponder.h`), the version of the V5 entry code (`SeaPkg/MmiEntrySeaV5/MmiEntrySeaV5.nasmb`).
+/// Version 5 keeps the version 4 header and the IDTR slot in the Fixup64 array, so the patch
+/// accepts either, but per-core validation requires this one.
+pub(crate) const MMI_ENTRY_STRUCT_VERSION: u32 = 5;
+
+// Indices into the Fixup64 array, as `SeaResponder.h` defines them.
+/// Fixup64 slot for `CpuSmmDebugEntry`. Not used by the V5 entry code.
+pub(crate) const FIXUP64_SMM_DBG_ENTRY: usize = 0;
+/// Fixup64 slot for `CpuSmmDebugExit`. Not used by the V5 entry code.
+pub(crate) const FIXUP64_SMM_DBG_EXIT: usize = 1;
+/// Fixup64 slot for the routine the entry code calls on every SMI.
+pub(crate) const FIXUP64_SMI_RDZ_ENTRY: usize = 2;
+/// Fixup64 slot for the address of `mXdSupported`. Not used by the V5 entry code.
+pub(crate) const FIXUP64_XD_SUPPORTED: usize = 3;
+/// Fixup64 slot for the address of `mCetSupported`. Not used by the V5 entry code.
+pub(crate) const FIXUP64_CET_SUPPORTED: usize = 4;
+/// Index into the Fixup64 array for the SMI handler IDTR pointer.
+pub(crate) const FIXUP64_SMI_HANDLER_IDTR: usize = 5;
+/// Fixup64 slot for the HOB list the entry code passes to the supervisor.
+pub(crate) const FIXUP64_HOB_START: usize = 6;
+
+// Indices into the Fixup32 array.
+/// Fixup32 slot for the CET Ring 0 shadow stack pointer.
+pub(crate) const FIXUP32_CET_PL0_SSP: usize = 0;
+/// Fixup32 slot for the address of the `IA32_DESCRIPTOR` the entry code loads into GDTR.
+pub(crate) const FIXUP32_GDTR: usize = 1;
+/// Fixup32 slot for the CR3 the entry code loads.
+pub(crate) const FIXUP32_CR3: usize = 2;
+/// Fixup32 slot for the CET interrupt shadow stack pointer.
+pub(crate) const FIXUP32_CET_INTERRUPT_SSP: usize = 3;
+/// Fixup32 slot for the CET interrupt shadow stack table.
+pub(crate) const FIXUP32_CET_INTERRUPT_SSP_TABLE: usize = 4;
+/// Fixup32 slot for the top of the Ring 0 stack the entry code switches to.
+pub(crate) const FIXUP32_STACK_CPL0: usize = 5;
+/// Fixup32 slot for the SMBASE the entry code was copied for.
+pub(crate) const FIXUP32_MSR_SMM_BASE: usize = 6;
+
+// Indices into the Fixup8 array.
+/// Fixup8 flag: enable NX (`EFER.NXE`) on entry.
+pub(crate) const FIXUP8_XD_SUPPORTED: usize = 0;
+/// Fixup8 flag: `MSR_IA32_MISC_ENABLE` exists, so its XD Disable bit is cleared on entry.
+pub(crate) const FIXUP8_MISC_ENABLE_SUPPORTED: usize = 1;
+/// Fixup8 flag: set CR4.LA57 on entry.
+pub(crate) const FIXUP8_5_LEVEL_PAGING: usize = 2;
+/// Fixup8 flag: enable CET on entry.
+pub(crate) const FIXUP8_CET_SUPPORTED: usize = 3;
+/// First reserved Fixup8 slot; the slots from here to the end of the array are reserved.
+pub(crate) const FIXUP8_FIRST_RESERVED: usize = 4;
 
 /// Errors produced while applying the SMI handler IDT patch.
 ///
@@ -84,13 +127,22 @@ pub enum SmiHandlerIdtPatchError {
         /// Header version the MMI entry reported.
         found: u32,
     },
-    /// The Fixup64 array holds fewer entries than the IDTR slot index requires.
-    Fixup64ArrayTooSmall {
-        /// Number of Fixup64 entries the header reported.
+    /// A fixup array holds fewer entries than the slot being read requires.
+    FixupArrayTooSmall {
+        /// Width in bits of the array's entries: 64, 32 or 8.
+        width: u8,
+        /// Index of the slot being read.
+        index: usize,
+        /// Number of entries the header reported.
         found: u8,
     },
-    /// The addressed Fixup64 entry lies outside the MMI entry.
-    Fixup64EntryOutOfBounds,
+    /// The addressed fixup entry lies outside the MMI entry.
+    FixupEntryOutOfBounds {
+        /// Width in bits of the array's entries: 64, 32 or 8.
+        width: u8,
+        /// Index of the slot being read.
+        index: usize,
+    },
 }
 
 impl core::error::Error for SmiHandlerIdtPatchError {}
@@ -119,10 +171,12 @@ impl fmt::Display for SmiHandlerIdtPatchError {
                 "the fixup structure header version {found} is not between {MMI_ENTRY_STRUCT_V4} and \
                  {MMI_ENTRY_STRUCT_VERSION}"
             ),
-            Self::Fixup64ArrayTooSmall { found } => {
-                write!(f, "the Fixup64 array holds {found} entries, too few for the IDTR slot the supervisor patches")
+            Self::FixupArrayTooSmall { width, index, found } => {
+                write!(f, "the Fixup{width} array holds {found} entries, too few to read slot {index}")
             }
-            Self::Fixup64EntryOutOfBounds => write!(f, "the addressed Fixup64 entry lies outside the MMI entry"),
+            Self::FixupEntryOutOfBounds { width, index } => {
+                write!(f, "Fixup{width} slot {index} lies outside the MMI entry")
+            }
         }
     }
 }
@@ -160,16 +214,14 @@ pub(crate) struct PerCoreMmiEntryStructHdr {
 /// The patch inputs after they were checked, narrowed to the widths the loop needs.
 ///
 /// Produced by [`validate_smi_handler_idt_patch_inputs`] so the loop over CPUs does no
-/// conversion of its own: it has the array length and the entry size in both the pointer width it
-/// indexes with and the `u64` it does address arithmetic with.
+/// conversion of its own: it has the array length and the entry size in the pointer width it
+/// indexes with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SmiHandlerIdtPatchInputs {
     /// Byte length of the SMBASE array, known to be addressable and inside MMRAM.
     pub(crate) sm_base_array_size: usize,
     /// MMI entry size as a length usable for slicing.
     pub(crate) mmi_entry_size: usize,
-    /// The same entry size kept as a `u64` for address arithmetic.
-    pub(crate) mmi_entry_size_u64: u64,
 }
 
 /// Checks the patch inputs before any core's MMI entry is read.
@@ -205,58 +257,107 @@ fn validate_smi_handler_idt_patch_inputs(
         .filter(|size| isize::try_from(*size).is_ok())
         .ok_or(SmiHandlerIdtPatchError::EntrySizeTooLarge)?;
 
-    Ok(SmiHandlerIdtPatchInputs {
-        sm_base_array_size,
-        mmi_entry_size: mmi_entry_size_usize,
-        mmi_entry_size_u64: mmi_entry_size,
-    })
+    Ok(SmiHandlerIdtPatchInputs { sm_base_array_size, mmi_entry_size: mmi_entry_size_usize })
 }
 
-/// Returns the address of the `IA32_DESCRIPTOR` one core's SMI entry loads.
+/// The fixup structure at the end of one core's MMI entry, with every offset bounds-checked.
 ///
 /// The MMI entry ends with a `u32` giving the size of the fixup structure that precedes it. That
-/// structure starts with a [`PerCoreMmiEntryStructHdr`], whose Fixup64 array holds the IDTR slot
-/// at [`FIXUP64_SMI_HANDLER_IDTR`]. Every offset read here comes from the producer, so each step
-/// is bounds-checked against `mmi_entry` rather than trusted.
-fn parse_smi_handler_idt_descriptor(mmi_entry: &[u8]) -> MmSupervisorResult<u64> {
-    const TRAILING_SIZE_FIELD_SIZE: usize = core::mem::size_of::<u32>();
+/// structure starts with a [`PerCoreMmiEntryStructHdr`], which locates the Fixup64, Fixup32 and
+/// Fixup8 arrays. Every offset and count comes from the producer, so each read is checked
+/// against the entry rather than trusted.
+pub(crate) struct MmiEntryFixups<'a> {
+    /// The fixup structure, from its header up to the trailing size field.
+    structure: &'a [u8],
+    /// The structure's header.
+    header: PerCoreMmiEntryStructHdr,
+}
 
-    let trailer_start =
-        mmi_entry.len().checked_sub(TRAILING_SIZE_FIELD_SIZE).ok_or(SmiHandlerIdtPatchError::EntryTooSmall)?;
-    let trailer = mmi_entry.get(trailer_start..).ok_or(SmiHandlerIdtPatchError::EntryTooSmall)?;
-    let whole_struct_size =
-        u32::from_ne_bytes(trailer.try_into().map_err(|_| SmiHandlerIdtPatchError::EntryTooSmall)?) as usize;
-    let header_start =
-        trailer_start.checked_sub(whole_struct_size).ok_or(SmiHandlerIdtPatchError::FixupStructureOutOfBounds)?;
-    let fixup_structure =
-        mmi_entry.get(header_start..trailer_start).ok_or(SmiHandlerIdtPatchError::FixupStructureOutOfBounds)?;
-    let (header, _) = PerCoreMmiEntryStructHdr::read_from_prefix(fixup_structure)
-        .map_err(|_| SmiHandlerIdtPatchError::FixupHeaderTooSmall)?;
+impl<'a> MmiEntryFixups<'a> {
+    /// Locates the fixup structure at the end of `mmi_entry` and reads its header, which must be
+    /// a version from [`MMI_ENTRY_STRUCT_V4`] to [`MMI_ENTRY_STRUCT_VERSION`].
+    pub(crate) fn parse(mmi_entry: &'a [u8]) -> MmSupervisorResult<Self> {
+        const TRAILING_SIZE_FIELD_SIZE: usize = core::mem::size_of::<u32>();
 
-    let header_version = header.header_version;
-    if !(MMI_ENTRY_STRUCT_V4..=MMI_ENTRY_STRUCT_VERSION).contains(&header_version) {
-        return Err(SmiHandlerIdtPatchError::UnsupportedHeaderVersion { found: header_version }.into());
+        let trailer_start =
+            mmi_entry.len().checked_sub(TRAILING_SIZE_FIELD_SIZE).ok_or(SmiHandlerIdtPatchError::EntryTooSmall)?;
+        let trailer = mmi_entry.get(trailer_start..).ok_or(SmiHandlerIdtPatchError::EntryTooSmall)?;
+        let whole_struct_size =
+            u32::from_ne_bytes(trailer.try_into().map_err(|_| SmiHandlerIdtPatchError::EntryTooSmall)?) as usize;
+        let header_start =
+            trailer_start.checked_sub(whole_struct_size).ok_or(SmiHandlerIdtPatchError::FixupStructureOutOfBounds)?;
+        let structure =
+            mmi_entry.get(header_start..trailer_start).ok_or(SmiHandlerIdtPatchError::FixupStructureOutOfBounds)?;
+        let (header, _) = PerCoreMmiEntryStructHdr::read_from_prefix(structure)
+            .map_err(|_| SmiHandlerIdtPatchError::FixupHeaderTooSmall)?;
+
+        let header_version = header.header_version;
+        if !(MMI_ENTRY_STRUCT_V4..=MMI_ENTRY_STRUCT_VERSION).contains(&header_version) {
+            return Err(SmiHandlerIdtPatchError::UnsupportedHeaderVersion { found: header_version }.into());
+        }
+
+        Ok(Self { structure, header })
     }
 
-    if FIXUP64_SMI_HANDLER_IDTR >= usize::from(header.fixup64_num) {
-        return Err(SmiHandlerIdtPatchError::Fixup64ArrayTooSmall { found: header.fixup64_num }.into());
+    /// Returns the structure's header.
+    pub(crate) fn header(&self) -> &PerCoreMmiEntryStructHdr {
+        &self.header
     }
 
-    let fixup64_entry_start = usize::from(header.fixup64_offset)
-        .checked_add(
-            FIXUP64_SMI_HANDLER_IDTR
-                .checked_mul(core::mem::size_of::<u64>())
-                .ok_or(SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds)?,
-        )
-        .ok_or(SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds)?;
-    let fixup64_entry_end = fixup64_entry_start
-        .checked_add(core::mem::size_of::<u64>())
-        .ok_or(SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds)?;
-    let fixup64_entry = fixup_structure
-        .get(fixup64_entry_start..fixup64_entry_end)
-        .ok_or(SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds)?;
+    /// Returns Fixup64 slot `index`.
+    pub(crate) fn fixup64(&self, index: usize) -> MmSupervisorResult<u64> {
+        self.entry(64, self.header.fixup64_offset, self.header.fixup64_num, index).map(u64::from_ne_bytes)
+    }
 
-    Ok(u64::from_ne_bytes(fixup64_entry.try_into().map_err(|_| SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds)?))
+    /// Returns Fixup32 slot `index`.
+    pub(crate) fn fixup32(&self, index: usize) -> MmSupervisorResult<u32> {
+        self.entry(32, self.header.fixup32_offset, self.header.fixup32_num, index).map(u32::from_ne_bytes)
+    }
+
+    /// Returns Fixup8 slot `index`.
+    pub(crate) fn fixup8(&self, index: usize) -> MmSupervisorResult<u8> {
+        self.entry(8, self.header.fixup8_offset, self.header.fixup8_num, index).map(u8::from_ne_bytes)
+    }
+
+    /// Returns the bytes of slot `index` of the array of `N`-byte entries that starts `offset`
+    /// bytes into the structure and holds `count` entries.
+    fn entry<const N: usize>(&self, width: u8, offset: u8, count: u8, index: usize) -> MmSupervisorResult<[u8; N]> {
+        if index >= usize::from(count) {
+            return Err(SmiHandlerIdtPatchError::FixupArrayTooSmall { width, index, found: count }.into());
+        }
+        let out_of_bounds = SmiHandlerIdtPatchError::FixupEntryOutOfBounds { width, index };
+        // `index` is below a `u8` count and `N` is at most 8, so neither product can overflow.
+        let start = usize::from(offset) + index * N;
+        let bytes = self.structure.get(start..start + N).ok_or(out_of_bounds)?;
+        Ok(bytes.try_into().map_err(|_| out_of_bounds)?)
+    }
+}
+
+/// Returns the MMI entry of the core whose SMBASE is `smbase`: the `mmi_entry_size` bytes at
+/// `smbase + SMM_HANDLER_OFFSET`, which must lie entirely inside MMRAM. `cpu` names the core in
+/// the error.
+///
+/// ## Safety
+///
+/// The entry must stay readable and unmodified for as long as the returned slice is used. The
+/// caller has established that it is MMRAM the supervisor owns.
+pub(crate) unsafe fn locate_mmi_entry<'a>(
+    cpu_index: usize,
+    smbase: u64,
+    mmi_entry_size: usize,
+) -> MmSupervisorResult<&'a [u8]> {
+    let base = smbase
+        .checked_add(SMM_HANDLER_OFFSET)
+        .filter(|base| {
+            u64::try_from(mmi_entry_size)
+                .ok()
+                .and_then(|size| MemoryRange::new(*base, size).ok())
+                .is_some_and(|range| is_range_inside_mmram(&range))
+        })
+        .ok_or(SmiHandlerIdtPatchError::MmiEntryOutsideMmram { cpu: cpu_index })?;
+    // SAFETY: the range check above places the entry entirely inside MMRAM, and the caller
+    // guarantees it stays readable while the slice is used.
+    Ok(unsafe { core::slice::from_raw_parts(base as *const u8, mmi_entry_size) })
 }
 
 /// Patches every core's SMI-handler IDT descriptor to point to the IDT loaded on this core.
@@ -300,17 +401,11 @@ pub(crate) fn patch_smi_handler_idt(
             return Err(SmiHandlerIdtPatchError::SmBaseZero { cpu }.into());
         }
 
-        let mmi_entry_base = smbase
-            .checked_add(SMM_HANDLER_OFFSET)
-            .filter(|base| {
-                MemoryRange::new(*base, inputs.mmi_entry_size_u64).is_ok_and(|range| is_range_inside_mmram(&range))
-            })
-            .ok_or(SmiHandlerIdtPatchError::MmiEntryOutsideMmram { cpu })?;
-
-        // SAFETY: the range check above establishes that the initialized SMI handler template
-        // is fully contained in MMRAM.
-        let mmi_entry = unsafe { core::slice::from_raw_parts(mmi_entry_base as *const u8, inputs.mmi_entry_size) };
-        let idt_desc_addr = parse_smi_handler_idt_descriptor(mmi_entry)
+        // SAFETY: `locate_mmi_entry` checks the initialized SMI handler template lies entirely
+        // inside MMRAM, which stays resident during initialization.
+        let mmi_entry = unsafe { locate_mmi_entry(cpu, smbase, inputs.mmi_entry_size) }?;
+        let idt_desc_addr = MmiEntryFixups::parse(mmi_entry)
+            .and_then(|fixups| fixups.fixup64(FIXUP64_SMI_HANDLER_IDTR))
             .inspect_err(|error| log::error!("CPU {cpu}: invalid SMI handler fixup metadata: {error}"))?;
 
         if idt_desc_addr == 0 {
@@ -384,12 +479,12 @@ mod tests {
                 "the fixup structure header version 6 is not between 4 and 5",
             ),
             (
-                SmiHandlerIdtPatchError::Fixup64ArrayTooSmall { found: 2 },
-                "the Fixup64 array holds 2 entries, too few for the IDTR slot the supervisor patches",
+                SmiHandlerIdtPatchError::FixupArrayTooSmall { width: 64, index: 5, found: 2 },
+                "the Fixup64 array holds 2 entries, too few to read slot 5",
             ),
             (
-                SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds,
-                "the addressed Fixup64 entry lies outside the MMI entry",
+                SmiHandlerIdtPatchError::FixupEntryOutOfBounds { width: 32, index: 1 },
+                "Fixup32 slot 1 lies outside the MMI entry",
             ),
         ];
 
@@ -399,8 +494,8 @@ mod tests {
 
         // The count is carried in the message, so two short arrays stay distinguishable.
         assert_ne!(
-            format!("{}", SmiHandlerIdtPatchError::Fixup64ArrayTooSmall { found: 2 }),
-            format!("{}", SmiHandlerIdtPatchError::Fixup64ArrayTooSmall { found: 3 })
+            format!("{}", SmiHandlerIdtPatchError::FixupArrayTooSmall { width: 64, index: 5, found: 2 }),
+            format!("{}", SmiHandlerIdtPatchError::FixupArrayTooSmall { width: 64, index: 5, found: 3 })
         );
     }
 
@@ -413,11 +508,7 @@ mod tests {
 
         assert_eq!(
             inputs,
-            SmiHandlerIdtPatchInputs {
-                sm_base_array_size: 4 * size_of::<u64>(),
-                mmi_entry_size: 0x200,
-                mmi_entry_size_u64: 0x200,
-            }
+            SmiHandlerIdtPatchInputs { sm_base_array_size: 4 * size_of::<u64>(), mmi_entry_size: 0x200 }
         );
     }
 
@@ -453,60 +544,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_smi_handler_idt_descriptor() {
-        let entry = mmi_entry((FIXUP64_SMI_HANDLER_IDTR + 1) as u8, 0x1234_5678_9ABC_DEF0);
-
-        assert_eq!(parse_smi_handler_idt_descriptor(&entry), Ok(0x1234_5678_9ABC_DEF0));
+    /// Returns the Fixup64 IDTR slot of `entry`, as the patch reads it.
+    fn idt_descriptor_slot(entry: &[u8]) -> MmSupervisorResult<u64> {
+        MmiEntryFixups::parse(entry)?.fixup64(FIXUP64_SMI_HANDLER_IDTR)
     }
 
     #[test]
-    fn test_parse_smi_handler_idt_descriptor_checks_the_header_version() {
+    fn test_mmi_entry_fixups_read_each_array() {
+        let entry = mmi_entry((FIXUP64_SMI_HANDLER_IDTR + 1) as u8, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(idt_descriptor_slot(&entry), Ok(0x1234_5678_9ABC_DEF0));
+
+        let entry = test_support::mmi_entry_with(&[1, 2], &[3, 4, 5], &[6, 7]);
+        let fixups = MmiEntryFixups::parse(&entry).expect("a well-formed fixup structure");
+        let version = fixups.header().header_version;
+        assert_eq!(version, MMI_ENTRY_STRUCT_VERSION);
+        assert_eq!((fixups.fixup64(0), fixups.fixup64(1)), (Ok(1), Ok(2)));
+        assert_eq!((fixups.fixup32(0), fixups.fixup32(2)), (Ok(3), Ok(5)));
+        assert_eq!((fixups.fixup8(0), fixups.fixup8(1)), (Ok(6), Ok(7)));
+        assert_eq!(
+            fixups.fixup32(3),
+            Err(SmiHandlerIdtPatchError::FixupArrayTooSmall { width: 32, index: 3, found: 3 }.into())
+        );
+        assert_eq!(
+            fixups.fixup8(2),
+            Err(SmiHandlerIdtPatchError::FixupArrayTooSmall { width: 8, index: 2, found: 2 }.into())
+        );
+    }
+
+    #[test]
+    fn test_mmi_entry_fixups_check_the_header_version() {
         const HEADER_START: usize = 8;
         let mut entry = mmi_entry((FIXUP64_SMI_HANDLER_IDTR + 1) as u8, 0x1234_5678_9ABC_DEF0);
 
         // Version 5 keeps the version 4 header, so the IDTR slot is read the same way.
-        entry[HEADER_START..HEADER_START + 4].copy_from_slice(&5_u32.to_ne_bytes());
-        assert_eq!(parse_smi_handler_idt_descriptor(&entry), Ok(0x1234_5678_9ABC_DEF0));
+        for found in [4_u32, 5] {
+            entry[HEADER_START..HEADER_START + 4].copy_from_slice(&found.to_ne_bytes());
+            assert_eq!(idt_descriptor_slot(&entry), Ok(0x1234_5678_9ABC_DEF0), "version {found}");
+        }
 
         for found in [0, 3, 6, u32::MAX] {
             entry[HEADER_START..HEADER_START + 4].copy_from_slice(&found.to_ne_bytes());
             assert_eq!(
-                parse_smi_handler_idt_descriptor(&entry),
+                idt_descriptor_slot(&entry),
                 Err(SmiHandlerIdtPatchError::UnsupportedHeaderVersion { found }.into())
             );
         }
     }
 
     #[test]
-    fn test_parse_smi_handler_idt_descriptor_rejects_malformed_metadata() {
-        assert_eq!(parse_smi_handler_idt_descriptor(&[0; 3]), Err(SmiHandlerIdtPatchError::EntryTooSmall.into()));
+    fn test_mmi_entry_fixups_reject_malformed_metadata() {
+        assert_eq!(idt_descriptor_slot(&[0; 3]), Err(SmiHandlerIdtPatchError::EntryTooSmall.into()));
 
         let mut oversized_structure = [0_u8; 4];
         oversized_structure.copy_from_slice(&1_u32.to_ne_bytes());
         assert_eq!(
-            parse_smi_handler_idt_descriptor(&oversized_structure),
+            idt_descriptor_slot(&oversized_structure),
             Err(SmiHandlerIdtPatchError::FixupStructureOutOfBounds.into())
         );
 
         let mut short_header = vec![0_u8; 5];
         short_header[1..].copy_from_slice(&1_u32.to_ne_bytes());
-        assert_eq!(
-            parse_smi_handler_idt_descriptor(&short_header),
-            Err(SmiHandlerIdtPatchError::FixupHeaderTooSmall.into())
-        );
+        assert_eq!(idt_descriptor_slot(&short_header), Err(SmiHandlerIdtPatchError::FixupHeaderTooSmall.into()));
 
         let too_few_fixups = mmi_entry(FIXUP64_SMI_HANDLER_IDTR as u8, 0);
         assert_eq!(
-            parse_smi_handler_idt_descriptor(&too_few_fixups),
-            Err(SmiHandlerIdtPatchError::Fixup64ArrayTooSmall { found: FIXUP64_SMI_HANDLER_IDTR as u8 }.into())
+            idt_descriptor_slot(&too_few_fixups),
+            Err(SmiHandlerIdtPatchError::FixupArrayTooSmall {
+                width: 64,
+                index: FIXUP64_SMI_HANDLER_IDTR,
+                found: FIXUP64_SMI_HANDLER_IDTR as u8
+            }
+            .into())
         );
 
         let mut out_of_bounds_fixup = mmi_entry((FIXUP64_SMI_HANDLER_IDTR + 1) as u8, 0);
         out_of_bounds_fixup[8 + 6] = u8::MAX;
         assert_eq!(
-            parse_smi_handler_idt_descriptor(&out_of_bounds_fixup),
-            Err(SmiHandlerIdtPatchError::Fixup64EntryOutOfBounds.into())
+            idt_descriptor_slot(&out_of_bounds_fixup),
+            Err(SmiHandlerIdtPatchError::FixupEntryOutOfBounds { width: 64, index: FIXUP64_SMI_HANDLER_IDTR }.into())
         );
     }
 

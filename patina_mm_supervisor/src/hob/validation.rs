@@ -127,7 +127,7 @@ const MMRAM_MIN_BASE: u64 = 0x10_0000;
 const SMM_PSD_OFFSET: u64 = 0xFB00;
 
 /// Size of each CPU's SMRAM window above its SMBASE.
-const SMRAM_WINDOW_SIZE: u64 = 0x1_0000;
+pub(crate) const SMRAM_WINDOW_SIZE: u64 = 0x1_0000;
 
 /// Errors produced while validating the critical incoming HOBs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1522,7 +1522,7 @@ fn verify_mem_bound_page_protections<'a>(
 
 /// Runs `check` against the active page table, or reports it as unavailable when it has not been
 /// initialized yet.
-fn with_active_page_table<R>(
+pub(crate) fn with_active_page_table<R>(
     check: impl FnOnce(&SupervisorPageTable) -> MmSupervisorResult<R>,
 ) -> MmSupervisorResult<R> {
     let page_table = security_state().lock_page_table();
@@ -1552,7 +1552,7 @@ pub(crate) fn verify_cpl3_stacks_user_accessible(range: &MemoryRange) -> MmSuper
 /// The range is widened to whole pages and each page is queried individually, so
 /// attributes that differ across the range are detected per page rather than merged
 /// into a single range query.
-fn verify_page_attributes(
+pub(crate) fn verify_page_attributes(
     page_table: &impl PageTable,
     range: &MemoryRange,
     required: MemoryAttributes,

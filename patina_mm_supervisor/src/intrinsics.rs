@@ -20,7 +20,7 @@ use patina_paging::x64::{disable_write_protection, enable_write_protection};
 /// `packed(2)` gives the expected 10-byte in-memory layout with no padding between `limit` and
 /// `base`.
 #[repr(C, packed(2))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, zerocopy_derive::FromBytes, zerocopy_derive::Immutable)]
 pub(crate) struct DescriptorTablePointer {
     /// Size of the descriptor table in bytes, minus 1.
     pub(crate) limit: u16,
@@ -207,6 +207,32 @@ pub(crate) fn read_idtr() -> DescriptorTablePointer {
     rt_descriptor
 }
 
+/// Reads the GDT register (GDTR) with SGDT.
+///
+/// Returns a zeroed [`DescriptorTablePointer`] in unit tests.
+pub(crate) fn read_gdtr() -> DescriptorTablePointer {
+    let rt_descriptor = DescriptorTablePointer { limit: 0, base: 0 };
+
+    // Outside unit tests, fill it with SGDT. Test builds keep the zeroed value, so no mutable
+    // binding is left unused there.
+    #[cfg(not(test))]
+    let rt_descriptor = {
+        let mut descriptor = rt_descriptor;
+        // SAFETY: SGDT writes the 10-byte GDTR pseudo-descriptor to `descriptor`, a local with
+        // exactly that layout, and only reads CPU state.
+        unsafe {
+            core::arch::asm!(
+                "sgdt [{}]",
+                in(reg) &raw mut descriptor,
+                options(nostack, preserves_flags)
+            );
+        }
+        descriptor
+    };
+
+    rt_descriptor
+}
+
 /// Sets EFLAGS.AC with `stac`, which lets supervisor code access user pages despite SMAP.
 ///
 /// ## Safety
@@ -297,13 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn test_read_idtr_is_zeroed_in_unit_tests() {
-        let idtr = read_idtr();
-        let base = idtr.base;
-        let limit = idtr.limit;
+    fn test_read_descriptor_table_registers_are_zeroed_in_unit_tests() {
+        for descriptor in [read_idtr(), read_gdtr()] {
+            let base = descriptor.base;
+            let limit = descriptor.limit;
 
-        assert_eq!(base, 0);
-        assert_eq!(limit, 0);
+            assert_eq!(base, 0);
+            assert_eq!(limit, 0);
+        }
     }
 
     #[test]
