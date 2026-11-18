@@ -209,6 +209,24 @@ pub(crate) fn read_gdtr() -> DescriptorTablePointer {
     rt_descriptor
 }
 
+/// Reads the live LDTR selector. Returns 0 in unit tests, where UMIP can prohibit SLDT.
+pub(crate) fn read_ldtr() -> u16 {
+    #[cfg(test)]
+    {
+        0
+    }
+
+    #[cfg(not(test))]
+    {
+        let selector: u16;
+        // SAFETY: the supervisor runs at CPL0. SLDT only copies the selector into a register.
+        unsafe {
+            core::arch::asm!("sldt {0:x}", out(reg) selector, options(nomem, nostack, preserves_flags));
+        }
+        selector
+    }
+}
+
 /// Sets EFLAGS.AC with `stac`, which lets Ring 0 access user pages despite SMAP.
 ///
 /// ## Safety

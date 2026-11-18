@@ -25,5 +25,8 @@
 # efi_main jumps to rust_main, which the platform binary provides. The jump leaves the
 # argument registers and the stack untouched.
 efi_main:
-
+    # SMM uses only the GDT. Disable any inherited LDT on every entry without changing
+    # the interrupted context's save state, which RSM restores.
+    xor     eax, eax
+    lldt    ax
     jmp     rust_main

@@ -35,7 +35,7 @@ use super::smi_idt_patch::{
 use crate::error::MmSupervisorResult;
 use crate::hob::validation::{SMM_PSD_OFFSET, SMRAM_WINDOW_SIZE, verify_page_attributes, with_active_page_table};
 use crate::intrinsics::{
-    CR4_LA57, DescriptorTablePointer, cpuid_version_info, read_cr3, read_cr4, read_gdtr, read_idtr, read_msr,
+    CR4_LA57, DescriptorTablePointer, cpuid_version_info, read_cr3, read_cr4, read_gdtr, read_idtr, read_ldtr, read_msr,
 };
 use crate::memory::mmram::is_range_inside_mmram;
 use crate::privilege_mgmt::call_gate::{
@@ -464,6 +464,7 @@ struct MmiEntryStructures {
 /// patched descriptor.
 #[inline(never)]
 pub(crate) fn validate_mmi_entry(cpu_index: usize, hob_list: u64, is_bsp: bool) -> MmSupervisorResult<()> {
+    check_ldtr(cpu_index, read_ldtr())?;
     let info = security_state().save_state_info().ok_or(MmiEntryValidationError::SaveStateInfoUnavailable)?;
     let entry_size = usize::try_from(info.mmi_entry_size()).map_err(|_| SmiHandlerIdtPatchError::EntrySizeTooLarge)?;
     let core = read_mmi_entry_structures(&info, cpu_index, entry_size)?;
@@ -550,6 +551,20 @@ pub(crate) fn validate_mmi_entry(cpu_index: usize, hob_list: u64, is_bsp: bool) 
     }
 
     log::debug!("CPU {cpu_index}: MMI entry at 0x{:016x} validated", smbase + SMM_HANDLER_OFFSET);
+    Ok(())
+}
+
+/// The entry shim must have disabled the local descriptor table on this CPU.
+fn check_ldtr(cpu: usize, selector: u16) -> MmSupervisorResult<()> {
+    if selector != 0 {
+        return Err(MmiEntryValidationError::RegisterMismatch {
+            cpu,
+            register: "LDTR",
+            expected: 0,
+            found: u64::from(selector),
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -950,6 +965,23 @@ mod tests {
         // IST1 sits 0x24 bytes into the TSS, and the I/O map base 0x66.
         assert_eq!(core::mem::offset_of!(SmiGdtImage, tss_ist1), usize::from(TSS_DESC_OFFSET) + 0x24);
         assert_eq!(core::mem::offset_of!(SmiGdtImage, tss_io_map_base), usize::from(TSS_DESC_OFFSET) + 0x66);
+    }
+
+    #[test]
+    fn test_check_ldtr_requires_the_null_selector() {
+        assert_eq!(check_ldtr(2, 0), Ok(()));
+        for selector in [0x28, 0xfff8] {
+            assert_eq!(
+                check_ldtr(2, selector),
+                Err(MmiEntryValidationError::RegisterMismatch {
+                    cpu: 2,
+                    register: "LDTR",
+                    expected: 0,
+                    found: u64::from(selector)
+                }
+                .into())
+            );
+        }
     }
 
     #[test]
