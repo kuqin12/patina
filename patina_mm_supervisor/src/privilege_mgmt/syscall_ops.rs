@@ -17,7 +17,7 @@ use patina::MemoryRange;
 use crate::{
     comm_buffer::CommBufferConfig,
     error::{MmSupervisorError, MmSupervisorResult},
-    memory::{AllocationType, page_ownership::PageOwnership},
+    memory::{AllocationType, mmram::range_overlaps_mmram, page_ownership::PageOwnership},
     policy::{AccessType, Instruction, IoWidth},
     state::{init_state, security_state},
 };
@@ -258,7 +258,7 @@ impl SyscallOps for FirmwareOps {
     }
 
     fn is_within_unblocked_region(&self, range: &MemoryRange) -> bool {
-        security_state().unblocked_tracker().is_within_unblocked_region(range)
+        !range_overlaps_mmram(range) && security_state().unblocked_tracker().is_within_unblocked_region(range)
     }
 
     fn comm_buffer_config(&self) -> Option<CommBufferConfig> {

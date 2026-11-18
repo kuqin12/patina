@@ -12,13 +12,17 @@ use core::fmt::Debug;
 
 use patina::standard::efi;
 
+#[cfg(not(test))]
+use crate::intrinsics::read_cr3;
+#[cfg(test)]
+use tests::read_cr3;
+
 use crate::{
     error::MmSupervisorError,
     handlers::UnblockedMemoryTracker,
-    intrinsics::read_cr3,
     memory::mmram::is_range_inside_mmram,
     policy::PolicyGate,
-    state::{InitState, init_state, security_state},
+    state::{init_state, security_state},
 };
 
 /// The global state the Ready-to-Lock transition reads and changes, behind a trait so tests can
@@ -112,19 +116,21 @@ fn process_mm_ready_to_lock<C: ReadyToLockContext>(context: &C) -> efi::Status {
 ///
 /// Marks the supervisor as at runtime, after which the dispatch loop rejects supervisor
 /// requests.
-pub(crate) fn mm_exit_boot_services_handler(_comm_buffer: *mut u8, _comm_buffer_size: &mut usize) -> efi::Status {
+pub(crate) fn mm_exit_boot_services_handler(comm_buffer: *mut u8, comm_buffer_size: &mut usize) -> efi::Status {
     log::info!("MmExitBootServicesHandler invoked");
 
-    process_mm_exit_boot_services(init_state())
-}
-
-/// Marks the supervisor as being at runtime.
-fn process_mm_exit_boot_services(state: &InitState) -> efi::Status {
-    if !state.mark_at_runtime() {
+    let state = init_state();
+    if state.is_at_runtime() {
         log::debug!("MmExitBootServices: duplicate ExitBootServices notification ignored");
+        return efi::Status::SUCCESS;
     }
 
-    efi::Status::SUCCESS
+    // Invoke the ready to lock in case we are dealing with some screwed-up normal world behavior...
+    let status = mm_ready_to_lock_handler(comm_buffer, comm_buffer_size);
+    if status == efi::Status::SUCCESS {
+        state.mark_at_runtime();
+    }
+    status
 }
 
 #[cfg(test)]
@@ -134,7 +140,14 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
-    use crate::policy::{PolicyGateError, SecurePolicyDataV1_0};
+    use crate::policy::{MemDescriptorV1_0, PolicyGateError, SecurePolicyDataV1_0};
+    use crate::test_support::PageAlignedMemory;
+
+    /// Supplies a real, empty root page table in place of the privileged CR3 read.
+    pub(super) fn read_cr3() -> u64 {
+        std::thread_local! { static ROOT: PageAlignedMemory = PageAlignedMemory::new(1); }
+        ROOT.with(PageAlignedMemory::base)
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct TestSnapshotError;
@@ -188,6 +201,14 @@ mod tests {
         // process, so it outlives the returned gate.
         unsafe { PolicyGate::new(core::ptr::from_ref(policy).cast(), core::mem::size_of::<SecurePolicyDataV1_0>()) }
             .expect("test policy must be valid")
+    }
+
+    fn install_gate_with_snapshot_buffer() -> &'static PolicyGate {
+        let mut gate = unlocked_policy_gate();
+        let buffer = Box::leak(Box::new(MemDescriptorV1_0::default()));
+        gate.set_memory_policy_buffer(buffer, 1).unwrap();
+        security_state().set_policy_gate(gate);
+        security_state().policy_gate().unwrap()
     }
 
     #[test]
@@ -255,21 +276,48 @@ mod tests {
     }
 
     #[test]
-    fn exit_boot_services_marks_runtime_and_tolerates_duplicates() {
-        let state = InitState::new();
+    fn exit_boot_services_locks_before_runtime_and_tolerates_duplicates() {
+        let gate = install_gate_with_snapshot_buffer();
+        let tracker = security_state().unblocked_tracker();
+        let mut size = 0;
 
-        assert!(!state.is_at_runtime());
-        assert_eq!(process_mm_exit_boot_services(&state), efi::Status::SUCCESS);
-        assert!(state.is_at_runtime());
-        assert_eq!(process_mm_exit_boot_services(&state), efi::Status::SUCCESS);
-        assert!(state.is_at_runtime());
+        assert!(!gate.is_locked());
+        assert!(!tracker.is_core_init_complete());
+        assert!(!init_state().is_at_runtime());
+        assert_eq!(mm_exit_boot_services_handler(core::ptr::null_mut(), &mut size), efi::Status::SUCCESS);
+        assert_eq!(gate.snapshot_count(), Some(0));
+        assert!(tracker.is_core_init_complete());
+        assert!(init_state().is_at_runtime());
+
+        assert_eq!(mm_exit_boot_services_handler(core::ptr::null_mut(), &mut size), efi::Status::SUCCESS);
     }
 
     #[test]
-    fn exit_boot_services_entry_point_marks_the_global_state() {
+    fn exit_boot_services_preserves_an_existing_snapshot() {
+        let gate = install_gate_with_snapshot_buffer();
         let mut size = 0;
-
+        assert_eq!(mm_ready_to_lock_handler(core::ptr::null_mut(), &mut size), efi::Status::SUCCESS);
+        assert_eq!(gate.snapshot_count(), Some(0));
         assert_eq!(mm_exit_boot_services_handler(core::ptr::null_mut(), &mut size), efi::Status::SUCCESS);
+        assert_eq!(gate.snapshot_count(), Some(0));
         assert!(init_state().is_at_runtime());
+    }
+
+    #[test]
+    fn exit_boot_services_does_not_enter_runtime_on_snapshot_failure() {
+        security_state().set_policy_gate(unlocked_policy_gate()); // No snapshot buffer.
+        let mut size = 0;
+        let result = catch_unwind(AssertUnwindSafe(|| mm_exit_boot_services_handler(core::ptr::null_mut(), &mut size)));
+        assert!(result.is_err());
+        assert!(!security_state().unblocked_tracker().is_core_init_complete());
+        assert!(!init_state().is_at_runtime());
+    }
+
+    #[test]
+    fn exit_boot_services_entry_point_does_not_enter_runtime_without_a_policy_gate() {
+        let mut size = 0;
+        let result = catch_unwind(AssertUnwindSafe(|| mm_exit_boot_services_handler(core::ptr::null_mut(), &mut size)));
+        assert!(result.is_err());
+        assert!(!init_state().is_at_runtime());
     }
 }

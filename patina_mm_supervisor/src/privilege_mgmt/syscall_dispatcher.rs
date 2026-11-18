@@ -1382,7 +1382,7 @@ mod tests {
 
     #[test]
     fn test_mm_memory_unblocked_requires_unblocked_user_memory() {
-        // Unblocked and user-owned: the only case that reports TRUE.
+        // External, unblocked and user-owned: the only case that reports TRUE.
         let dispatcher = new_dispatcher(MockOps { mapped: vec![(0x5000, PageOwnership::User)], ..Default::default() });
         assert_eq!(dispatcher.handle_mm_memory_unblocked(&ctx(0, 0x5000, 0x100, 0)), Ok(1));
 
@@ -1407,6 +1407,53 @@ mod tests {
         let dispatcher = new_dispatcher(MockOps { mapped: vec![(0x5000, PageOwnership::User)], ..Default::default() });
         assert_eq!(dispatcher.handle_mm_memory_unblocked(&ctx(0, 0x5000, 0, 0)), Ok(0));
         assert_eq!(dispatcher.handle_mm_memory_unblocked(&ctx(0, u64::MAX, 0x100, 0)), Ok(0));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_mm_memory_unblocked_excludes_mmram_before_and_after_lock() {
+        use crate::policy::{MemDescriptorV1_0, RESOURCE_ATTR_READ};
+        use crate::state::security_state;
+        use crate::test_support::{PageAlignedMemory, init_global_state_over};
+        use patina_paging::{MemoryAttributes, PageTable};
+
+        let memory = PageAlignedMemory::new(crate::memory::DEFAULT_PAGING_POOL_PAGES + 16);
+        init_global_state_over(&memory);
+        let (start, end) = (memory.base(), memory.range().end());
+        let page = UEFI_PAGE_SIZE as u64;
+        {
+            // Make both sides of each boundary user-owned in the test page table so ownership
+            // alone cannot reject any of the queries below.
+            let mut table = security_state().lock_page_table();
+            let table = table.as_mut().unwrap();
+            for base in [start - page, end - page] {
+                table.map_memory_region(base, 2 * page, MemoryAttributes::ExecuteProtect).unwrap();
+            }
+        }
+        let tracker = security_state().unblocked_tracker();
+        let external = MemDescriptorV1_0 {
+            base_address: start - page,
+            size: page,
+            mem_attributes: RESOURCE_ATTR_READ,
+            reserved: 0,
+        };
+        tracker.init_from_descriptors(&[external]).unwrap();
+
+        let dispatcher = SyscallDispatcher::new();
+        let query = |base, size| dispatcher.handle_mm_memory_unblocked(&ctx(0, base, size, 0));
+        let check_boundaries = || {
+            assert_eq!(query(start - 8, 8), Ok(1)); // ends exactly where MMRAM begins
+            assert_eq!(query(start - 8, 9), Ok(0)); // one byte inside
+            assert_eq!(query(start, 8), Ok(0)); // wholly inside
+            assert_eq!(query(end - 1, 8), Ok(0)); // crosses the other boundary
+        };
+        check_boundaries();
+        assert_eq!(query(end, 8), Ok(1)); // outside; bootstrap permits untracked memory
+        tracker.set_core_init_complete();
+        check_boundaries();
+        assert_eq!(query(end, 8), Ok(0)); // outside, but not on the unblock list
+
+        *security_state().lock_page_table() = None;
     }
 
     #[test]
