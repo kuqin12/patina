@@ -391,6 +391,24 @@ impl<O: SyscallOps> SyscallDispatcher<O> {
             }
         }
 
+        let config = self.ops.comm_buffer_config().ok_or_else(|| {
+            log::error!("FREE_PAGE: Communication buffers not initialized");
+            Status::NOT_READY
+        })?;
+        for (base, size) in [
+            (config.user.internal_address, config.user.size),
+            (config.supv_to_user_buffer, config.supv_to_user_buffer_size),
+        ] {
+            let reserved = MemoryRange::new(base, size).map_err(|err| {
+                log::error!("FREE_PAGE: Invalid communication buffer at 0x{base:x}, size 0x{size:x}: {err}");
+                Status::SECURITY_VIOLATION
+            })?;
+            if reserved.overlaps(&range) {
+                log::error!("FREE_PAGE: {range} overlaps communication buffer {reserved}");
+                return Err(Status::SECURITY_VIOLATION);
+            }
+        }
+
         // The checked free fails if any page in the range is not a User allocation.
         match self.ops.free_user_pages(addr, page_count as usize) {
             Ok(()) => {
@@ -655,6 +673,22 @@ mod tests {
     }
 
     impl MockOps {
+        fn with_comm_buffers() -> Self {
+            Self {
+                comm_buffer: Some(CommBufferConfig {
+                    user: CommChannel {
+                        internal_address: 0x10_0000,
+                        size: 3 * UEFI_PAGE_SIZE as u64,
+                        ..Default::default()
+                    },
+                    supv_to_user_buffer: 0x20_0000,
+                    supv_to_user_buffer_size: UEFI_PAGE_SIZE as u64,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
         fn record(&self, effect: Effect) {
             self.effects.borrow_mut().push(effect);
         }
@@ -901,7 +935,7 @@ mod tests {
             },
             RoutingCase {
                 index: SyscallIndex::FreePage,
-                ops: MockOps::default(),
+                ops: MockOps::with_comm_buffers(),
                 args: (0x2000, 1, 0),
                 expected: Ok(0),
                 effect: Some(Effect::FreeUserPages(0x2000, 1)),
@@ -1228,10 +1262,41 @@ mod tests {
 
     #[test]
     fn test_free_page_success() {
-        let dispatcher = new_dispatcher(MockOps::default());
+        let dispatcher = new_dispatcher(MockOps::with_comm_buffers());
 
         assert_eq!(dispatcher.handle_free_page(&ctx(0, 0x2000, 2, 0)), Ok(0));
         assert_eq!(dispatcher.ops.effects(), vec![Effect::FreeUserPages(0x2000, 2)]);
+    }
+
+    #[test]
+    fn test_free_page_rejects_any_overlap_with_communication_buffers() {
+        let dispatcher = new_dispatcher(MockOps::with_comm_buffers());
+        let page = UEFI_PAGE_SIZE as u64;
+        let buffers = [MemoryRange::from_pages(0x10_0000, 3).unwrap(), MemoryRange::from_pages(0x20_0000, 1).unwrap()];
+        for reserved in buffers {
+            for (addr, count) in [
+                (reserved.base(), reserved.pages()),
+                (reserved.end() - page, 1),
+                (reserved.base() - page, 2),
+                (reserved.end() - page, 2),
+                (reserved.base() - page, reserved.pages() + 2),
+            ] {
+                assert_eq!(dispatcher.handle_free_page(&ctx(0, addr, count, 0)), Err(Status::SECURITY_VIOLATION));
+            }
+        }
+        assert!(dispatcher.ops.effects().is_empty(), "a protected free reached the allocator");
+        for reserved in buffers {
+            for addr in [reserved.base() - page, reserved.end()] {
+                assert_eq!(dispatcher.handle_free_page(&ctx(0, addr, 1, 0)), Ok(0));
+            }
+        }
+    }
+
+    #[test]
+    fn test_free_page_refuses_to_free_before_comm_buffers_are_published() {
+        let dispatcher = new_dispatcher(MockOps::default());
+        assert_eq!(dispatcher.handle_free_page(&ctx(0, 0x2000, 1, 0)), Err(Status::NOT_READY));
+        assert!(dispatcher.ops.effects().is_empty());
     }
 
     #[test]
@@ -1271,8 +1336,10 @@ mod tests {
     #[test]
     fn test_free_page_reports_allocator_failure() {
         // A page in the range belongs to someone else, so the checked free fails.
-        let dispatcher =
-            new_dispatcher(MockOps { free_result: Err(AllocError::NotAllocated.into()), ..Default::default() });
+        let dispatcher = new_dispatcher(MockOps {
+            free_result: Err(AllocError::NotAllocated.into()),
+            ..MockOps::with_comm_buffers()
+        });
 
         assert_eq!(dispatcher.handle_free_page(&ctx(0, 0x2000, 3, 0)), Err(Status::SECURITY_VIOLATION));
         assert_eq!(dispatcher.ops.effects(), vec![Effect::FreeUserPages(0x2000, 3)]);

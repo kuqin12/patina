@@ -50,7 +50,6 @@ use crate::{
     },
     policy::{self, MemDescriptorV1_0, dump_policy, gate::PolicyGate, walk_page_table},
     state::{init_state, security_state},
-    user_access_guard::with_user_access,
 };
 
 use super::CoreInitError;
@@ -397,19 +396,16 @@ impl<P: PlatformInfo> MmSupervisorCore<P> {
             usize::try_from(hob_list_size).map_err(|_| CoreInitError::HobListTooLargeToCopy { size: hob_list_size })?;
 
         let pages = uefi_size_to_pages!(size);
-        let copy_base = security_state().page_allocator().allocate_pages_with_type(pages, AllocationType::User)?;
+        // Ring 3 borrows this allocation read-only; it must not be able to free it.
+        let copy_base = security_state().page_allocator().allocate_pages(pages)?;
         let copy_size = uefi_pages_to_size!(pages);
 
-        // The destination is user-owned, so SMAP is lifted to fill it. The whole allocation is
-        // zeroed first because Ring 3 can read the tail of the last page.
-        // SAFETY: `copy_base` is a fresh allocation of `copy_size` bytes, and `hob_base` was
-        // checked above to be `size` readable bytes inside MMRAM. The two cannot overlap: the
-        // allocation came from the free pool, while the HOB list is reserved memory.
+        // Zero the whole allocation because Ring 3 can read the tail of the last page.
+        // SAFETY: the validated producer list is supervisor-readable. The fresh supervisor
+        // allocation is disjoint from it, holds `copy_size` bytes, and is not shared until below.
         unsafe {
-            with_user_access(|| {
-                memory::write_zeros_volatile(copy_base as *mut u8, copy_size);
-                memory::copy_volatile(hob_base as *const u8, copy_base as *mut u8, size);
-            });
+            memory::write_zeros_volatile(copy_base as *mut u8, copy_size);
+            memory::copy_volatile(hob_base as *const u8, copy_base as *mut u8, size);
         }
 
         // The page table guard is a temporary, so the lock is released at the end of this
@@ -1018,7 +1014,12 @@ mod tests {
         let copy = supervisor.publish_hob_list_to_user(handoff).expect("publishing the HOB list copy should succeed");
 
         assert_ne!(copy, 0);
-        assert_eq!(security_state().page_allocator().get_allocation_type(copy), Some(AllocationType::User));
+        assert_eq!(security_state().page_allocator().get_allocation_type(copy), Some(AllocationType::Supervisor));
+        assert_eq!(
+            security_state().page_allocator().free_pages_checked(copy + UEFI_PAGE_SIZE as u64, 1, AllocationType::User),
+            Err(memory::AllocError::TypeMismatch.into()),
+            "Ring 3 must not free even an interior page of its read-only HOB copy"
+        );
 
         // SAFETY: `copy` is a live allocation of at least `size` bytes the supervisor just filled.
         let published = unsafe { core::slice::from_raw_parts(copy as *const u8, size) };
@@ -1044,10 +1045,20 @@ mod tests {
         let memory = PageAlignedMemory::new(memory::DEFAULT_PAGING_POOL_PAGES + 32);
         init_global_state_over(&memory);
 
-        // A user-owned staging range makes the supervisor-typed reclaim fail, which is reported
-        // rather than fatal: the copy the user core needs has already been published.
+        // Keep the producer mapped supervisor-only, but give it the wrong allocator type so
+        // reclaim fails after the user copy has been published.
         let staging =
             security_state().page_allocator().allocate_pages_with_type(4, AllocationType::User).expect("staging pages");
+        security_state()
+            .lock_page_table()
+            .as_mut()
+            .unwrap()
+            .map_memory_region(
+                staging,
+                4 * UEFI_PAGE_SIZE as u64,
+                MemoryAttributes::Supervisor | MemoryAttributes::ExecuteProtect,
+            )
+            .expect("map the producer's HOB list supervisor-only");
         let source = padded_hob_list(2 * UEFI_PAGE_SIZE);
         // SAFETY: `source` is a valid HOB list.
         let size = unsafe { hob::get_pi_hob_list_size(source.as_ptr()) };
@@ -1272,7 +1283,7 @@ mod tests {
         assert_eq!(unsafe { core::slice::from_raw_parts(user_copy as *const u8, size) }, unsafe {
             core::slice::from_raw_parts(source.as_ptr().cast::<u8>(), size)
         });
-        assert_eq!(allocator.get_allocation_type(user_copy), Some(AllocationType::User));
+        assert_eq!(allocator.get_allocation_type(user_copy), Some(AllocationType::Supervisor));
         assert_eq!(
             security_state()
                 .lock_page_table()
@@ -1539,7 +1550,7 @@ mod tests {
         let handoff = unsafe { &*(staging as *const PhaseHandoffInformationTable) };
         let copy = supervisor.publish_hob_list_to_user(handoff).expect("publishing the HOB list copy should succeed");
 
-        assert_eq!(security_state().page_allocator().get_allocation_type(copy), Some(AllocationType::User));
+        assert_eq!(security_state().page_allocator().get_allocation_type(copy), Some(AllocationType::Supervisor));
         assert_eq!(security_state().page_allocator().get_allocation_type(staging), Some(AllocationType::Supervisor));
         assert_eq!(security_state().page_allocator().free_page_count(), free_before - 1);
     }
