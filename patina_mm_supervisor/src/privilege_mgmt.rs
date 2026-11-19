@@ -32,6 +32,11 @@
 
 use patina::standard::efi::Status;
 
+#[cfg(target_os = "uefi")]
+use crate::intrinsics::{cpuid_version_info, read_msr, write_msr};
+#[cfg(all(test, not(target_os = "uefi")))]
+use mock::{cpuid_version_info, invoke_demoted_routine as invoke_demoted_routine_asm, read_msr, write_msr};
+
 pub(crate) mod call_gate;
 pub(crate) mod save_state;
 mod syscall_dispatcher;
@@ -74,12 +79,32 @@ pub(crate) unsafe fn invoke_demoted_routine(
     arg2: u64,
     arg3: u64,
 ) -> usize {
-    #[cfg(target_os = "uefi")]
-    // SAFETY: the caller upholds this function's contract.
-    let ret = unsafe { invoke_demoted_routine_asm(cpu_index, cpl3_routine, cpl3_stack, arg_count, arg1, arg2, arg3) };
+    #[cfg(any(target_os = "uefi", test))]
+    let ret = {
+        const CPUID_EDX_SEP: u32 = 1 << 11;
+        const IA32_SYSENTER_CS: u32 = 0x174;
 
-    #[cfg(all(not(target_os = "uefi"), test))]
-    let ret = mock::invoke_demoted_routine(cpu_index, cpl3_routine, cpl3_stack, arg_count, arg1, arg2, arg3);
+        let saved_cs = if cpuid_version_info().edx & CPUID_EDX_SEP != 0 {
+            // SAFETY: SEP makes the MSR available at CPL0. A null selector disables SYSENTER.
+            unsafe {
+                let cs = read_msr(IA32_SYSENTER_CS);
+                write_msr(IA32_SYSENTER_CS, 0);
+                Some(cs)
+            }
+        } else {
+            None
+        };
+
+        // SAFETY: the caller supplies the Ring 3 entry, stack and arguments for this CPU.
+        let status =
+            unsafe { invoke_demoted_routine_asm(cpu_index, cpl3_routine, cpl3_stack, arg_count, arg1, arg2, arg3) };
+
+        if let Some(cs) = saved_cs {
+            // SAFETY: back at CPL0 on the same CPU, restoring the value read above.
+            unsafe { write_msr(IA32_SYSENTER_CS, cs) };
+        }
+        status
+    };
 
     // Other host builds (e.g. doctests) never run the transition.
     #[cfg(all(not(target_os = "uefi"), not(test)))]
@@ -99,7 +124,8 @@ pub(crate) unsafe fn invoke_demoted_routine(
 #[cfg(test)]
 #[cfg_attr(coverage, coverage(off))]
 pub(crate) mod mock {
-    use core::cell::RefCell;
+    use core::arch::x86_64::CpuidResult;
+    use core::cell::{Cell, RefCell};
 
     /// Handler signature: receives the same arguments as the real routine and returns the value
     /// the supervisor should observe.
@@ -107,6 +133,21 @@ pub(crate) mod mock {
 
     thread_local! {
         static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+        pub(super) static SYSENTER_CS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn cpuid_version_info() -> CpuidResult {
+        CpuidResult { eax: 0, ebx: 0, ecx: 0, edx: if SYSENTER_CS.get().is_some() { 1 << 11 } else { 0 } }
+    }
+
+    pub(super) unsafe fn read_msr(msr: u32) -> u64 {
+        assert_eq!(msr, 0x174);
+        SYSENTER_CS.get().expect("SYSENTER_CS read without SEP")
+    }
+
+    pub(super) unsafe fn write_msr(msr: u32, value: u64) {
+        assert_eq!(msr, 0x174);
+        assert!(SYSENTER_CS.replace(Some(value)).is_some(), "SYSENTER_CS write without SEP");
     }
 
     /// Installs a handler that runs in place of the real Ring 0 to Ring 3 transition.
@@ -120,9 +161,10 @@ pub(crate) mod mock {
     /// Removes any installed handler; later calls return 0.
     pub(crate) fn clear() {
         HANDLER.with(|handler_cell| *handler_cell.borrow_mut() = None);
+        SYSENTER_CS.set(None);
     }
 
-    pub(super) fn invoke_demoted_routine(
+    pub(super) unsafe fn invoke_demoted_routine(
         cpu_index: usize,
         cpl3_routine: u64,
         cpl3_stack: u64,
@@ -143,6 +185,34 @@ pub(crate) mod mock {
 mod tests {
     use super::*;
     use core::cell::RefCell;
+
+    #[test]
+    fn test_demotion_disables_sysenter_and_restores_the_original_selector() {
+        for original in [0, 0x10, 0x28] {
+            for status in [Status::SUCCESS, Status::ACCESS_DENIED] {
+                mock::SYSENTER_CS.set(Some(original));
+                mock::set_handler(move |_, _, _, _, _, _, _| {
+                    assert_eq!(mock::SYSENTER_CS.get(), Some(0));
+                    status.as_usize()
+                });
+                // SAFETY: the host uses mock registers and never changes privilege.
+                let result = unsafe { invoke_demoted_routine(0, 0x1000, 0x2000, 0, 0, 0, 0) };
+                assert_eq!(result, status.as_usize());
+                assert_eq!(mock::SYSENTER_CS.get(), Some(original));
+            }
+        }
+        mock::clear();
+    }
+
+    #[test]
+    fn test_demotion_without_sep_never_accesses_sysenter_cs() {
+        mock::clear();
+        mock::set_handler(|_, _, _, _, _, _, _| 7);
+        // SAFETY: the host uses mock registers and never changes privilege.
+        let result = unsafe { invoke_demoted_routine(0, 0x1000, 0x2000, 0, 0, 0, 0) };
+        assert_eq!(result, 7);
+        mock::clear();
+    }
 
     #[test]
     fn test_invoke_demoted_routine_delegates_to_mock_handler() {
