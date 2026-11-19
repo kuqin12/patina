@@ -109,6 +109,11 @@ invoke_demoted_routine:
     # Save RBP again; the return path skips over this copy.
     push    rbp
 
+    # Save the FPU and SSE state (FX_SAVE_STATE_X64, 512 bytes).
+    sub rsp, 512
+    mov rdi, rsp
+    .byte 0x0f, 0xae, 0x07 #fxsave [rdi]
+
     # Reserve the 0x20-byte shadow space the EFIAPI callee may spill RCX, RDX, R8 and R9 into,
     # so it stays inside this CPU's CPL3 stack whatever the argument count.
     mov     r15, r8
@@ -234,6 +239,12 @@ invoke_demoted_routine:
     mov     fs, ax
     mov     gs, ax
 
+    # Clear the volatile inputs regardless
+    mov     rcx, 0
+    mov     rdx, 0
+    mov     r8, 0
+    mov     r9, 0
+
     #Prepare input arguments
     mov     rax, [rbp + 0x28]           #Get ArgCount from stack
     CHECK_RAX
@@ -276,6 +287,47 @@ invoke_demoted_routine:
     mov     r15, CALL_GATE_SEL          #call gate selector the demoted routine returns through
     shl     r15, 32                     #selector in bits 63:32 for the far call through the gate
 
+    # Clear x87 FPU and MMX state to not leak information to CPL3
+    fninit
+    .rept 8
+        fldz
+    .endr
+    fninit
+
+    # reset to default SSE control and exception flags
+    push    0x1f80
+    ldmxcsr dword ptr [rsp]
+    lea     rsp, [rsp + 8]
+
+    # clear xmm to not leak information to the demoted routine
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    pxor xmm12, xmm12
+    pxor xmm13, xmm13
+    pxor xmm14, xmm14
+    pxor xmm15, xmm15
+
+    # Clear non-argument registers to avoid leaking information to CPL3
+    mov     rax, 0
+    mov     rbx, 0
+    mov     rsi, 0
+    mov     rdi, 0
+    mov     rbp, 0
+    mov     r10, 0
+    mov     r11, 0
+    mov     r12, 0
+    mov     r13, 0
+    mov     r14, 0
     retfq
 
 5:
@@ -344,8 +396,12 @@ invoke_demoted_routine:
     # push sequence at the top of this routine.
     mov     rax, [rsp - 15 * 8]
 
-    add     rsp, 0x08       #skip the saved RBP copy
+    mov rsi, rsp
+    .byte 0x0f, 0xae, 0x0e # fxrstor [rsi]
+    add rsp, 512
+
     # Restore the nonvolatile registers.
+    pop     rbp
     pop     r15
     pop     r14
     pop     r13

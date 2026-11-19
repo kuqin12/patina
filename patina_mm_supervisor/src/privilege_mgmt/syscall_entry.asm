@@ -100,6 +100,36 @@ syscall_center:
     mov rdi, rsp
     .byte 0x0f, 0xae, 0x07 #fxsave [rdi]
 
+    # clear xmm to not pollute the syscall with demoted routine's state
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    pxor xmm12, xmm12
+    pxor xmm13, xmm13
+    pxor xmm14, xmm14
+    pxor xmm15, xmm15
+
+    # reset to default SSE control and exception flags
+    push    0x1f80
+    ldmxcsr dword ptr [rsp]
+    lea     rsp, [rsp + 8]
+
+    # Clear x87 FPU and MMX state to not leak information to CPL3
+    fninit                      # Mask x87 exceptions and mark all slots empty.
+    .rept 8
+        fldz                    # Overwrite all eight physical x87/MMX slots.
+    .endr
+    fninit                      # Leave the now-zero slots marked empty.
+
     # Load the Ring 0 data selector into DS, ES and FS. GS is left alone to keep its base.
     xor     rbx, rbx
     mov     bx, LONG_DS_R0
